@@ -1,0 +1,7 @@
+# paper_live (real data, simulated fills) only needs:
+requests>=2.31
+python-dotenv>=1.0
+websockets>=12.0          # Polymarket RTDS Chainlink Data Stream (btc/usd)
+
+# live trading (MODE=live) additionally needs the Polymarket CLOB V2 client:
+py-clob-client-v2>=0.1.0
