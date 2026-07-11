@@ -23,12 +23,14 @@ from __future__ import annotations
 import json
 import os
 import time
+from types import SimpleNamespace
 
 import config
 from price_feed import SimulatedPriceFeed, LivePriceFeed, ChainlinkDataStream
-from signal_engine import compute_signal
+from signal_engine import compute_signal, count_strike_crossings, fair_value
 from risk import RiskManager
 from executor import PaperExecutor, Trade, stamp_trade_times
+from decision_journal import log_decision
 
 STATE_DIR = os.path.join(os.path.dirname(__file__), "state")
 os.makedirs(STATE_DIR, exist_ok=True)
@@ -167,8 +169,21 @@ def _rewrite_history_csv() -> None:
             w.writerow(r)
 
 
+def _copy_file_safe(src: str, dst: str) -> None:
+    import shutil
+    try:
+        if os.path.isfile(src):
+            os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
+            shutil.copy2(src, dst)
+    except Exception as e:
+        print(f"  [archive] copy failed {src} -> {dst}: {e}")
+
+
 def archive_records(trades, stats: dict) -> int:
-    """Append settled trades to permanent history. Returns count newly written."""
+    """Append settled trades to permanent history + timestamped copies.
+
+    Returns count newly written to the master JSONL.
+    """
     global _archived_keys
     if not _archived_keys:
         _archived_keys = _load_archived_keys()
@@ -195,28 +210,55 @@ def archive_records(trades, stats: dict) -> int:
                 f.write(json.dumps(d, default=str) + "\n")
                 _archived_keys.add(key)
                 new_n += 1
+
+        # Always refresh CSV + session snapshot (even if no new rows — stats update)
+        _rewrite_history_csv()
+        settled_dicts = [
+            (t.to_dict() if hasattr(t, "to_dict") else t)
+            for t in trades if getattr(t, "won", None) is not None
+        ]
+        snap = {
+            "session_id": sid,
+            "saved_at": time.time(),
+            "mode": config.MODE,
+            "strategy": strat,
+            "stats": stats,
+            "trades": settled_dicts,
+        }
+        snap_path = os.path.join(SESSIONS_DIR, f"session_{sid}.json")
+        with open(snap_path, "w", encoding="utf-8") as f:
+            json.dump(snap, f, indent=2, default=str)
+
+        # Live dashboard copies (easy to open without hunting paths)
+        _copy_file_safe(TRADES_PATH, os.path.join(ARCHIVE_DIR, "latest_trades.json"))
+        _copy_file_safe(STATS_PATH, os.path.join(ARCHIVE_DIR, "latest_stats.json"))
+        _copy_file_safe(HISTORY_CSV, os.path.join(ARCHIVE_DIR, "latest_trades.csv"))
+
+        # Timestamped backup folder (never overwritten)
+        from datetime import datetime, timezone
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        copy_dir = os.path.join(ARCHIVE_DIR, "copies", f"{sid}_{stamp}")
+        os.makedirs(copy_dir, exist_ok=True)
+        _copy_file_safe(TRADES_PATH, os.path.join(copy_dir, "trades.json"))
+        _copy_file_safe(STATS_PATH, os.path.join(copy_dir, "stats.json"))
+        _copy_file_safe(HISTORY_JSONL, os.path.join(copy_dir, "trades_history.jsonl"))
+        _copy_file_safe(HISTORY_CSV, os.path.join(copy_dir, "trades_history.csv"))
+        _copy_file_safe(snap_path, os.path.join(copy_dir, "session.json"))
+        with open(os.path.join(copy_dir, "readme.txt"), "w", encoding="utf-8") as f:
+            f.write(
+                f"Session {sid}\nSaved {stamp} UTC\nMode={config.MODE} strategy={strat}\n"
+                f"Master history: {HISTORY_JSONL}\nMaster CSV: {HISTORY_CSV}\n"
+            )
+
         if new_n:
-            _rewrite_history_csv()
-            # Per-session snapshot (full current run)
-            snap = {
-                "session_id": sid,
-                "saved_at": time.time(),
-                "mode": config.MODE,
-                "strategy": strat,
-                "stats": stats,
-                "trades": [
-                    (t.to_dict() if hasattr(t, "to_dict") else t)
-                    for t in trades if getattr(t, "won", None) is not None
-                ],
-            }
-            snap_path = os.path.join(SESSIONS_DIR, f"session_{sid}.json")
-            with open(snap_path, "w", encoding="utf-8") as f:
-                json.dump(snap, f, indent=2, default=str)
             print(f"  [archive] +{new_n} trade(s) -> {HISTORY_JSONL}")
-            print(f"  [archive] session snapshot -> {snap_path}")
-            print(f"  [archive] CSV updated -> {HISTORY_CSV}")
+        print(f"  [archive] session -> {snap_path}")
+        print(f"  [archive] CSV -> {HISTORY_CSV}")
+        print(f"  [archive] copy folder -> {copy_dir}")
     except Exception as e:
         print(f"  [archive] WARNING failed to save history: {e}")
+        import traceback
+        traceback.print_exc()
     return new_n
 
 
@@ -398,10 +440,52 @@ def _quote_side(pub, market, side: str) -> dict | None:
         return None
 
 
-def _pick_late_scalp_favorite(pub, market) -> tuple[str, dict] | None:
+def _scan_sum_to_one_arb(pub, market) -> dict | None:
+    """Tier 2: detect ask_UP + ask_DOWN < 1 - fee (structural mispricing)."""
+    if not getattr(config, "ARB_SCAN_ENABLED", True):
+        return None
+    try:
+        q_up = _quote_side(pub, market, "UP")
+        q_dn = _quote_side(pub, market, "DOWN")
+        if not q_up or not q_dn:
+            return None
+        p_up = float(q_up["price"])
+        p_dn = float(q_dn["price"])
+        if not (0.0 < p_up < 1.0 and 0.0 < p_dn < 1.0):
+            return None
+        s = p_up + p_dn
+        min_edge = float(getattr(config, "ARB_MIN_EDGE", 0.02) or 0.02)
+        edge = 1.0 - s
+        if edge >= min_edge:
+            return {
+                "ask_up": p_up,
+                "ask_down": p_dn,
+                "sum": s,
+                "edge": edge,
+                "up_size": q_up.get("ask_size"),
+                "down_size": q_dn.get("ask_size"),
+            }
+    except Exception:
+        return None
+    return None
+
+
+def _journal(session_id: str, mode: str, strategy: str, **kw):
+    if not getattr(config, "DECISION_JOURNAL", True):
+        return
+    row = {
+        "session_id": session_id,
+        "mode": mode,
+        "strategy": strategy,
+        **kw,
+    }
+    log_decision(row)
+
+
+def _pick_late_scalp_favorite(pub, market) -> tuple[str, dict, dict] | None:
     """Pick the expensive side (market favorite) if clearly leading.
 
-    Returns (side, quote) or None if book is balanced / unusable.
+    Returns (side, fav_quote, underdog_quote) or None if book is balanced / unusable.
     """
     q_up = _quote_side(pub, market, "UP")
     q_dn = _quote_side(pub, market, "DOWN")
@@ -414,12 +498,17 @@ def _pick_late_scalp_favorite(pub, market) -> tuple[str, dict] | None:
         return None
     if not (0.0 < p_up < 1.0 and 0.0 < p_dn < 1.0):
         return None
-    lead = getattr(config, "LATE_SCALP_MIN_FAVORITE_LEAD", 0.50) or 0.50
+    lead = getattr(config, "LATE_SCALP_MIN_FAVORITE_LEAD", 0.70) or 0.70
+    max_dog = float(getattr(config, "LATE_SCALP_MAX_UNDERDOG_ASK", 0.08) or 0.08)
     # Favorite = higher ask (market prices it more likely to pay $1).
     if p_up >= p_dn and (p_up - p_dn) >= lead:
-        return "UP", q_up
+        if max_dog > 0 and p_dn > max_dog:
+            return None
+        return "UP", q_up, q_dn
     if p_dn > p_up and (p_dn - p_up) >= lead:
-        return "DOWN", q_dn
+        if max_dog > 0 and p_up > max_dog:
+            return None
+        return "DOWN", q_dn, q_up
     return None
 
 
@@ -454,7 +543,7 @@ def run_realtime(rounds: int = 100, paper: bool = True):
             raise SystemExit(
                 "MODE=live is blocked. Set LIVE_CONFIRM=yes in .env only after\n"
                 "you have run paper_live successfully and accept real capital risk.\n"
-                "There is NO profit guarantee — this bot only limits downside size.")
+                "There is NO profit guarantee - this bot only limits downside size.")
         notes = config.apply_live_safety_profile()
         print("[LIVE SAFETY PROFILE]")
         for n in notes:
@@ -470,6 +559,7 @@ def run_realtime(rounds: int = 100, paper: bool = True):
     # Strategy profile (after live safety so late_scalp can override the window)
     hybrid = config.is_hybrid()
     late_only = config.is_late_scalp() and not hybrid
+    prefer_late = bool(hybrid and config.hybrid_prefer_late())
     # Snapshot mid-window params before any late profile mutates them
     mid_min_slot = int(config.MIN_SLOT_SECONDS)
     mid_max_rem = int(config.MAX_TRADE_REMAINING)
@@ -479,36 +569,95 @@ def run_realtime(rounds: int = 100, paper: bool = True):
     mid_edge = float(config.EDGE_THRESHOLD)
     mid_min_ev = float(getattr(config, "MIN_EV", 0) or 0)
     mid_min_conf = float(getattr(config, "MIN_CONFIDENCE", 0) or 0)
+    hybrid_mid_edge = float(getattr(config, "HYBRID_MID_MIN_EDGE", 0.10))
+    hybrid_mid_move = float(getattr(config, "HYBRID_MID_MIN_MOVE_USD", 15.0))
+    hybrid_mid_model = float(getattr(config, "HYBRID_MID_MIN_MODEL", 0.65))
+    hybrid_mid_conf = float(getattr(config, "HYBRID_MID_MIN_CONFIDENCE", 0.55))
 
-    late_min = int(getattr(config, "LATE_SCALP_MIN_REMAINING", 8))
-    late_max = int(getattr(config, "LATE_SCALP_MAX_REMAINING", 35))
-    late_min_entry = float(getattr(config, "LATE_SCALP_MIN_ENTRY", 0.88))
-    late_max_entry = float(getattr(config, "LATE_SCALP_MAX_ENTRY", 0.97))
+    late_min = int(getattr(config, "LATE_SCALP_MIN_REMAINING", 10))
+    late_max = int(getattr(config, "LATE_SCALP_MAX_REMAINING", 22))
+    late_min_entry = float(getattr(config, "LATE_SCALP_MIN_ENTRY", 0.93))
+    late_max_entry = float(getattr(config, "LATE_SCALP_MAX_ENTRY", 0.96))
+    late_pause_slots = 0  # cooldown after a late loss
+    late_pause_n = int(getattr(config, "LATE_SCALP_PAUSE_SLOTS_AFTER_LOSS", 3) or 0)
+    mid_pause_slots = 0  # cooldown after a mid loss
+    mid_pause_n = int(getattr(config, "MID_PAUSE_SLOTS_AFTER_LOSS", 2) or 0)
 
     if late_only:
         ls_notes = config.apply_late_scalp_profile()
-        print("[STRATEGY: late_scalp] late-window favorites only")
+        print("[STRATEGY: late_scalp] strict late favorites "
+              f"(band [{late_min_entry:.2f},{late_max_entry:.2f}]  "
+              f"window {late_min}-{late_max}s)")
         for n in ls_notes:
             print(f"  - {n}")
+        print(f"  guards: lead>="
+              f"{float(getattr(config,'LATE_SCALP_MIN_FAVORITE_LEAD',0.7)):.2f}  "
+              f"spot_align="
+              f"{bool(getattr(config,'LATE_SCALP_REQUIRE_SPOT_ALIGN',True))}  "
+              f"pause_after_loss={late_pause_n}  "
+              f"max_stake=$"
+              f"{float(getattr(config,'LATE_SCALP_MAX_STAKE_USD',4.9)):.2f}")
         if not paper:
-            print("  [warn] late_scalp on LIVE money — prefer paper_live first")
+            print("  [warn] late_scalp on LIVE money - prefer paper_live first")
         risk = RiskManager(config.STARTING_BANKROLL)
         late_min = config.MIN_SLOT_SECONDS
         late_max = config.MAX_TRADE_REMAINING
     elif hybrid:
-        print("[STRATEGY: hybrid] mid-edge first, then late_scalp on same slot if no fill")
-        print(f"  mid window {mid_min_slot}–{mid_max_rem}s  "
-              f"band [{mid_min_entry:.2f},{mid_max_entry:.2f}]")
-        print(f"  late window {late_min}–{late_max}s  "
-              f"band [{late_min_entry:.2f},{late_max_entry:.2f}]")
+        if prefer_late:
+            print("[STRATEGY: hybrid] late preferred; mid only if exceptional "
+                  "(else late_scalp same slot)")
+            print(f"  mid exceptional bar: edge>={hybrid_mid_edge:.2f}  "
+                  f"move>=${hybrid_mid_move:.0f}  "
+                  f"model>={hybrid_mid_model:.2f}  conf>={hybrid_mid_conf:.2f}")
+        else:
+            print("[STRATEGY: hybrid] mid-edge first, then late_scalp on same slot "
+                  "if no fill (HYBRID_PREFER_LATE=0)")
+        print(f"  mid window {mid_min_slot}-{mid_max_rem}s  "
+              f"band [{mid_min_entry:.2f},{mid_max_entry:.2f}]  "
+              f"edge>={mid_edge:.2f} move>=${mid_min_move:.0f}")
+        if getattr(config, "MID_REQUIRE_CHAINLINK_STRIKE", True):
+            print("  mid requires Chainlink Data Stream strike "
+                  "(exchange-proxy -> skip / defer late)")
+        print(f"  late window {late_min}-{late_max}s  "
+              f"band [{late_min_entry:.2f},{late_max_entry:.2f}]  "
+              f"(tighter: fewer losses, better win payout)")
+        print(f"  late guards: lead>="
+              f"{float(getattr(config,'LATE_SCALP_MIN_FAVORITE_LEAD',0.7)):.2f}  "
+              f"underdog<="
+              f"{float(getattr(config,'LATE_SCALP_MAX_UNDERDOG_ASK',0.08)):.2f}  "
+              f"spot_align="
+              f"{bool(getattr(config,'LATE_SCALP_REQUIRE_SPOT_ALIGN',True))}  "
+              f"requote={bool(getattr(config,'LATE_SCALP_REQUOTE',True))}  "
+              f"pause_after_loss={late_pause_n}  "
+              f"max_stake=$"
+              f"{float(getattr(config,'LATE_SCALP_MAX_STAKE_USD',4.9)):.2f}")
+        print(f"  discovery stays on slot until "
+              f"~{int(getattr(config, 'MARKET_ADVANCE_REMAINING', 5))}s left "
+              f"(late handoff safe)")
         print(f"  min shares {getattr(config, 'MIN_ORDER_SHARES', 5):.0f} "
               f"(stake auto-bumped for CLOB limits)")
         if not paper:
-            print("  [warn] hybrid on LIVE — paper_live recommended first")
+            print("  [warn] hybrid on LIVE - paper_live recommended first")
     else:
-        print(f"[STRATEGY: mid] mid-slot edge band "
+        print(f"[STRATEGY: mid] quality mid-slot edge band "
               f"[{config.MIN_ENTRY_PRICE:.2f}, {config.MAX_ENTRY_PRICE:.2f}]  "
-              f"window {config.MIN_SLOT_SECONDS}–{config.MAX_TRADE_REMAINING}s left")
+              f"window {config.MIN_SLOT_SECONDS}-{config.MAX_TRADE_REMAINING}s left")
+        print(f"  edge>={config.EDGE_THRESHOLD:.2f}  min_ev>={getattr(config,'MIN_EV',0):.2f}  "
+              f"move>=${config.MIN_MOVE_USD:.0f}  conf>={getattr(config,'MIN_CONFIDENCE',0):.2f}")
+        print(f"  model in "
+              f"[{float(getattr(config,'MID_MIN_MODEL',0.60)):.2f},"
+              f"{float(getattr(config,'MID_MAX_MODEL',0.88)):.2f}]  "
+              f"fair-value Z>={float(getattr(config,'MID_Z_MIN',1.0)):.1f}  "
+              f"chop_max={int(getattr(config,'MID_MAX_CHOP_CROSSES',3))}  "
+              f"paper_slip={float(getattr(config,'PAPER_FILL_SLIPPAGE',0.01)):.2f}")
+        print(f"  requote={bool(getattr(config,'MID_REQUOTE',True))}  "
+              f"pause_after_loss={mid_pause_n}  "
+              f"max_stake=$"
+              f"{float(getattr(config,'MID_MAX_STAKE_USD',3.5)):.2f}  "
+              f"journal={bool(getattr(config,'DECISION_JOURNAL',True))}  "
+              f"arb_scan={bool(getattr(config,'ARB_SCAN_ENABLED',True))}")
+        if getattr(config, "MID_REQUIRE_CHAINLINK_STRIKE", True):
+            print("  mid requires Chainlink Data Stream strike (no exchange-proxy)")
         print(f"  min shares {getattr(config, 'MIN_ORDER_SHARES', 5):.0f} "
               f"(ENFORCE={getattr(config, 'ENFORCE_MIN_SHARES', True)})")
 
@@ -567,6 +716,7 @@ def run_realtime(rounds: int = 100, paper: bool = True):
         "slot_closing": 0,
         "slot_too_early": 0,
         "bad_samples": 0,
+        "proxy_strike": 0,
         "thin_move": 0,
         "quote_fail": 0,
         "quote_range": 0,
@@ -587,8 +737,21 @@ def run_realtime(rounds: int = 100, paper: bool = True):
 
         # Fetch the freshest current 5-minute slot's token IDs.
         # Pass stream clock so a slow PC clock doesn't re-select an ended slot.
+        # When hybrid queued late_scalp for a slot, PIN that end_ts so discovery
+        # cannot skip to the next market before the late window (8–35s).
+        now_clk = _now(cl_stream)
         try:
-            market = pub.find_btc_5min_market(now=_now(cl_stream))
+            if hybrid and pending_late_end_ts is not None:
+                pin_start = int(pending_late_end_ts) - int(config.SLOT_SECONDS)
+                market = pub.find_btc_5min_market_at(pin_start, now=now_clk)
+                if market is None:
+                    # Pinned slot ended or unfetchable — clear and rediscover.
+                    print(f"  [hybrid] pinned late slot end={int(pending_late_end_ts)} "
+                          f"gone; clearing late queue")
+                    pending_late_end_ts = None
+                    market = pub.find_btc_5min_market(now=now_clk)
+            else:
+                market = pub.find_btc_5min_market(now=now_clk)
             lookup_fails = 0
         except Exception as e:
             lookup_fails += 1
@@ -624,6 +787,13 @@ def run_realtime(rounds: int = 100, paper: bool = True):
                 use_late = True
                 print(f"  [hybrid] past mid window ({remaining:.0f}s); "
                       f"queuing late_scalp for this slot")
+            elif remaining <= late_max and remaining >= late_min:
+                # Already inside late window without a mid fill this slot
+                pending_late_end_ts = end_ts
+                force_late = True
+                use_late = True
+                print(f"  [hybrid] in late window ({remaining:.0f}s); "
+                      f"running late_scalp")
 
         if use_late:
             min_slot = late_min
@@ -650,7 +820,12 @@ def run_realtime(rounds: int = 100, paper: bool = True):
             skips["slot_too_early"] += 1
             write_status(phase="waiting", message=f"waiting for {phase_name}")
             if config.ROUND_SECONDS > 0 and wait > 0:
-                time.sleep(min(wait, 15.0 if use_late else 30.0))
+                # Late handoff: sleep almost until the window opens so we don't
+                # thrash discovery and miss 8–35s. Mid still polls every ~30s.
+                if use_late:
+                    time.sleep(min(wait, max(1.0, wait - 1.5)))
+                else:
+                    time.sleep(min(wait, 30.0))
             continue
 
         remaining = (end_ts - _now(cl_stream)) if end_ts else remaining
@@ -662,13 +837,42 @@ def run_realtime(rounds: int = 100, paper: bool = True):
             _sleep_until_slot_end(end_ts, cl_stream)
             continue
 
-        # ---- LATE SCALP PATH: book favorite, no model edge ----
+        # ---- LATE SCALP PATH: book favorite + hard quality filters ----
         if use_late:
             # Restore late band for sizing (hybrid keeps mid band in globals)
             config.MIN_ENTRY_PRICE = late_min_entry
             config.MAX_ENTRY_PRICE = late_max_entry
             config.MIN_SLOT_SECONDS = late_min
             config.MAX_TRADE_REMAINING = late_max
+
+            def _late_skip(skip_key: str, msg: str, retry: bool = True):
+                """Skip this late attempt; optionally retry while window open."""
+                nonlocal pending_late_end_ts
+                skips[skip_key] = skips.get(skip_key, 0) + 1
+                write_status(phase="waiting", message=msg, strategy="late_scalp")
+                print(f"  [late_scalp] {msg}")
+                rem_now = (end_ts - _now(cl_stream)) if end_ts else remaining
+                if retry and rem_now is not None and rem_now > late_min + 2:
+                    time.sleep(min(1.2, max(0.4, rem_now - late_min)))
+                    return "retry"
+                if hybrid and pending_late_end_ts == end_ts:
+                    pending_late_end_ts = None
+                _sleep_until_slot_end(end_ts, cl_stream)
+                return "done"
+
+            # Cooldown after a late loss (harder to chain blowups).
+            if late_pause_slots > 0:
+                print(f"  [late_scalp] pause after loss "
+                      f"({late_pause_slots} late window(s) left); skip")
+                skips["no_edge"] = skips.get("no_edge", 0) + 1
+                late_pause_slots -= 1
+                if hybrid and pending_late_end_ts == end_ts:
+                    pending_late_end_ts = None
+                write_status(phase="waiting", message="late pause after loss",
+                             strategy="late_scalp")
+                _sleep_until_slot_end(end_ts, cl_stream)
+                continue
+
             slot_start_time = (end_ts - config.SLOT_SECONDS) if end_ts else None
             slot_open_ref = None
             strike_src = "unknown"
@@ -702,55 +906,118 @@ def run_realtime(rounds: int = 100, paper: bool = True):
 
             picked = _pick_late_scalp_favorite(pub, market)
             if not picked:
-                print("  [late_scalp] no clear favorite (book balanced / quote fail); skip")
-                skips["quote_fail"] += 1
-                write_status(phase="waiting", message="no clear favorite")
-                if remaining is not None and remaining > late_min + 2:
-                    time.sleep(min(2.0, max(0.5, remaining - late_min)))
+                if _late_skip("quote_fail",
+                              "no clear favorite (lead/underdog gate)",
+                              retry=True) == "retry":
                     continue
-                if hybrid and pending_late_end_ts == end_ts:
-                    pending_late_end_ts = None
-                _sleep_until_slot_end(end_ts, cl_stream)
                 continue
-            side, q = picked
+            side, q, q_dog = picked
             mkt = float(q["price"])
+            dog_px = float(q_dog["price"]) if q_dog else None
             ask_sz = q.get("ask_size")
             min_entry = late_min_entry
             max_entry = late_max_entry
             if mkt < min_entry or mkt > max_entry:
-                print(f"  [late_scalp] favorite ask {mkt:.3f} outside "
-                      f"[{min_entry:.2f}, {max_entry:.2f}]; skip")
-                skips["quote_range"] += 1
-                if remaining is not None and remaining > late_min + 2:
-                    time.sleep(1.0)
+                if _late_skip(
+                    "quote_range",
+                    f"favorite ask {mkt:.3f} outside "
+                    f"[{min_entry:.2f}, {max_entry:.2f}]",
+                    retry=True,
+                ) == "retry":
                     continue
-                if hybrid and pending_late_end_ts == end_ts:
-                    pending_late_end_ts = None
-                _sleep_until_slot_end(end_ts, cl_stream)
                 continue
-            max_spread = getattr(config, "MAX_SPREAD", 0) or 0
+
+            # Spot must agree with favorite side (book vs reality filter).
+            require_align = getattr(config, "LATE_SCALP_REQUIRE_SPOT_ALIGN", True)
+            eps = float(getattr(config, "LATE_SCALP_SPOT_ALIGN_EPS_USD", 3.0) or 0.0)
+            if require_align and slot_open_ref and price_before:
+                signed = float(price_before) - float(slot_open_ref)
+                if side == "UP" and signed < -eps:
+                    if _late_skip(
+                        "thin_move",
+                        f"spot vs strike DOWN (${signed:.1f}) but book favorite UP",
+                        retry=True,
+                    ) == "retry":
+                        continue
+                    continue
+                if side == "DOWN" and signed > eps:
+                    if _late_skip(
+                        "thin_move",
+                        f"spot vs strike UP (+${signed:.1f}) but book favorite DOWN",
+                        retry=True,
+                    ) == "retry":
+                        continue
+                    continue
+
+            # Re-quote: skip if favorite flips or ask jumps (unstable book).
+            if getattr(config, "LATE_SCALP_REQUOTE", True):
+                rq_sleep = float(getattr(config, "LATE_SCALP_REQUOTE_SLEEP_S", 0.45)
+                                 or 0.45)
+                if config.ROUND_SECONDS > 0 and rq_sleep > 0:
+                    time.sleep(min(rq_sleep, 1.0))
+                picked2 = _pick_late_scalp_favorite(pub, market)
+                if not picked2:
+                    if _late_skip("quote_fail", "requote lost favorite",
+                                 retry=True) == "retry":
+                        continue
+                    continue
+                side2, q2, _dog2 = picked2
+                mkt2 = float(q2["price"])
+                max_jump = float(getattr(config, "LATE_SCALP_MAX_ASK_JUMP", 0.015)
+                                 or 0.015)
+                if side2 != side:
+                    if _late_skip("quote_fail",
+                                  f"requote side flip {side}->{side2}",
+                                  retry=True) == "retry":
+                        continue
+                    continue
+                if abs(mkt2 - mkt) > max_jump:
+                    if _late_skip(
+                        "wide_spread",
+                        f"requote ask jump {mkt:.3f}->{mkt2:.3f} "
+                        f"> {max_jump:.3f}",
+                        retry=True,
+                    ) == "retry":
+                        continue
+                    continue
+                # Use the more expensive of the two asks (conservative fill).
+                if mkt2 > mkt:
+                    mkt = mkt2
+                    q = q2
+                    ask_sz = q2.get("ask_size")
+                if mkt < min_entry or mkt > max_entry:
+                    if _late_skip(
+                        "quote_range",
+                        f"after requote ask {mkt:.3f} outside band",
+                        retry=True,
+                    ) == "retry":
+                        continue
+                    continue
+
+            max_spread = float(getattr(config, "LATE_SCALP_MAX_SPREAD", 0)
+                               or getattr(config, "MAX_SPREAD", 0) or 0)
             if max_spread > 0 and q.get("spread") is not None and q["spread"] > max_spread:
-                print(f"  [late_scalp] spread {q['spread']:.3f} too wide; skip")
-                skips["wide_spread"] += 1
-                if hybrid and pending_late_end_ts == end_ts:
-                    pending_late_end_ts = None
-                _sleep_until_slot_end(end_ts, cl_stream)
+                if _late_skip("wide_spread",
+                              f"spread {q['spread']:.3f} too wide",
+                              retry=False) == "retry":
+                    continue
                 continue
             min_ask_sz = getattr(config, "MIN_ASK_SIZE", 0) or 0
             if min_ask_sz > 0 and ask_sz is not None and ask_sz < min_ask_sz:
-                print(f"  [late_scalp] ask size {ask_sz:.2f} < {min_ask_sz:.2f}; skip")
-                skips["thin_book"] += 1
-                if hybrid and pending_late_end_ts == end_ts:
-                    pending_late_end_ts = None
-                _sleep_until_slot_end(end_ts, cl_stream)
+                if _late_skip("thin_book",
+                              f"ask size {ask_sz:.2f} < {min_ask_sz:.2f}",
+                              retry=False) == "retry":
+                    continue
                 continue
 
             model_side_prob = mkt
             fee = getattr(config, "FEE_BUFFER", 0.0) or 0.0
             stake = risk.size_late_scalp(mkt)
             edge = 0.0
-            print(f"  [late_scalp] side={side} ask={mkt:.3f} stake=${stake:.2f}  "
-                  f"(favorite convergence; limit buy; min shares enforced)")
+            dog_txt = f" dog={dog_px:.3f}" if dog_px is not None else ""
+            print(f"  [late_scalp] side={side} ask={mkt:.3f}{dog_txt} "
+                  f"stake=${stake:.2f}  "
+                  f"(strict favorite; limit buy; min shares enforced)")
             write_status(phase="analyzing", btc_price=round(price_before, 2),
                          side=side, model=round(model_side_prob, 4),
                          mkt=round(mkt, 4), edge=0.0, stake=stake,
@@ -766,20 +1033,34 @@ def run_realtime(rounds: int = 100, paper: bool = True):
                 continue
             pending_late_end_ts = None
             token_id = market["tokens"][side]
-            class _LSSig:
-                side = side
-                confidence = 1.0
-                model_prob_up = mkt if side == "UP" else (1.0 - mkt)
-                realized_vol_daily = None
-            sig = _LSSig()
+            # SimpleNamespace (not a nested class): class bodies do not close
+            # over function locals, so `class _LSSig: side = side` raises NameError.
+            sig = SimpleNamespace(
+                side=side,
+                confidence=1.0,
+                model_prob_up=(mkt if side == "UP" else (1.0 - mkt)),
+                realized_vol_daily=None,
+            )
         else:
-            # ---- MID-SLOT PATH (original) ----
+            # ---- MID-SLOT PATH (original + quality guards) ----
             config.MIN_ENTRY_PRICE = mid_min_entry
             config.MAX_ENTRY_PRICE = mid_max_entry
             config.MIN_MOVE_USD = mid_min_move
             config.EDGE_THRESHOLD = mid_edge
             config.MIN_EV = mid_min_ev
             config.MIN_CONFIDENCE = mid_min_conf
+
+            # Cooldown after mid loss (pure mid or hybrid mid fill).
+            if mid_pause_slots > 0 and not hybrid:
+                print(f"  [mid] pause after loss "
+                      f"({mid_pause_slots} slot(s) left); skip")
+                skips["no_edge"] = skips.get("no_edge", 0) + 1
+                mid_pause_slots -= 1
+                write_status(phase="waiting", message="mid pause after loss",
+                             strategy="mid")
+                _sleep_until_slot_end(end_ts, cl_stream)
+                continue
+
             prices = _warmup_prices(feed, remaining)
             if len(prices) < 3:
                 print("  not enough price samples; retrying in 5s")
@@ -790,7 +1071,8 @@ def run_realtime(rounds: int = 100, paper: bool = True):
                     print("  [hybrid] mid samples weak; will try late_scalp later")
                     rem_now = (end_ts - _now(cl_stream)) if end_ts else None
                     if rem_now is not None and rem_now > late_max and config.ROUND_SECONDS > 0:
-                        time.sleep(min(rem_now - late_max, 25.0))
+                        time.sleep(min(rem_now - late_max,
+                                       max(1.0, rem_now - late_max - 1.5)))
                     continue
                 _backoff(5)
                 continue
@@ -825,11 +1107,61 @@ def run_realtime(rounds: int = 100, paper: bool = True):
                 print(f"  [bot] using strike price: ${slot_open_ref:,.2f} "
                       f"[{strike_src}]")
             if strike_src in ("exchange-proxy", "warmup-fallback"):
-                print("  [warn] strike is NOT Chainlink Data Stream — close-call "
+                print("  [warn] strike is NOT Chainlink Data Stream - close-call "
                       "local PnL can disagree with Polymarket. Will wait longer "
                       "for official Gamma resolution.")
 
-            price_before = prices[-1]
+            price_before = prices[-1] if prices else None
+            journal_extra: dict = {}
+
+            def _mid_no_trade(skip_key: str, msg: str, extra: dict | None = None):
+                """Skip mid; in hybrid, queue late_scalp on same slot instead of burning it."""
+                nonlocal pending_late_end_ts
+                skips[skip_key] = skips.get(skip_key, 0) + 1
+                write_status(phase="waiting", message=msg)
+                j = {
+                    "phase": "mid",
+                    "action": "skip",
+                    "reason": msg,
+                    "slug": market.get("slug") or "",
+                    "question": question,
+                    "spot": price_before,
+                    "strike": slot_open_ref,
+                    "strike_src": strike_src,
+                    "remaining_s": remaining,
+                    "shadow": True,
+                }
+                j.update(journal_extra)
+                if extra:
+                    j.update(extra)
+                try:
+                    _journal(_ensure_session_id(),
+                             "paper_live" if paper else "live",
+                             "hybrid" if hybrid else "mid", **j)
+                except Exception:
+                    pass
+                if hybrid:
+                    pending_late_end_ts = end_ts
+                    print(f"  [hybrid] mid skip ({msg}); will try late_scalp "
+                          f"when ~{late_max}s left")
+                    rem_now = (end_ts - _now(cl_stream)) if end_ts else None
+                    # Sleep almost to late window so pin+discovery can't drift
+                    if rem_now is not None and rem_now > late_max and config.ROUND_SECONDS > 0:
+                        time.sleep(min(rem_now - late_max, max(1.0, rem_now - late_max - 1.5)))
+                    return "hybrid_late"
+                _sleep_until_slot_end(end_ts, cl_stream)
+                return "done"
+
+            # Mid signal is strike-relative; exchange-proxy strike produced
+            # fake "exceptional" edges that lost to official Gamma (session logs).
+            require_cl = getattr(config, "MID_REQUIRE_CHAINLINK_STRIKE", True)
+            if require_cl and strike_src != "chainlink-data-stream":
+                print(f"  mid blocked: strike source [{strike_src}] "
+                      f"(need chainlink-data-stream)")
+                if _mid_no_trade("proxy_strike", f"strike={strike_src}") == "hybrid_late":
+                    continue
+                continue
+
             remaining_secs = (end_ts - _now(cl_stream)) if end_ts else None
 
             n = len(prices)
@@ -847,27 +1179,78 @@ def run_realtime(rounds: int = 100, paper: bool = True):
             except Exception:
                 pass
 
-            def _mid_no_trade(skip_key: str, msg: str):
-                """Skip mid; in hybrid, queue late_scalp on same slot instead of burning it."""
-                nonlocal pending_late_end_ts
-                skips[skip_key] = skips.get(skip_key, 0) + 1
-                write_status(phase="waiting", message=msg)
-                if hybrid:
-                    pending_late_end_ts = end_ts
-                    print(f"  [hybrid] mid skip ({msg}); will try late_scalp "
-                          f"when ~{late_max}s left")
-                    rem_now = (end_ts - _now(cl_stream)) if end_ts else None
-                    if rem_now is not None and rem_now > late_max and config.ROUND_SECONDS > 0:
-                        time.sleep(min(rem_now - late_max, 25.0))
-                    return "hybrid_late"
-                _sleep_until_slot_end(end_ts, cl_stream)
-                return "done"
+            # Tier 2: both-side arb scan (log only — capital-light research path)
+            arb = _scan_sum_to_one_arb(pub, market)
+            if arb:
+                print(f"  [arb] sum-to-one edge={arb['edge']:+.3f} "
+                      f"UP@{arb['ask_up']:.3f}+DOWN@{arb['ask_down']:.3f}="
+                      f"{arb['sum']:.3f}")
+                journal_extra["arb_sum"] = arb["sum"]
+                try:
+                    _journal(
+                        _ensure_session_id(),
+                        "paper_live" if paper else "live",
+                        "hybrid" if hybrid else "mid",
+                        phase="arb",
+                        action="signal",
+                        reason="sum_to_one",
+                        slug=market.get("slug") or "",
+                        question=question,
+                        ask=arb["sum"],
+                        edge=arb["edge"],
+                        arb_sum=arb["sum"],
+                        remaining_s=remaining,
+                        shadow=True,
+                    )
+                except Exception:
+                    pass
 
-            min_move = getattr(config, "MIN_MOVE_USD", 0.0) or 0.0
+            # Tier 1: chop filter — price thrashing the strike kills mid edge
+            chop_n = count_strike_crossings(prices, float(slot_open_ref))
+            journal_extra["chop_crosses"] = chop_n
+            max_chop = int(getattr(config, "MID_MAX_CHOP_CROSSES", 3) or 0)
+            if max_chop > 0 and chop_n > max_chop:
+                print(f"  chop filter: {chop_n} strike crosses > {max_chop}; skip")
+                if _mid_no_trade("thin_move", f"chop crosses={chop_n}") == "hybrid_late":
+                    continue
+                continue
+
             move_usd = abs(price_before - slot_open_ref)
-            if min_move > 0 and move_usd < min_move:
-                print(f"  move ${move_usd:.2f} < MIN_MOVE_USD ${min_move:.2f}; skip")
-                if _mid_no_trade("thin_move", "move too small") == "hybrid_late":
+            journal_extra["move_usd"] = move_usd
+            min_move = getattr(config, "MIN_MOVE_USD", 0.0) or 0.0
+
+            # Fair-value relative move: |delta| >= Z * sigma_usd
+            z_min = float(getattr(config, "MID_Z_MIN", 1.0) or 1.0)
+            fv = fair_value(
+                spot=float(price_before),
+                strike=float(slot_open_ref),
+                remaining_seconds=float(remaining_secs or 1.0),
+                volatility_daily=config.VOLATILITY_DAILY,
+                vol_blend=config.VOL_BLEND,
+                z_min_significant=z_min,
+            )
+            journal_extra.update({
+                "fair_prob": fv.fair_prob_up,
+                "z_score": fv.z_score,
+                "sigma_usd": fv.sigma_usd,
+                "min_move_usd": fv.min_move_usd,
+            })
+            # Effective min move = max(fixed $, noise-relative)
+            eff_min_move = min_move
+            if getattr(config, "MID_USE_FAIR_VALUE", True):
+                eff_min_move = max(min_move, float(fv.min_move_usd))
+            if eff_min_move > 0 and move_usd < eff_min_move:
+                print(f"  move ${move_usd:.2f} < min ${eff_min_move:.2f} "
+                      f"(fixed+Z*sigma Z={fv.z_score:.2f}); skip")
+                if _mid_no_trade("thin_move", "move too small vs noise") == "hybrid_late":
+                    continue
+                continue
+            if (getattr(config, "MID_REQUIRE_SIGNIFICANT", True)
+                    and getattr(config, "MID_USE_FAIR_VALUE", True)
+                    and not fv.significant):
+                print(f"  fair-value not significant |Z|={abs(fv.z_score):.2f} "
+                      f"< {z_min:.2f}; skip")
+                if _mid_no_trade("thin_move", f"|Z|={abs(fv.z_score):.2f}") == "hybrid_late":
                     continue
                 continue
 
@@ -878,6 +1261,8 @@ def run_realtime(rounds: int = 100, paper: bool = True):
                 volatility_daily=config.VOLATILITY_DAILY,
                 sample_seconds=spacing if spacing > 0 else config.SAMPLE_SECONDS,
                 vol_blend=config.VOL_BLEND,
+                prefer_window_delta_side=True,
+                z_min_significant=z_min,
             )
 
             token_id = market["tokens"][sig.side]
@@ -917,24 +1302,114 @@ def run_realtime(rounds: int = 100, paper: bool = True):
                 continue
             min_ask_sz = getattr(config, "MIN_ASK_SIZE", 0) or 0
             ask_sz = q.get("ask_size")
+            bid_sz = q.get("bid_size")
+            journal_extra["ask_size"] = ask_sz
+            journal_extra["spread"] = q.get("spread")
             if min_ask_sz > 0 and ask_sz is not None and ask_sz < min_ask_sz:
                 print(f"  ask size {ask_sz:.2f} < MIN_ASK_SIZE {min_ask_sz:.2f}; thin book")
                 if _mid_no_trade("thin_book", "thin ask") == "hybrid_late":
+                    continue
+                continue
+            # Tier 2: book imbalance — if bid is tiny vs ask, toxic lift risk
+            min_ba = float(getattr(config, "MID_MIN_BID_ASK_RATIO", 0) or 0)
+            if (min_ba > 0 and ask_sz and bid_sz is not None
+                    and ask_sz > 0 and float(bid_sz) / float(ask_sz) < min_ba):
+                print(f"  thin bid/ask ratio {float(bid_sz)/float(ask_sz):.2f} "
+                      f"< {min_ba:.2f}; skip")
+                if _mid_no_trade("thin_book", "bid/ask imbalance") == "hybrid_late":
                     continue
                 continue
 
             model_side_prob = (
                 sig.model_prob_up if sig.side == "UP" else (1 - sig.model_prob_up)
             )
+            fair_side_prob = None
+            if sig.fair_prob_up is not None:
+                fair_side_prob = (
+                    sig.fair_prob_up if sig.side == "UP" else (1.0 - sig.fair_prob_up)
+                )
+
+            # Mid quality: model range (skip soft + overconfident CDF tails).
+            mid_lo = float(getattr(config, "MID_MIN_MODEL", 0.60) or 0.0)
+            mid_hi = float(getattr(config, "MID_MAX_MODEL", 0.88) or 1.0)
+            if mid_lo > 0 and model_side_prob < mid_lo:
+                if _mid_no_trade(
+                    "no_edge",
+                    f"model {model_side_prob:.2f} < MID_MIN_MODEL {mid_lo:.2f}",
+                ) == "hybrid_late":
+                    continue
+                continue
+            if mid_hi < 1.0 and model_side_prob > mid_hi:
+                if _mid_no_trade(
+                    "no_edge",
+                    f"model {model_side_prob:.2f} > MID_MAX_MODEL {mid_hi:.2f} "
+                    f"(overconfident)",
+                ) == "hybrid_late":
+                    continue
+                continue
+            # Cheap ask + very high model = classic false edge (archive losses).
+            cheap_ask = float(getattr(config, "MID_CHEAP_ASK", 0.38) or 0.0)
+            cheap_max_model = float(getattr(config, "MID_CHEAP_MAX_MODEL", 0.82) or 1.0)
+            if cheap_ask > 0 and mkt < cheap_ask and model_side_prob > cheap_max_model:
+                if _mid_no_trade(
+                    "no_edge",
+                    f"cheap overconf ask {mkt:.2f} model {model_side_prob:.2f}",
+                ) == "hybrid_late":
+                    continue
+                continue
+
+            # Requote: skip if ask jumped against us before entry.
+            if getattr(config, "MID_REQUOTE", True):
+                rq_sleep = float(getattr(config, "MID_REQUOTE_SLEEP_S", 0.40) or 0.0)
+                if config.ROUND_SECONDS > 0 and rq_sleep > 0:
+                    time.sleep(min(rq_sleep, 1.0))
+                try:
+                    if hasattr(pub, "buy_quote"):
+                        q2 = pub.buy_quote(token_id)
+                    else:
+                        q2 = q
+                    mkt2 = float(q2["price"])
+                    max_jump = float(getattr(config, "MID_MAX_ASK_JUMP", 0.02) or 0.02)
+                    if mkt2 > mkt + max_jump:
+                        if _mid_no_trade(
+                            "wide_spread",
+                            f"requote ask jumped {mkt:.3f}->{mkt2:.3f}",
+                        ) == "hybrid_late":
+                            continue
+                        continue
+                    if mkt2 < min_entry or mkt2 > max_entry:
+                        if _mid_no_trade(
+                            "quote_range",
+                            f"requote ask {mkt2:.3f} outside band",
+                        ) == "hybrid_late":
+                            continue
+                        continue
+                    # Conservative: use higher ask for sizing/fill sim.
+                    if mkt2 > mkt:
+                        mkt = mkt2
+                        q = q2
+                        ask_sz = q2.get("ask_size")
+                except Exception as e:
+                    if _mid_no_trade("quote_fail", f"requote failed ({e})") == "hybrid_late":
+                        continue
+                    continue
+
             fee = getattr(config, "FEE_BUFFER", 0.0) or 0.0
-            stake = risk.size_trade(model_side_prob, mkt, confidence=sig.confidence)
-            edge = model_side_prob - mkt - fee
+            # Prefer fair-value side prob for edge when available (Tier 1)
+            edge_prob = fair_side_prob if fair_side_prob is not None else model_side_prob
+            stake = risk.size_trade(edge_prob, mkt, confidence=sig.confidence)
+            edge = edge_prob - mkt - fee
+            fair_edge = (
+                (fair_side_prob - mkt - fee) if fair_side_prob is not None else edge
+            )
             rv_txt = (f" rv={sig.realized_vol_daily:.3f}"
                       if sig.realized_vol_daily is not None else "")
+            z_txt = (f" Z={sig.z_score:+.2f}" if sig.z_score is not None else "")
+            fair_s = f"{fair_side_prob:.2f}" if fair_side_prob is not None else "n/a"
             print(f"  btc=${price_before:,.2f} strike=${slot_open_ref:,.2f} "
                   f"move=${move_usd:.1f} side={sig.side} model={model_side_prob:.2f} "
-                  f"ask={mkt:.2f} edge={edge:+.2f} conf={sig.confidence:.2f} "
-                  f"stake=${stake:.2f}{rv_txt}")
+                  f"fair={fair_s} ask={mkt:.2f} edge={edge:+.2f} "
+                  f"conf={sig.confidence:.2f} stake=${stake:.2f}{z_txt}{rv_txt}")
             write_status(phase="analyzing", btc_price=round(price_before, 2),
                          side=sig.side, model=round(model_side_prob, 4),
                          mkt=round(mkt, 4), edge=round(edge, 4), stake=stake,
@@ -943,9 +1418,28 @@ def run_realtime(rounds: int = 100, paper: bool = True):
             if stake <= 0:
                 why = getattr(risk, "last_skip_reason", "") or "no qualifying edge"
                 print(f"  size skip ({why}) -> skip this slot")
-                if _mid_no_trade("no_edge", why) == "hybrid_late":
+                if _mid_no_trade("no_edge", why, {
+                    "side": sig.side, "model_prob": model_side_prob,
+                    "fair_prob": fair_side_prob, "ask": mkt, "edge": edge,
+                }) == "hybrid_late":
                     continue
                 continue
+            # Hybrid prefer-late: only take mid when signal is exceptional;
+            # otherwise defer this slot to late_scalp (avoids weak mid fills).
+            if hybrid and prefer_late:
+                ok_mid, mid_why = config.mid_exceptional_ok(
+                    edge=edge,
+                    move_usd=move_usd,
+                    model_side_prob=model_side_prob,
+                    confidence=float(sig.confidence or 0.0),
+                )
+                if not ok_mid:
+                    print(f"  [hybrid] mid not exceptional ({mid_why}); "
+                          f"prefer late_scalp")
+                    if _mid_no_trade("no_edge", f"prefer late: {mid_why}") == "hybrid_late":
+                        continue
+                    continue
+                print(f"  [hybrid] exceptional mid OK ({mid_why}) - taking mid")
             token_id = market["tokens"][sig.side]
 
         shares = round(stake / mkt, 4)
@@ -959,11 +1453,24 @@ def run_realtime(rounds: int = 100, paper: bool = True):
                 _sleep_until_slot_end(end_ts, cl_stream)
                 continue
 
+        # Tier 1: pessimistic paper fills — pay ask + slippage (not optimistic mid)
+        fill_px = float(mkt)
+        if paper and not use_late:
+            slip = float(getattr(config, "PAPER_FILL_SLIPPAGE", 0.01) or 0.0)
+            if slip > 0:
+                fill_px = min(0.99, float(mkt) + slip)
+                if fill_px != mkt:
+                    shares = round(stake / fill_px, 4) if fill_px > 0 else shares
+                    stake = round(shares * fill_px, 2)
+                    print(f"  [paper] pessimistic fill ask {mkt:.3f} + "
+                          f"slip {slip:.3f} -> {fill_px:.3f} "
+                          f"(shares={shares:.2f} stake=${stake:.2f})")
+
         trade = Trade(
             ts=time.time(),
             round_id=placed + 1,
             side=sig.side,
-            entry_price=round(mkt, 4),
+            entry_price=round(fill_px, 4),
             shares=shares,
             stake_usd=stake,
             model_prob=round(model_side_prob, 4),
@@ -977,7 +1484,37 @@ def run_realtime(rounds: int = 100, paper: bool = True):
         risk.on_open(stake)
         # Notify dashboard immediately (before multi-minute hold).
         trade_event_id = f"placed-{trade.round_id}-{int(trade.ts)}"
-        strat_lbl = "late_scalp" if late_scalp else "mid"
+        strat_lbl = "late_scalp" if use_late else "mid"
+        # Decision journal: trade intent
+        try:
+            _journal(
+                _ensure_session_id(),
+                "paper_live" if paper else "live",
+                "hybrid" if hybrid else strat_lbl,
+                phase=strat_lbl,
+                action="trade",
+                reason="placed",
+                slug=trade.slug,
+                question=question,
+                side=sig.side,
+                spot=price_before,
+                strike=slot_open_ref,
+                strike_src=strike_src if not use_late else "",
+                move_usd=abs(price_before - slot_open_ref) if (
+                    price_before and slot_open_ref) else None,
+                remaining_s=remaining,
+                model_prob=model_side_prob,
+                fair_prob=getattr(sig, "fair_prob_up", None),
+                z_score=getattr(sig, "z_score", None),
+                ask=mkt,
+                fill_price=fill_px,
+                edge=edge,
+                conf=getattr(sig, "confidence", None),
+                stake=stake,
+                shadow=False,
+            )
+        except Exception:
+            pass
         print(f"  TRADE PLACED [{strat_lbl}] R{trade.round_id} {trade.side} "
               f"@ {trade.entry_price:.2f} ${trade.stake_usd:.2f}  "
               f"{trade.time_et or trade.time_utc}")
@@ -1117,7 +1654,7 @@ def run_realtime(rounds: int = 100, paper: bool = True):
                       f"~{poll_attempts * 3}s AND strike was {strike_src}. "
                       f"Local estimate {'UP' if local_up else 'DOWN'} "
                       f"end=${price_after:,.2f} vs start=${slot_open_ref:,.2f} "
-                      f"— may NOT match Polymarket. Prefer restarting bot "
+                      f"- may NOT match Polymarket. Prefer restarting bot "
                       f"before next slots so Chainlink open is recorded.")
             else:
                 src = "chainlink-stream" if cl_stream.ready else "local-estimate"
@@ -1131,6 +1668,16 @@ def run_realtime(rounds: int = 100, paper: bool = True):
         trade.bankroll_after = round(risk.bankroll, 2)
         trades.append(trade)
         placed += 1
+        # Loss cooldowns (protect bankroll after a hit).
+        if not trade.won:
+            if use_late and late_pause_n > 0:
+                late_pause_slots = max(late_pause_slots, late_pause_n)
+                print(f"  [late_scalp] LOSS cooldown: skip next "
+                      f"{late_pause_slots} late window(s)")
+            if (not use_late) and mid_pause_n > 0:
+                mid_pause_slots = max(mid_pause_slots, mid_pause_n)
+                print(f"  [mid] LOSS cooldown: skip next "
+                      f"{mid_pause_slots} mid slot(s)")
         flag = "WON " if trade.won else "LOST"
         print(f"  resolved {'UP' if resolved_up else 'DOWN'} [{src}] "
               f"-> {flag} pnl={trade.pnl:+.2f} "
@@ -1192,7 +1739,7 @@ if __name__ == "__main__":
                     default=config.MODE, help="overrides MODE from .env")
     ap.add_argument("--strategy", choices=["mid", "late_scalp", "hybrid"],
                     default=None,
-                    help="mid | late_scalp | hybrid (mid first, then late same slot)")
+                    help="mid | late_scalp | hybrid (late preferred; strict mid if exceptional)")
     ap.add_argument("--rounds", type=int, default=None)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--sleep", type=float, default=0.0)

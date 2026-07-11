@@ -107,6 +107,13 @@ class ChainlinkDataStream:
                     self._err or "Chainlink Data Stream not ready yet")
             return float(self._latest)
 
+    def latest_tick(self) -> tuple[float, float] | None:
+        """Return (price, stream_ts) for the newest tick, or None."""
+        with self._lock:
+            if self._latest is None or self._latest_ts is None:
+                return None
+            return float(self._latest), float(self._latest_ts)
+
     def price_at(self, unix_ts: float, max_skew_s: float = 5.0
                  ) -> tuple[float, float] | None:
         """Nearest tick to unix_ts (stream/UTC seconds). Returns (price, skew) or None."""
@@ -404,7 +411,7 @@ class LivePriceFeed:
                         price = float(candle[3])  # open is index 3
                         print(f"  [price_feed] Coinbase 5m open PROXY for ts "
                               f"{slot_start_ts}: ${price:,.2f} "
-                              f"(not Chainlink — signal only)")
+                              f"(not Chainlink - signal only)")
                         return price
         except Exception as e:
             print(f"  [price_feed] Coinbase candles failed: {e}")
@@ -422,7 +429,7 @@ class LivePriceFeed:
                         price = float(candle[1])  # open is index 1
                         print(f"  [price_feed] Binance 5m open PROXY for ts "
                               f"{slot_start_ts}: ${price:,.2f} "
-                              f"(not Chainlink — signal only)")
+                              f"(not Chainlink - signal only)")
                         return price
         except Exception as e:
             print(f"  [price_feed] Binance klines failed: {e}")
@@ -434,30 +441,40 @@ class LivePriceFeed:
         """Price at the end of the slot window (Polymarket settlement price).
 
         Prefer Chainlink Data Stream tick at slot_end = start + SLOT_SECONDS.
-        Exchange candles are proxy-only.
+        Never use a stale stream "latest" as close (frozen ticks caused bad
+        local resolves). Exchange candles are proxy-only fallback.
         """
         slot_end_ts = int(slot_start_ts) + int(getattr(config, "SLOT_SECONDS", 300))
 
         if self.stream is not None:
-            # Wait briefly for end-of-window ticks to arrive
-            for _ in range(12):
-                hit = self.stream.price_at_or_before(float(slot_end_ts), max_age_s=10.0)
+            # Wait for end-of-window ticks (stream can lag a few seconds).
+            # Wider age/skew than open: close ticks often arrive slightly late.
+            for attempt in range(30):  # up to ~15s
+                hit = self.stream.price_at_or_before(
+                    float(slot_end_ts), max_age_s=15.0)
                 if hit is None:
-                    hit2 = self.stream.price_at(float(slot_end_ts), max_skew_s=5.0)
+                    hit2 = self.stream.price_at(
+                        float(slot_end_ts), max_skew_s=8.0)
                     hit = (hit2[0], hit2[1]) if hit2 else None
                 if hit is not None:
                     price, skew = hit
                     print(f"  [price_feed] Chainlink Data Stream close for ts "
                           f"{slot_end_ts}: ${price:,.2f} (d={skew:.2f}s)")
                     return price
+                # Only accept "latest" if the tick timestamp is near slot end
+                # (not a frozen price from minutes ago).
+                latest = self.stream.latest_tick()
+                if latest is not None:
+                    p, ts = latest
+                    age_vs_end = abs(ts - float(slot_end_ts))
+                    if age_vs_end <= 8.0:
+                        print(f"  [price_feed] Chainlink Data Stream close "
+                              f"(fresh latest) for ts {slot_end_ts}: "
+                              f"${p:,.2f} (tick_age_vs_end={age_vs_end:.1f}s)")
+                        return p
                 time.sleep(0.5)
-            # Last resort: latest stream price near now if we just crossed the end
-            try:
-                p = self.stream.price()
-                print(f"  [price_feed] Chainlink Data Stream latest as close: ${p:,.2f}")
-                return p
-            except Exception:
-                pass
+            print(f"  [price_feed] no fresh Chainlink close near "
+                  f"{slot_end_ts}; trying exchange candle proxy")
 
         # Proxy fallbacks (may disagree with Polymarket)
         try:

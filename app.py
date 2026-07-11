@@ -1089,7 +1089,7 @@ body.trade-flash-lose { animation: page-flash-down 1.6s ease-out; }
         <select id="c-strategy" class="ctl-select">
           <option value="mid">mid · edge band (default)</option>
           <option value="late_scalp">late_scalp · last 35s–8s favorites</option>
-          <option value="hybrid">hybrid · mid first, then late same slot</option>
+          <option value="hybrid">hybrid · late preferred, strict mid if exceptional</option>
         </select>
       </div>
       <div class="ctl-field">

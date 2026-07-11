@@ -147,29 +147,23 @@ class PolymarketPublic:
         slot = config.SLOT_SECONDS
         base = int(now // slot * slot)
         # If current window is already over (or nearly over), prefer the next slug.
+        # IMPORTANT: do NOT use MIN_SLOT_SECONDS here — that is a *trade* gate.
+        # Using 90s caused hybrid to abandon the current slot before late_scalp
+        # (8–35s) could ever run.
         rem_cur = (base + slot) - now
-        min_rem = int(getattr(config, "MIN_SLOT_SECONDS", 60) or 60)
+        advance_below = int(getattr(config, "MARKET_ADVANCE_REMAINING", 5) or 5)
+        advance_below = max(1, min(advance_below, 30))
         if rem_cur <= 0:
             candidates = (base + slot, base + 2 * slot, base)
-        elif rem_cur < min_rem:
+        elif rem_cur < advance_below:
             candidates = (base + slot, base, base - slot)
         else:
             candidates = (base, base + slot, base - slot)
 
         for slot_start in candidates:
-            slug = f"{config.BTC_SLUG_PREFIX}{slot_start}"
-            try:
-                ev = self._fetch_event_by_slug(slug)
-            except Exception:
-                ev = None
-            packed = self._open_market_from_event(ev, slug, slot_start)
-            if not packed:
-                continue
-            end_ts = packed.get("end_ts")
-            # Skip slots that have already ended on the clock we trust.
-            if end_ts is not None and end_ts <= now:
-                continue
-            return packed
+            packed = self.find_btc_5min_market_at(slot_start, now=now)
+            if packed:
+                return packed
 
         packed = self._scan_markets()
         if packed:
@@ -181,6 +175,25 @@ class PolymarketPublic:
             "No open BTC 5-minute up/down market found. The series may be between "
             "slots (just retry), or Polymarket renamed it \u2014 run `python discover.py` "
             "to inspect, and set BTC_SLUG_PREFIX / BTC_MARKET_MATCH in .env if needed.")
+
+    def find_btc_5min_market_at(
+        self, slot_start_ts: int | float, now: float | None = None
+    ) -> dict | None:
+        """Fetch a specific 5m slot by start timestamp (for hybrid late pin)."""
+        now = time.time() if now is None else float(now)
+        slot_start = int(slot_start_ts)
+        slug = f"{config.BTC_SLUG_PREFIX}{slot_start}"
+        try:
+            ev = self._fetch_event_by_slug(slug)
+        except Exception:
+            ev = None
+        packed = self._open_market_from_event(ev, slug, slot_start)
+        if not packed:
+            return None
+        end_ts = packed.get("end_ts")
+        if end_ts is not None and end_ts <= now:
+            return None
+        return packed
 
     def get_official_btc_updown_outcome(self, slug: str) -> str | None:
         """Return 'UP' or 'DOWN' once Polymarket has resolved the event.
@@ -523,7 +536,7 @@ class PolymarketClient:
                 "Common fixes:\n"
                 "  1) Sync Windows clock\n"
                 "  2) Check PRIVATE_KEY / FUNDER / SIGNATURE_TYPE\n"
-                "  3) Network timeout — retry; avoid spamming Refresh balance\n"
+                "  3) Network timeout - retry; avoid spamming Refresh balance\n"
                 "  4) After one success, creds are cached in state/poly_api_creds.json\n"
             )
 
@@ -567,7 +580,7 @@ class PolymarketClient:
         if funder_l and eoa_l == funder_l:
             if sig != 0:
                 if not getattr(cls, "_sig_warn_printed", False):
-                    print("  [auth] funder matches key — using SIGNATURE_TYPE=0 (EOA)")
+                    print("  [auth] funder matches key - using SIGNATURE_TYPE=0 (EOA)")
                     cls._sig_warn_printed = True
                 sig = 0
                 config.SIGNATURE_TYPE = 0
@@ -578,7 +591,7 @@ class PolymarketClient:
             return 2, eoa  # explicit Gnosis Safe
         if sig != 3:
             if not getattr(cls, "_sig_warn_printed", False):
-                print(f"  [auth] funder != key address — using SIGNATURE_TYPE=3 "
+                print(f"  [auth] funder != key address - using SIGNATURE_TYPE=3 "
                       f"(POLY_1271 deposit wallet); was {sig}")
                 print(f"         EOA={eoa}  funder={funder}")
                 print("         (type 1 returns $0 collateral for most site proxies)")
@@ -744,8 +757,8 @@ class PolymarketClient:
             msg = str(e).lower()
             if "signer address" in msg and "api key" in msg:
                 # Stale cache or wrong signature_type — wipe and rebuild once
-                print("  [auth] signer/API-key mismatch — clearing cache and "
-                      "re-authenticating once…")
+                print("  [auth] signer/API-key mismatch - clearing cache and "
+                      "re-authenticating once...")
                 try:
                     import os
                     path = self._creds_path()

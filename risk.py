@@ -160,7 +160,8 @@ class RiskManager:
             if stake < 0.5:
                 self.last_skip_reason = f"bankroll ${self.bankroll:.2f} below min stake"
                 return 0.0
-            return self._apply_min_shares(round(stake, 2), market_price)
+            stake = self._apply_min_shares(round(stake, 2), market_price)
+            return self._cap_mid_stake(stake, market_price)
 
         # Kelly path: never stake more than a small fraction of remaining bankroll.
         stake = min(stake, max(0.0, self.bankroll * 0.05))
@@ -170,7 +171,23 @@ class RiskManager:
                 f"(bankroll ${self.bankroll:.2f})"
             )
             return 0.0
-        return self._apply_min_shares(round(stake, 2), market_price)
+        stake = self._apply_min_shares(round(stake, 2), market_price)
+        return self._cap_mid_stake(stake, market_price)
+
+    def _cap_mid_stake(self, stake: float, market_price: float) -> float:
+        """Optional mid max-stake after min-share bump (limits loss size)."""
+        if stake <= 0:
+            return 0.0
+        # Only apply when mid-style band (not late favorites ~0.9+).
+        if market_price >= 0.85:
+            return stake
+        max_mid = float(getattr(config, "MID_MAX_STAKE_USD", 0) or 0)
+        if max_mid > 0 and stake > max_mid + 1e-9:
+            self.last_skip_reason = (
+                f"mid stake ${stake:.2f} > MID_MAX_STAKE_USD ${max_mid:.2f}"
+            )
+            return 0.0
+        return stake
 
     def _apply_min_shares(self, stake: float, market_price: float) -> float:
         """Bump stake so shares >= MIN_ORDER_SHARES (Polymarket CLOB ~5 share min)."""
@@ -196,7 +213,13 @@ class RiskManager:
         return round(need_usd, 2)
 
     def size_late_scalp(self, market_price: float) -> float:
-        """Fixed stake for late-favorite mode (no model edge requirement)."""
+        """Fixed stake for late-favorite mode (no model edge requirement).
+
+        Harder-to-lose sizing:
+        - still bumps to CLOB min shares when required
+        - refuses trades that would exceed LATE_SCALP_MAX_STAKE_USD after bump
+          (caps single-trade loss size)
+        """
         self.last_skip_reason = ""
         if self.halted:
             self.last_skip_reason = self.halt_reason or "halted"
@@ -231,7 +254,28 @@ class RiskManager:
         if stake < 0.5:
             self.last_skip_reason = "stake below dust"
             return 0.0
-        return self._apply_min_shares(round(stake, 2), market_price)
+        stake = self._apply_min_shares(round(stake, 2), market_price)
+        if stake <= 0:
+            return 0.0
+        # Hard cap on late loss size (session R13-style -$4.45 blowups).
+        max_late = float(getattr(config, "LATE_SCALP_MAX_STAKE_USD", 0) or 0)
+        if max_late > 0 and stake > max_late + 1e-9:
+            self.last_skip_reason = (
+                f"late stake ${stake:.2f} > LATE_SCALP_MAX_STAKE_USD "
+                f"${max_late:.2f} (skip to limit loss size)"
+            )
+            return 0.0
+        # Extra safety: never risk more than MAX_EXPOSURE_USD * 1.7 on late
+        # (min-shares can exceed MAX_EXPOSURE slightly; keep a hard ceiling).
+        exp_cap = float(getattr(config, "MAX_EXPOSURE_USD", 0) or 0)
+        if exp_cap > 0:
+            hard = max(exp_cap * 1.7, max_late if max_late > 0 else exp_cap)
+            if stake > hard + 1e-9:
+                self.last_skip_reason = (
+                    f"late stake ${stake:.2f} > exposure hard cap ${hard:.2f}"
+                )
+                return 0.0
+        return stake
 
     def on_open(self, stake: float):
         self.open_exposure += stake
