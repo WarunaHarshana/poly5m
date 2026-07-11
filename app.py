@@ -87,6 +87,12 @@ STRATEGY_FIELDS = [
      "default": "5.00", "group": "late"},
     {"key": "LATE_SCALP_MAX_SPREAD", "label": "Late max spread", "type": "float",
      "default": "0.15", "group": "late"},
+    {"key": "LATE_SCALP_MIN_MOVE_USD", "label": "Late min move $", "type": "float",
+     "default": "15.0", "group": "late", "hint": "BTC price must move this much from strike"},
+    {"key": "LATE_SCALP_REQUIRE_CHAINLINK", "label": "Late require Chainlink", "type": "bool",
+     "default": "1", "group": "late", "hint": "Refuse trading on exchange-proxy strikes"},
+    {"key": "LATE_SCALP_MIN_EDGE", "label": "Late min edge", "type": "float",
+     "default": "0.02", "group": "late", "hint": "Min model probability edge over ask"},
     # --- Mid ---
     {"key": "MIN_ENTRY_PRICE", "label": "Mid min entry", "type": "float",
      "default": "0.22", "group": "mid", "hint": "Do not buy cheaper than this"},
