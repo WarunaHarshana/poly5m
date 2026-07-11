@@ -1137,7 +1137,7 @@ def run_realtime(rounds: int = 100, paper: bool = True):
             edge = model_side_prob - mkt  # positive = model thinks we're underpaying
             min_edge = float(getattr(config, "LATE_SCALP_MIN_EDGE", 0.02) or 0)
             print(f"  [late_scalp] model={model_side_prob:.3f} vs ask={mkt:.3f} "
-                  f"edge={edge:.3f} (Z={fv.z_score:.2f}, σ=${fv.sigma_usd:.1f})")
+                  f"edge={edge:.3f} (Z={fv.z_score:.2f}, sigma=${fv.sigma_usd:.1f})")
             if min_edge > 0 and edge < min_edge:
                 if _late_skip(
                     "no_edge",
