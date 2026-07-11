@@ -212,13 +212,12 @@ class RiskManager:
               f"stake ${stake:.2f} -> ${need_usd:.2f}")
         return round(need_usd, 2)
 
-    def size_late_scalp(self, market_price: float) -> float:
-        """Fixed stake for late-favorite mode (no model edge requirement).
+    def size_late_scalp(self, market_price: float, edge: float = 0.0) -> float:
+        """Smart stake for late-favorite mode with optional edge-based scaling.
 
-        Harder-to-lose sizing:
-        - still bumps to CLOB min shares when required
-        - refuses trades that would exceed LATE_SCALP_MAX_STAKE_USD after bump
-          (caps single-trade loss size)
+        When edge > 0, scales stake proportionally (higher edge = larger bet).
+        Still bumps to CLOB min shares when required and refuses trades that
+        would exceed LATE_SCALP_MAX_STAKE_USD after bump (caps loss size).
         """
         self.last_skip_reason = ""
         if self.halted:
@@ -244,7 +243,22 @@ class RiskManager:
             )
             return 0.0
         fixed = getattr(config, "FIXED_STAKE_USD", 0.0) or 0.0
-        stake = float(fixed) if fixed > 0 else float(config.BASE_TRADE_USD)
+        if fixed > 0:
+            stake = float(fixed)
+        elif edge > 0:
+            # Edge-scaled sizing: higher edge → larger stake (capped).
+            # At edge=0.05 with bankroll=$50, kelly_frac=0.10 → ~$0.25 base
+            # but min-shares bump will bring it to venue floor anyway.
+            kelly_frac = getattr(config, "KELLY_FRACTION", 0.10) or 0.10
+            win_per_share = 1.0 - market_price
+            if win_per_share > 0:
+                kelly_f = kelly_frac * (edge / market_price)
+                stake = max(float(config.BASE_TRADE_USD),
+                            round(self.bankroll * kelly_f, 2))
+            else:
+                stake = float(config.BASE_TRADE_USD)
+        else:
+            stake = float(config.BASE_TRADE_USD)
         # Prefer configured max, but min-share bump may exceed it (venue floor).
         stake = min(stake, max(config.MAX_TRADE_USD, stake))
         if self.bankroll < 0.5:

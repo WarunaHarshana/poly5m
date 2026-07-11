@@ -38,15 +38,20 @@ def _env_bool(name: str, default: bool = False) -> bool:
 # --- Mode ---
 MODE = os.getenv("MODE", "paper")  # paper | paper_live | live
 # Strategy:
-#   mid        = mid-slot value band (default; edge vs strike + model)
-#   late_scalp = last ~35s–8s favorites only (Bone Reaper–style; paper first)
-#   hybrid     = late preferred; mid only if exceptional, else late_scalp same slot
+#   mid         = mid-slot value band (default; edge vs strike + model)
+#   late_scalp  = selective late favorites (stricter gates)
+#   late_every  = late scalp EVERY 5m slot (relaxed; more activity/risk)
+#   hybrid      = late preferred; mid only if exceptional, else late same slot
 STRATEGY = (os.getenv("STRATEGY") or "mid").strip().lower()
 
 # --- Polymarket / chain ---
 CLOB_HOST = os.getenv("CLOB_HOST", "https://clob.polymarket.com")
 GAMMA_HOST = os.getenv("GAMMA_HOST", "https://gamma-api.polymarket.com")
 CHAIN_ID = int(os.getenv("CHAIN_ID", "137"))  # Polygon mainnet
+# Authenticated CLOB httpx timeout (py-clob-client-v2 default is too tight).
+CLOB_HTTP_TIMEOUT = float(os.getenv("CLOB_HTTP_TIMEOUT", "30"))
+# Min seconds between update_balance_allowance calls (dashboard polls often).
+CLOB_BALANCE_REFRESH_S = float(os.getenv("CLOB_BALANCE_REFRESH_S", "60"))
 PRIVATE_KEY = os.getenv("PRIVATE_KEY")
 FUNDER_ADDRESS = os.getenv("FUNDER_ADDRESS")
 SIGNATURE_TYPE = int(os.getenv("SIGNATURE_TYPE", "3"))  # 0=EOA, 1=POLY_PROXY, 2=Safe, 3=deposit/EIP-1271
@@ -85,8 +90,6 @@ MAX_TRADE_REMAINING = int(os.getenv("MAX_TRADE_REMAINING", "240"))
 # Must stay LOW (≤ late window) or hybrid never reaches late_scalp (was wrongly
 # tied to MIN_SLOT_SECONDS=90, which abandoned slots ~100s early).
 MARKET_ADVANCE_REMAINING = int(os.getenv("MARKET_ADVANCE_REMAINING", "5"))
-# Mid path requires Chainlink Data Stream strike (refuse exchange-proxy).
-MID_REQUIRE_CHAINLINK_STRIKE = _env_bool("MID_REQUIRE_CHAINLINK_STRIKE", True)
 
 # --- BTC price feed (real data) ---
 # Polymarket 5m BTC markets resolve on Chainlink BTC/USD — put chainlink first
@@ -99,39 +102,42 @@ BTC_PRICE_SOURCES = [s.strip() for s in os.getenv(
 ROUND_SECONDS = int(os.getenv("ROUND_SECONDS", "300"))
 MOMENTUM_LOOKBACK = int(os.getenv("MOMENTUM_LOOKBACK", "12"))
 SAMPLE_SECONDS = float(os.getenv("SAMPLE_SECONDS", "5"))
-EDGE_THRESHOLD = float(os.getenv("EDGE_THRESHOLD", "0.10"))
-MIN_EV = float(os.getenv("MIN_EV", "0.06"))
+EDGE_THRESHOLD = float(os.getenv("EDGE_THRESHOLD", "0.04"))
+MIN_EV = float(os.getenv("MIN_EV", "0.02"))
 VOL_BLEND = float(os.getenv("VOL_BLEND", "0.5"))
-MAX_SPREAD = float(os.getenv("MAX_SPREAD", "0.05"))
+MAX_SPREAD = float(os.getenv("MAX_SPREAD", "0.08"))
 # Assumed / buffer for fees + adverse selection (subtracted from model edge).
-FEE_BUFFER = float(os.getenv("FEE_BUFFER", "0.015"))
+FEE_BUFFER = float(os.getenv("FEE_BUFFER", "0.01"))
 # Only buy contracts in this ask band (avoid expensive favorites / lottery tickets).
-MIN_ENTRY_PRICE = float(os.getenv("MIN_ENTRY_PRICE", "0.32"))
-MAX_ENTRY_PRICE = float(os.getenv("MAX_ENTRY_PRICE", "0.55"))
+MIN_ENTRY_PRICE = float(os.getenv("MIN_ENTRY_PRICE", "0.22"))
+MAX_ENTRY_PRICE = float(os.getenv("MAX_ENTRY_PRICE", "0.72"))
 # Require signal confidence and a clear move vs strike (in $) before trading.
-MIN_CONFIDENCE = float(os.getenv("MIN_CONFIDENCE", "0.55"))
-MIN_MOVE_USD = float(os.getenv("MIN_MOVE_USD", "15.0"))  # |spot - strike|
+MIN_CONFIDENCE = float(os.getenv("MIN_CONFIDENCE", "0.40"))
+MIN_MOVE_USD = float(os.getenv("MIN_MOVE_USD", "5.0"))  # |spot - strike|
 # Minimum size sitting on the best ask (shares); 0 = disabled (paper-friendly).
 MIN_ASK_SIZE = float(os.getenv("MIN_ASK_SIZE", "0"))
 
 # Mid-only quality guards (STRATEGY=mid). Archive mid was ~44% WR / flat PnL;
 # skip overconfident cheap tickets and soft edges.
-MID_MIN_MODEL = float(os.getenv("MID_MIN_MODEL", "0.60"))
-MID_MAX_MODEL = float(os.getenv("MID_MAX_MODEL", "0.88"))
-# If ask is this cheap AND model above this -> skip (lottery + fake confidence).
-MID_CHEAP_ASK = float(os.getenv("MID_CHEAP_ASK", "0.38"))
-MID_CHEAP_MAX_MODEL = float(os.getenv("MID_CHEAP_MAX_MODEL", "0.82"))
+MID_MIN_MODEL = float(os.getenv("MID_MIN_MODEL", "0.52"))
+MID_MAX_MODEL = float(os.getenv("MID_MAX_MODEL", "0.95"))
+# If ask is this cheap AND model above this -> skip (0 / 1 = disabled).
+MID_CHEAP_ASK = float(os.getenv("MID_CHEAP_ASK", "0.0"))
+MID_CHEAP_MAX_MODEL = float(os.getenv("MID_CHEAP_MAX_MODEL", "1.0"))
 MID_REQUOTE = _env_bool("MID_REQUOTE", True)
 MID_REQUOTE_SLEEP_S = float(os.getenv("MID_REQUOTE_SLEEP_S", "0.40"))
 MID_MAX_ASK_JUMP = float(os.getenv("MID_MAX_ASK_JUMP", "0.02"))
-MID_PAUSE_SLOTS_AFTER_LOSS = int(os.getenv("MID_PAUSE_SLOTS_AFTER_LOSS", "2"))
-MID_MAX_STAKE_USD = float(os.getenv("MID_MAX_STAKE_USD", "3.50"))
-# Fair-value mid: require |move| >= Z * sigma_usd (noise-relative, not fixed $).
+MID_PAUSE_SLOTS_AFTER_LOSS = int(os.getenv("MID_PAUSE_SLOTS_AFTER_LOSS", "1"))
+MID_MAX_STAKE_USD = float(os.getenv("MID_MAX_STAKE_USD", "4.0"))
+# Fair-value: used for edge sizing/logging. Noise floor off when CAP=0.
 MID_USE_FAIR_VALUE = _env_bool("MID_USE_FAIR_VALUE", True)
-MID_Z_MIN = float(os.getenv("MID_Z_MIN", "1.0"))
-MID_REQUIRE_SIGNIFICANT = _env_bool("MID_REQUIRE_SIGNIFICANT", True)
-# Chop: skip mid if price crossed strike this many times in warmup samples.
-MID_MAX_CHOP_CROSSES = int(os.getenv("MID_MAX_CHOP_CROSSES", "3"))
+MID_Z_MIN = float(os.getenv("MID_Z_MIN", "0.15"))
+# Cap on Z*sigma floor (USD). 0 = do not raise min move above MIN_MOVE_USD.
+MID_NOISE_MOVE_CAP = float(os.getenv("MID_NOISE_MOVE_CAP", "0"))
+MID_REQUIRE_SIGNIFICANT = _env_bool("MID_REQUIRE_SIGNIFICANT", False)
+MID_MAX_CHOP_CROSSES = int(os.getenv("MID_MAX_CHOP_CROSSES", "6"))
+# Paper default: allow proxy strike (Chainlink open often missing if bot joins late)
+MID_REQUIRE_CHAINLINK_STRIKE = _env_bool("MID_REQUIRE_CHAINLINK_STRIKE", False)
 # Pessimistic paper fills: add this to ask for simulated entry (Tier 1 realism).
 PAPER_FILL_SLIPPAGE = float(os.getenv("PAPER_FILL_SLIPPAGE", "0.01"))
 # Book quality (Tier 2)
@@ -147,27 +153,43 @@ DECISION_JOURNAL = _env_bool("DECISION_JOURNAL", True)
 # payoff than ultra-rich 0.97+ asks. R13-style 0.89 losses are filtered out.
 # Enter only when remaining seconds in [LATE_SCALP_MIN_REMAINING, LATE_SCALP_MAX_REMAINING]
 # and the favorite ask is in [LATE_SCALP_MIN_ENTRY, LATE_SCALP_MAX_ENTRY].
-LATE_SCALP_MIN_REMAINING = int(os.getenv("LATE_SCALP_MIN_REMAINING", "10"))
-LATE_SCALP_MAX_REMAINING = int(os.getenv("LATE_SCALP_MAX_REMAINING", "22"))
-LATE_SCALP_MIN_ENTRY = float(os.getenv("LATE_SCALP_MIN_ENTRY", "0.93"))
-LATE_SCALP_MAX_ENTRY = float(os.getenv("LATE_SCALP_MAX_ENTRY", "0.96"))
+LATE_SCALP_MIN_REMAINING = int(os.getenv("LATE_SCALP_MIN_REMAINING", "8"))
+LATE_SCALP_MAX_REMAINING = int(os.getenv("LATE_SCALP_MAX_REMAINING", "50"))
+# Default band wide enough for every-slot mode (clamp if needed).
+# Min favorite ask — below this is near coin-flip (R5 lost @ 0.57).
+LATE_SCALP_MIN_ENTRY = float(os.getenv("LATE_SCALP_MIN_ENTRY", "0.60"))
+LATE_SCALP_MAX_ENTRY = float(os.getenv("LATE_SCALP_MAX_ENTRY", "0.99"))
+# Prefer entries at/under this ask (ignored when LATE_SCALP_EVERY_SLOT=1).
+LATE_SCALP_PREFER_MAX = float(os.getenv("LATE_SCALP_PREFER_MAX", "0.99"))
 # Minimum gap between favorite ask and underdog ask (favorite clearly leading).
-LATE_SCALP_MIN_FAVORITE_LEAD = float(os.getenv("LATE_SCALP_MIN_FAVORITE_LEAD", "0.70"))
-# Underdog ask must be this low (favorite solidly priced in).
-LATE_SCALP_MAX_UNDERDOG_ASK = float(os.getenv("LATE_SCALP_MAX_UNDERDOG_ASK", "0.08"))
+LATE_SCALP_MIN_FAVORITE_LEAD = float(os.getenv("LATE_SCALP_MIN_FAVORITE_LEAD", "0.05"))
+# Underdog ask must be this low (0 = off in every-slot).
+LATE_SCALP_MAX_UNDERDOG_ASK = float(os.getenv("LATE_SCALP_MAX_UNDERDOG_ASK", "0.42"))
 # Require spot vs strike to agree with the favorite side (skip book/spot fights).
-LATE_SCALP_REQUIRE_SPOT_ALIGN = _env_bool("LATE_SCALP_REQUIRE_SPOT_ALIGN", True)
-LATE_SCALP_SPOT_ALIGN_EPS_USD = float(os.getenv("LATE_SCALP_SPOT_ALIGN_EPS_USD", "3.0"))
+LATE_SCALP_REQUIRE_SPOT_ALIGN = _env_bool("LATE_SCALP_REQUIRE_SPOT_ALIGN", False)
+LATE_SCALP_SPOT_ALIGN_EPS_USD = float(os.getenv("LATE_SCALP_SPOT_ALIGN_EPS_USD", "8.0"))
 # Re-check book after a short pause; skip if favorite flips or ask jumps.
-LATE_SCALP_REQUOTE = _env_bool("LATE_SCALP_REQUOTE", True)
-LATE_SCALP_REQUOTE_SLEEP_S = float(os.getenv("LATE_SCALP_REQUOTE_SLEEP_S", "0.45"))
-LATE_SCALP_MAX_ASK_JUMP = float(os.getenv("LATE_SCALP_MAX_ASK_JUMP", "0.015"))
+LATE_SCALP_REQUOTE = _env_bool("LATE_SCALP_REQUOTE", False)
+LATE_SCALP_REQUOTE_SLEEP_S = float(os.getenv("LATE_SCALP_REQUOTE_SLEEP_S", "0.25"))
+LATE_SCALP_MAX_ASK_JUMP = float(os.getenv("LATE_SCALP_MAX_ASK_JUMP", "0.10"))
+# If requote spikes higher, keep original limit when it is still in the sweet band.
+LATE_SCALP_KEEP_FIRST_ASK = _env_bool("LATE_SCALP_KEEP_FIRST_ASK", True)
 # After a late loss, skip this many subsequent late windows (cooldown).
-LATE_SCALP_PAUSE_SLOTS_AFTER_LOSS = int(os.getenv("LATE_SCALP_PAUSE_SLOTS_AFTER_LOSS", "3"))
-# Cap stake even after min-share bump (skip trade if venue min would exceed).
-LATE_SCALP_MAX_STAKE_USD = float(os.getenv("LATE_SCALP_MAX_STAKE_USD", "4.90"))
+LATE_SCALP_PAUSE_SLOTS_AFTER_LOSS = int(os.getenv("LATE_SCALP_PAUSE_SLOTS_AFTER_LOSS", "0"))
+# Cap stake even after min-share bump (5 * 0.99 = 4.95).
+LATE_SCALP_MAX_STAKE_USD = float(os.getenv("LATE_SCALP_MAX_STAKE_USD", "5.00"))
 # Prefer slightly wider late max-spread than mid (books thin near end).
-LATE_SCALP_MAX_SPREAD = float(os.getenv("LATE_SCALP_MAX_SPREAD", "0.05"))
+LATE_SCALP_MAX_SPREAD = float(os.getenv("LATE_SCALP_MAX_SPREAD", "0.15"))
+# 1 = try to place a late trade every 5m slot (relaxed gates; more risk).
+LATE_SCALP_EVERY_SLOT = _env_bool("LATE_SCALP_EVERY_SLOT", True)
+
+# --- Late-scalp v2 improvements (smart filters) ---
+# Minimum |spot − strike| move in USD before entering. Skip coin-flip slots.
+LATE_SCALP_MIN_MOVE_USD = float(os.getenv("LATE_SCALP_MIN_MOVE_USD", "15.0"))
+# Require Chainlink Data Stream tick for strike (refuse exchange-proxy strikes).
+LATE_SCALP_REQUIRE_CHAINLINK = _env_bool("LATE_SCALP_REQUIRE_CHAINLINK", True)
+# Minimum model edge (model_prob − market_ask) to enter. 0 = off (legacy).
+LATE_SCALP_MIN_EDGE = float(os.getenv("LATE_SCALP_MIN_EDGE", "0.02"))
 
 # --- Hybrid (STRATEGY=hybrid): prefer late; mid only if exceptional ---
 # When true (default), mid must clear HYBRID_MID_* bars on top of normal mid filters;
@@ -325,14 +347,14 @@ def apply_late_scalp_profile() -> list[str]:
     MAX_ENTRY_PRICE = float(LATE_SCALP_MAX_ENTRY)
     notes.append(
         f"entry band -> [{MIN_ENTRY_PRICE:.2f}, {MAX_ENTRY_PRICE:.2f}] "
-        f"(strict late favorite; skip soft 0.88-0.92 and micro-payout 0.97+)"
+        f"(late favorites from ~0.90; skip micro-payout 0.97+)"
     )
 
     # Book/signal gates: late scalp is book-driven, not model-edge driven
     EDGE_THRESHOLD = 0.0
     MIN_EV = 0.0
     MIN_CONFIDENCE = 0.0
-    MIN_MOVE_USD = 0.0
+    MIN_MOVE_USD = max(MIN_MOVE_USD, LATE_SCALP_MIN_MOVE_USD)
     FEE_BUFFER = min(FEE_BUFFER, 0.01)
     MAX_SPREAD = max(MAX_SPREAD, 0.08) if MAX_SPREAD > 0 else 0.08
     # Paper-friendly depth; live safety may have raised MIN_ASK_SIZE already
@@ -346,8 +368,17 @@ def apply_late_scalp_profile() -> list[str]:
     return notes
 
 
+def is_late_every() -> bool:
+    """True for every-5m-slot late mode (menu: late_every)."""
+    return (STRATEGY or "mid").strip().lower() in (
+        "late_every", "late_scalp_every", "every_slot", "every", "late_all",
+    )
+
+
 def is_late_scalp() -> bool:
-    """True only for pure late_scalp (not hybrid)."""
+    """True for pure late strategies (selective or every-slot), not hybrid."""
+    if is_late_every():
+        return True
     return (STRATEGY or "mid").strip().lower() in (
         "late_scalp", "latescalp", "late", "scalp", "bone_reaper", "convergence",
     )
@@ -357,6 +388,28 @@ def is_hybrid() -> bool:
     return (STRATEGY or "mid").strip().lower() in (
         "hybrid", "mid_then_late", "both", "late_then_mid", "prefer_late",
     )
+
+
+def apply_strategy_flags() -> None:
+    """Normalize STRATEGY aliases and set LATE_SCALP_EVERY_SLOT from menu choice.
+
+    Call after CLI/env STRATEGY is set so dashboard menu options behave:
+      late_every  -> late path + EVERY_SLOT on
+      late_scalp  -> late path + EVERY_SLOT off (unless env already forced)
+    """
+    global STRATEGY, LATE_SCALP_EVERY_SLOT
+    s = (STRATEGY or "mid").strip().lower()
+    if s in ("late_every", "late_scalp_every", "every_slot", "every", "late_all"):
+        STRATEGY = "late_every"
+        LATE_SCALP_EVERY_SLOT = True
+    elif s in ("late_scalp", "latescalp", "late", "scalp", "bone_reaper", "convergence"):
+        STRATEGY = "late_scalp"
+        # Menu "late_scalp" = selective; only keep EVERY_SLOT if explicitly late_every
+        LATE_SCALP_EVERY_SLOT = False
+    elif s in ("hybrid", "mid_then_late", "both", "late_then_mid", "prefer_late"):
+        STRATEGY = "hybrid"
+    elif s in ("mid", "middle", "value"):
+        STRATEGY = "mid"
 
 
 def hybrid_prefer_late() -> bool:
@@ -395,6 +448,8 @@ def mid_exceptional_ok(
 def strategy_name() -> str:
     if is_hybrid():
         return "hybrid"
+    if is_late_every():
+        return "late_every"
     if is_late_scalp():
         return "late_scalp"
     return "mid"

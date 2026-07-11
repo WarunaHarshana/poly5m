@@ -15,12 +15,49 @@ only as a fallback.
 """
 from __future__ import annotations
 import json
+import logging
 import time
 
 import config
 
 UP_WORDS = {"up", "yes", "higher", "above"}
 DOWN_WORDS = {"down", "no", "lower", "below"}
+
+# py-clob-client-v2 logs every timeout as ERROR even when we handle retries.
+# Keep the console clean; real failures still surface via our own messages.
+logging.getLogger("py_clob_client_v2").setLevel(logging.CRITICAL)
+logging.getLogger("py_clob_client_v2.http_helpers").setLevel(logging.CRITICAL)
+logging.getLogger("py_clob_client_v2.http_helpers.helpers").setLevel(logging.CRITICAL)
+
+_clob_http_patched = False
+_last_balance_refresh_ts = 0.0
+
+
+def _patch_clob_http_timeout(timeout_s: float = 30.0) -> None:
+    """Give CLOB httpx client a longer timeout (library default is too short)."""
+    global _clob_http_patched
+    if _clob_http_patched:
+        return
+    try:
+        import httpx
+        from py_clob_client_v2.http_helpers import helpers as h
+        # Replace shared client with explicit connect/read timeouts.
+        try:
+            old = getattr(h, "_http_client", None)
+            if old is not None:
+                try:
+                    old.close()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        h._http_client = httpx.Client(
+            http2=True,
+            timeout=httpx.Timeout(timeout_s, connect=min(15.0, timeout_s)),
+        )
+        _clob_http_patched = True
+    except Exception:
+        pass
 
 
 class PolymarketPublic:
@@ -551,6 +588,9 @@ class PolymarketClient:
     @staticmethod
     def _make_clob(pk: str, funder: str, sig: int):
         from py_clob_client_v2 import ClobClient
+        _patch_clob_http_timeout(
+            float(getattr(config, "CLOB_HTTP_TIMEOUT", 30) or 30)
+        )
         return ClobClient(
             config.CLOB_HOST,
             chain_id=int(config.CHAIN_ID),
@@ -654,17 +694,18 @@ class PolymarketClient:
 
         Returns:
           {ok, balance_usd, allowance_usd, funder, raw, error?}
+
+        Note: update_balance_allowance is rate-limited to once per
+        CLOB_BALANCE_REFRESH_S seconds — dashboard polls must not hammer CLOB.
         """
+        global _last_balance_refresh_ts
         from py_clob_client_v2.clob_types import BalanceAllowanceParams, AssetType
+        _patch_clob_http_timeout(
+            float(getattr(config, "CLOB_HTTP_TIMEOUT", 30) or 30)
+        )
         params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
-        c = self._client()
-        if refresh:
-            try:
-                c.update_balance_allowance(params)
-            except Exception:
-                pass  # still try cached get
         try:
-            raw = c.get_balance_allowance(params)
+            c = self._client()
         except Exception as e:
             return {
                 "ok": False,
@@ -673,6 +714,32 @@ class PolymarketClient:
                 "funder": config.FUNDER_ADDRESS,
                 "raw": None,
                 "error": str(e),
+            }
+        # Full on-chain refresh is expensive and often times out on Windows.
+        refresh_every = float(getattr(config, "CLOB_BALANCE_REFRESH_S", 60) or 60)
+        now = time.time()
+        do_refresh = bool(refresh) and (
+            now - _last_balance_refresh_ts >= refresh_every
+        )
+        if do_refresh:
+            try:
+                c.update_balance_allowance(params)
+                _last_balance_refresh_ts = now
+            except Exception:
+                pass  # still try cached get
+        try:
+            raw = c.get_balance_allowance(params)
+        except Exception as e:
+            err = str(e)
+            if "Request exception" in err or "timeout" in err.lower():
+                err = "CLOB timed out (network/API busy) — will retry"
+            return {
+                "ok": False,
+                "balance_usd": None,
+                "allowance_usd": None,
+                "funder": config.FUNDER_ADDRESS,
+                "raw": None,
+                "error": err,
             }
         bal = allow = None
         if isinstance(raw, dict):

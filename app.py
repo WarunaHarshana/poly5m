@@ -46,6 +46,212 @@ _ENV_KEYS = (
     "MAX_TRADES_PER_DAY", "MAX_CONSECUTIVE_LOSSES",
 )
 
+# Tunables editable from the dashboard (never secrets).
+# Each field: key, label, type (float|int|bool|str), default, group, hint
+STRATEGY_FIELDS = [
+    # --- Strategy / mode-ish ---
+    {"key": "STRATEGY", "label": "Default strategy", "type": "str",
+     "default": "mid", "group": "general",
+     "hint": "mid | late_scalp | late_every | hybrid (Start menu can override)"},
+    # --- Late scalp bands ---
+    {"key": "LATE_SCALP_EVERY_SLOT", "label": "Trade every 5m slot", "type": "bool",
+     "default": "1", "group": "late",
+     "hint": "1=relaxed gates, try to bet every slot (more risk)"},
+    {"key": "LATE_SCALP_MIN_ENTRY", "label": "Late min entry (favorite ask)", "type": "float",
+     "default": "0.60", "group": "late",
+     "hint": "Skip softer favorites (0.57 loss) — try 0.60+"},
+    {"key": "LATE_SCALP_MAX_ENTRY", "label": "Late max entry (hard cap)", "type": "float",
+     "default": "0.99", "group": "late", "hint": "Hard max ask allowed"},
+    {"key": "LATE_SCALP_PREFER_MAX", "label": "Late prefer max (sweet spot)", "type": "float",
+     "default": "0.99", "group": "late",
+     "hint": "Ignored when Trade every 5m slot is ON"},
+    {"key": "LATE_SCALP_MIN_REMAINING", "label": "Late min seconds left", "type": "int",
+     "default": "8", "group": "late", "hint": "Stop trading below this many seconds"},
+    {"key": "LATE_SCALP_MAX_REMAINING", "label": "Late max seconds left", "type": "int",
+     "default": "50", "group": "late", "hint": "Start late window at this many seconds"},
+    {"key": "LATE_SCALP_MIN_FAVORITE_LEAD", "label": "Min favorite lead", "type": "float",
+     "default": "0.02", "group": "late", "hint": "fav_ask - dog_ask must be >= this"},
+    {"key": "LATE_SCALP_MAX_UNDERDOG_ASK", "label": "Max underdog ask", "type": "float",
+     "default": "0.49", "group": "late", "hint": "Other side max (relaxed for every-slot)"},
+    {"key": "LATE_SCALP_REQUIRE_SPOT_ALIGN", "label": "Require spot aligns with favorite", "type": "bool",
+     "default": "0", "group": "late", "hint": "0 recommended for every-slot mode"},
+    {"key": "LATE_SCALP_SPOT_ALIGN_EPS_USD", "label": "Spot align epsilon $", "type": "float",
+     "default": "8", "group": "late", "hint": "Allow this $ noise vs strike"},
+    {"key": "LATE_SCALP_REQUOTE", "label": "Late requote before fill", "type": "bool",
+     "default": "0", "group": "late"},
+    {"key": "LATE_SCALP_KEEP_FIRST_ASK", "label": "Keep first ask if requote spikes", "type": "bool",
+     "default": "1", "group": "late", "hint": "1=limit at first ask instead of chasing"},
+    {"key": "LATE_SCALP_PAUSE_SLOTS_AFTER_LOSS", "label": "Pause late windows after loss", "type": "int",
+     "default": "0", "group": "late"},
+    {"key": "LATE_SCALP_MAX_STAKE_USD", "label": "Late max stake $", "type": "float",
+     "default": "5.00", "group": "late"},
+    {"key": "LATE_SCALP_MAX_SPREAD", "label": "Late max spread", "type": "float",
+     "default": "0.15", "group": "late"},
+    # --- Mid ---
+    {"key": "MIN_ENTRY_PRICE", "label": "Mid min entry", "type": "float",
+     "default": "0.22", "group": "mid", "hint": "Do not buy cheaper than this"},
+    {"key": "MAX_ENTRY_PRICE", "label": "Mid max entry", "type": "float",
+     "default": "0.72", "group": "mid", "hint": "Do not buy richer than this"},
+    {"key": "EDGE_THRESHOLD", "label": "Min edge", "type": "float",
+     "default": "0.04", "group": "mid"},
+    {"key": "MIN_EV", "label": "Min EV", "type": "float",
+     "default": "0.02", "group": "mid"},
+    {"key": "MIN_MOVE_USD", "label": "Min move $ vs strike", "type": "float",
+     "default": "5", "group": "mid"},
+    {"key": "MIN_CONFIDENCE", "label": "Min confidence", "type": "float",
+     "default": "0.40", "group": "mid"},
+    {"key": "MAX_SPREAD", "label": "Max spread (mid)", "type": "float",
+     "default": "0.08", "group": "mid"},
+    {"key": "FEE_BUFFER", "label": "Fee buffer", "type": "float",
+     "default": "0.01", "group": "mid"},
+    {"key": "MIN_SLOT_SECONDS", "label": "Min seconds left (mid window)", "type": "int",
+     "default": "60", "group": "mid"},
+    {"key": "MAX_TRADE_REMAINING", "label": "Max seconds left (mid window)", "type": "int",
+     "default": "240", "group": "mid"},
+    {"key": "MID_MIN_MODEL", "label": "Mid min model prob", "type": "float",
+     "default": "0.52", "group": "mid"},
+    {"key": "MID_MAX_MODEL", "label": "Mid max model prob", "type": "float",
+     "default": "0.95", "group": "mid"},
+    {"key": "MID_NOISE_MOVE_CAP", "label": "Noise move cap $ (0=off)", "type": "float",
+     "default": "0", "group": "mid", "hint": "0 = only MIN_MOVE_USD applies"},
+    {"key": "MID_Z_MIN", "label": "Fair-value Z min", "type": "float",
+     "default": "0.15", "group": "mid"},
+    {"key": "MID_USE_FAIR_VALUE", "label": "Use fair-value model", "type": "bool",
+     "default": "1", "group": "mid"},
+    {"key": "MID_REQUIRE_SIGNIFICANT", "label": "Require significant Z", "type": "bool",
+     "default": "0", "group": "mid"},
+    {"key": "MID_REQUIRE_CHAINLINK_STRIKE", "label": "Require Chainlink strike", "type": "bool",
+     "default": "0", "group": "mid", "hint": "1=block exchange-proxy strikes"},
+    {"key": "MID_MAX_CHOP_CROSSES", "label": "Max chop crosses", "type": "int",
+     "default": "6", "group": "mid"},
+    {"key": "MID_REQUOTE", "label": "Mid requote", "type": "bool",
+     "default": "1", "group": "mid"},
+    {"key": "MID_PAUSE_SLOTS_AFTER_LOSS", "label": "Pause mid slots after loss", "type": "int",
+     "default": "1", "group": "mid"},
+    {"key": "MID_MAX_STAKE_USD", "label": "Mid max stake $", "type": "float",
+     "default": "4.00", "group": "mid"},
+    {"key": "PAPER_FILL_SLIPPAGE", "label": "Paper fill slippage", "type": "float",
+     "default": "0.01", "group": "mid"},
+    # --- Hybrid ---
+    {"key": "HYBRID_PREFER_LATE", "label": "Hybrid prefer late", "type": "bool",
+     "default": "1", "group": "hybrid"},
+    {"key": "HYBRID_MID_MIN_EDGE", "label": "Hybrid mid min edge", "type": "float",
+     "default": "0.10", "group": "hybrid"},
+    {"key": "HYBRID_MID_MIN_MOVE_USD", "label": "Hybrid mid min move $", "type": "float",
+     "default": "15", "group": "hybrid"},
+    {"key": "HYBRID_MID_MIN_MODEL", "label": "Hybrid mid min model", "type": "float",
+     "default": "0.65", "group": "hybrid"},
+    {"key": "HYBRID_MID_MIN_CONFIDENCE", "label": "Hybrid mid min conf", "type": "float",
+     "default": "0.55", "group": "hybrid"},
+    # --- Risk ---
+    {"key": "FIXED_STAKE_USD", "label": "Fixed stake $", "type": "float",
+     "default": "1", "group": "risk"},
+    {"key": "BASE_TRADE_USD", "label": "Base trade $", "type": "float",
+     "default": "1", "group": "risk"},
+    {"key": "MAX_TRADE_USD", "label": "Max trade $", "type": "float",
+     "default": "1", "group": "risk"},
+    {"key": "MAX_EXPOSURE_USD", "label": "Max exposure $", "type": "float",
+     "default": "1", "group": "risk"},
+    {"key": "STARTING_BANKROLL", "label": "Starting bankroll $", "type": "float",
+     "default": "50", "group": "risk"},
+    {"key": "DAILY_LOSS_LIMIT_USD", "label": "Daily loss limit $", "type": "float",
+     "default": "5", "group": "risk"},
+    {"key": "DAILY_LOSS_LIMIT_PCT", "label": "Daily loss limit % (0=off)", "type": "float",
+     "default": "0", "group": "risk"},
+    {"key": "MAX_TRADES_PER_DAY", "label": "Max trades / day", "type": "int",
+     "default": "50", "group": "risk"},
+    {"key": "MAX_CONSECUTIVE_LOSSES", "label": "Max consecutive losses", "type": "int",
+     "default": "2", "group": "risk"},
+    {"key": "MIN_ORDER_SHARES", "label": "Min order shares", "type": "float",
+     "default": "5", "group": "risk"},
+    {"key": "ENFORCE_MIN_SHARES", "label": "Enforce min shares", "type": "bool",
+     "default": "1", "group": "risk"},
+]
+
+_SETTINGS_KEYS = {f["key"] for f in STRATEGY_FIELDS}
+_SETTINGS_BY_KEY = {f["key"]: f for f in STRATEGY_FIELDS}
+
+
+def _settings_payload() -> dict:
+    """Current strategy settings from .env + schema for the UI."""
+    env = _parse_env_file()
+    groups = {
+        "general": "General",
+        "late": "Late scalp bands & guards",
+        "mid": "Mid strategy",
+        "hybrid": "Hybrid",
+        "risk": "Risk & size",
+    }
+    fields = []
+    for f in STRATEGY_FIELDS:
+        val = env.get(f["key"], f.get("default", ""))
+        fields.append({**f, "value": val})
+    return {
+        "ok": True,
+        "groups": groups,
+        "fields": fields,
+        "note": "Saved to local .env. Restart the bot (Stop then Start) for changes to apply.",
+    }
+
+
+def _save_settings(body: dict) -> dict:
+    """Write allowed strategy keys to .env. Rejects secrets."""
+    if not isinstance(body, dict):
+        return {"ok": False, "error": "Invalid body"}
+    raw = body.get("settings") if isinstance(body.get("settings"), dict) else body
+    updates = {}
+    errors = []
+    blocked = {"PRIVATE_KEY", "POLY_API_KEY", "POLY_API_SECRET", "POLY_API_PASSPHRASE"}
+    for k, v in raw.items():
+        k = str(k).strip()
+        if k in blocked:
+            errors.append(f"{k} cannot be set here")
+            continue
+        if k not in _SETTINGS_KEYS:
+            continue  # ignore unknown
+        meta = _SETTINGS_BY_KEY[k]
+        s = "" if v is None else str(v).strip()
+        if meta["type"] == "bool":
+            s = "1" if s.lower() in ("1", "true", "yes", "y", "on") else "0"
+        elif meta["type"] == "int":
+            try:
+                s = str(int(float(s)))
+            except ValueError:
+                errors.append(f"{k}: need integer")
+                continue
+        elif meta["type"] == "float":
+            try:
+                s = str(float(s))
+            except ValueError:
+                errors.append(f"{k}: need number")
+                continue
+        elif k == "STRATEGY":
+            s = s.lower()
+            if s not in ("mid", "late_scalp", "late_every", "hybrid"):
+                errors.append(
+                    "STRATEGY must be mid, late_scalp, late_every, or hybrid")
+                continue
+            # Keep LATE_SCALP_EVERY_SLOT in sync with strategy menu choice
+            if s == "late_every":
+                updates["LATE_SCALP_EVERY_SLOT"] = "1"
+            elif s == "late_scalp":
+                updates["LATE_SCALP_EVERY_SLOT"] = "0"
+        updates[k] = s
+    if errors and not updates:
+        return {"ok": False, "error": "; ".join(errors)}
+    if not updates:
+        return {"ok": False, "error": "No valid settings to save"}
+    try:
+        _upsert_env(updates)
+    except Exception as e:
+        return {"ok": False, "error": f"Failed to write .env: {e}"}
+    out = _settings_payload()
+    out["ok"] = True
+    out["saved"] = list(updates.keys())
+    if errors:
+        out["warnings"] = errors
+    return out
+
 
 def _parse_env_file(path: str = ENV_PATH) -> dict:
     """Parse KEY=VALUE lines from .env (best-effort; comments ignored)."""
@@ -235,11 +441,17 @@ def _reload_config_from_env() -> None:
 
 
 _last_balance_ok = None  # cache last good reading across transient Windows socket errors
+_balance_in_flight = False
+_balance_lock = threading.Lock()
 
 
 def _fetch_polymarket_balance() -> dict:
-    """Live USDC collateral for the configured funder (needs private key)."""
-    global _last_balance_ok
+    """Live USDC collateral for the configured funder (needs private key).
+
+    Transient CLOB timeouts are common on Windows; we return the last good
+    balance when possible instead of flooding the UI/logs with errors.
+    """
+    global _last_balance_ok, _balance_in_flight
     env = _parse_env_file()
     pk = (env.get("PRIVATE_KEY") or "").strip()
     funder = _norm_addr(env.get("FUNDER_ADDRESS"))
@@ -252,68 +464,91 @@ def _fetch_polymarket_balance() -> dict:
             "error": "Save private key + funder in Live Wallet Setup first.",
             "ts": __import__("time").time(),
         }
-    last_err = None
-    for attempt in range(2):
-        try:
-            _reload_config_from_env()
-            from polymarket_client import PolymarketClient
-            # Reuse shared authenticated client (do NOT re-create API key every poll)
-            client = PolymarketClient(use_shared=True)
-            # refresh=True only on first attempt; retry uses cache path if possible
-            out = client.get_usdc_balance(refresh=(attempt == 0))
-            out["ts"] = __import__("time").time()
-            if out.get("raw") is not None:
-                out["raw_preview"] = str(out.get("raw"))[:240]
-                del out["raw"]
-            if out.get("ok"):
-                _last_balance_ok = dict(out)
-            return out
-        except Exception as e:
-            last_err = e
-            msg = str(e).lower()
-            # WinError 10035 / timeouts: brief pause and one retry
-            if attempt == 0 and (
-                "10035" in msg or "timed out" in msg or "timeout" in msg
-                or "non-blocking" in msg or "would block" in msg
-            ):
-                __import__("time").sleep(1.0)
-                continue
-            break
+    # Collapse concurrent dashboard polls (15s interval can overlap with 30s timeout).
+    with _balance_lock:
+        if _balance_in_flight:
+            if _last_balance_ok and _last_balance_ok.get("balance_usd") is not None:
+                cached = dict(_last_balance_ok)
+                cached["stale"] = True
+                cached["ok"] = True
+                cached["ts"] = __import__("time").time()
+                return cached
+            return {
+                "ok": False,
+                "balance_usd": None,
+                "allowance_usd": None,
+                "funder": funder,
+                "error": "Balance request already in flight",
+                "ts": __import__("time").time(),
+            }
+        _balance_in_flight = True
+    try:
+        last_err = None
+        for attempt in range(2):
+            try:
+                _reload_config_from_env()
+                from polymarket_client import PolymarketClient
+                client = PolymarketClient(use_shared=True)
+                # First poll may refresh chain allowance; retry is read-only.
+                out = client.get_usdc_balance(refresh=(attempt == 0))
+                out["ts"] = __import__("time").time()
+                if out.get("raw") is not None:
+                    out["raw_preview"] = str(out.get("raw"))[:240]
+                    del out["raw"]
+                if out.get("ok"):
+                    _last_balance_ok = dict(out)
+                    return out
+                # Soft fail with stale cache
+                last_err = out.get("error") or "balance unavailable"
+                if attempt == 0 and (
+                    "timeout" in str(last_err).lower()
+                    or "timed out" in str(last_err).lower()
+                    or "request exception" in str(last_err).lower()
+                ):
+                    __import__("time").sleep(1.2)
+                    continue
+                break
+            except Exception as e:
+                last_err = e
+                msg = str(e).lower()
+                if attempt == 0 and (
+                    "10035" in msg or "timed out" in msg or "timeout" in msg
+                    or "non-blocking" in msg or "would block" in msg
+                    or "request exception" in msg
+                ):
+                    __import__("time").sleep(1.2)
+                    continue
+                break
 
-    err = str(last_err or "balance fetch failed")
-    if "API key create/derive failed" in err:
-        err = (
-            "API key create/derive failed. Sync Windows clock; check key/"
-            "funder/signature type. See bot log for details."
-        )
-    elif "10035" in err or "non-blocking" in err.lower():
-        err = "Network busy (WinError 10035) — transient; will retry"
-        if _last_balance_ok and _last_balance_ok.get("balance_usd") is not None:
-            cached = dict(_last_balance_ok)
-            cached["stale"] = True
-            cached["error"] = err
-            cached["ts"] = __import__("time").time()
-            # Keep showing last good balance
-            cached["ok"] = True
-            return cached
-    elif "timed out" in err.lower() or "timeout" in err.lower():
-        err = "CLOB request timed out — transient; will retry"
-        if _last_balance_ok and _last_balance_ok.get("balance_usd") is not None:
-            cached = dict(_last_balance_ok)
-            cached["stale"] = True
-            cached["error"] = err
-            cached["ts"] = __import__("time").time()
-            cached["ok"] = True
-            return cached
+        err = str(last_err or "balance fetch failed")
+        if "API key create/derive failed" in err:
+            err = (
+                "API key create/derive failed. Sync Windows clock; check key/"
+                "funder/signature type. See bot log for details."
+            )
+        elif ("10035" in err or "non-blocking" in err.lower()
+              or "timeout" in err.lower() or "timed out" in err.lower()
+              or "request exception" in err.lower()):
+            err = "CLOB busy/timeout - showing last balance if known"
+            if _last_balance_ok and _last_balance_ok.get("balance_usd") is not None:
+                cached = dict(_last_balance_ok)
+                cached["stale"] = True
+                cached["error"] = err
+                cached["ts"] = __import__("time").time()
+                cached["ok"] = True
+                return cached
 
-    return {
-        "ok": False,
-        "balance_usd": None,
-        "allowance_usd": None,
-        "funder": funder,
-        "error": err,
-        "ts": __import__("time").time(),
-    }
+        return {
+            "ok": False,
+            "balance_usd": None,
+            "allowance_usd": None,
+            "funder": funder,
+            "error": err,
+            "ts": __import__("time").time(),
+        }
+    finally:
+        with _balance_lock:
+            _balance_in_flight = False
 
 
 def _save_wallet(body: dict) -> dict:
@@ -433,10 +668,17 @@ def _start(opts: dict) -> dict:
         # Use python -u for unbuffered output to make logs real-time
         cmd = [sys.executable, "-u", "bot.py", "--mode", mode]
         strategy = str(opts.get("strategy") or "mid").strip().lower()
-        if strategy not in ("mid", "late_scalp", "hybrid"):
+        if strategy not in ("mid", "late_scalp", "late_every", "hybrid"):
             strategy = "mid"
-        if strategy == "late_scalp" and mode == "live":
-            # Allow but force explicit ack already required for live
+        # Persist menu choice + every-slot flag for next load
+        try:
+            if strategy == "late_every":
+                _upsert_env({"STRATEGY": "late_every", "LATE_SCALP_EVERY_SLOT": "1"})
+            elif strategy == "late_scalp":
+                _upsert_env({"STRATEGY": "late_scalp", "LATE_SCALP_EVERY_SLOT": "0"})
+            else:
+                _upsert_env({"STRATEGY": strategy})
+        except Exception:
             pass
         cmd += ["--strategy", strategy]
         try:
@@ -1034,6 +1276,50 @@ body.trade-flash-lose { animation: page-flash-down 1.6s ease-out; }
 .mode-live-opt { color: #ff8a95; }
 .live-gates { display: none; margin-top: 10px; padding-top: 10px; border-top: 1px dashed rgba(255,71,87,0.25); }
 .live-gates.on { display: block; }
+
+/* ===== STRATEGY SETTINGS ===== */
+.settings-panel {
+  margin-top: 12px; padding: 16px 18px;
+  border: 1px solid rgba(0,212,255,0.18);
+  background: linear-gradient(180deg, rgba(0,212,255,0.05), rgba(14,20,35,0.35));
+}
+.settings-panel .sp-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+.settings-panel .sp-title { font-weight: 700; font-size: 14px; letter-spacing: 0.3px; }
+.settings-panel .sp-title span { color: var(--accent); }
+.sp-tabs { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
+.sp-tab {
+  background: rgba(0,0,0,0.3); border: 1px solid var(--line); color: var(--txt-soft);
+  padding: 6px 12px; border-radius: 999px; cursor: pointer; font-size: 12px; font-weight: 600;
+}
+.sp-tab.on { color: var(--accent); border-color: rgba(0,212,255,0.45); background: var(--accent-dim); }
+.sp-group { display: none; }
+.sp-group.on { display: block; }
+.sp-grid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 10px 12px;
+}
+.sp-field label {
+  display: block; font-size: 10.5px; color: var(--dim); margin-bottom: 4px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: 0.3px;
+}
+.sp-field input, .sp-field select {
+  width: 100%; background: rgba(0,0,0,0.35); border: 1px solid var(--line);
+  color: var(--txt); border-radius: 8px; padding: 8px 10px; font-size: 13px;
+  font-family: 'JetBrains Mono', monospace;
+}
+.sp-field input:focus, .sp-field select:focus { outline: none; border-color: rgba(0,212,255,0.45); }
+.sp-field .hint { font-size: 10.5px; color: var(--dim); margin-top: 3px; line-height: 1.3; min-height: 1.2em; }
+.sp-field.bool { display: flex; flex-direction: column; justify-content: flex-end; }
+.sp-field.bool .bool-row { display: flex; align-items: center; gap: 8px; padding: 8px 0; }
+.sp-field.bool input[type=checkbox] { width: 16px; height: 16px; accent-color: var(--accent); }
+.sp-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; align-items: center; }
+.sp-msg { font-size: 12px; margin-top: 8px; min-height: 1.2em; }
+.sp-msg.ok { color: var(--green); }
+.sp-msg.err { color: var(--red); }
+.sp-note { font-size: 11.5px; color: var(--amber); margin-top: 6px; }
+
 .up    { color: var(--green); }
 .down  { color: var(--red); }
 .won   { color: var(--green); }
@@ -1087,8 +1373,9 @@ body.trade-flash-lose { animation: page-flash-down 1.6s ease-out; }
       <div class="ctl-field">
         <span class="ctl-label">Strategy</span>
         <select id="c-strategy" class="ctl-select">
-          <option value="mid">mid · edge band (default)</option>
-          <option value="late_scalp">late_scalp · last 35s–8s favorites</option>
+          <option value="mid">mid · edge / fair-value mid-slot</option>
+          <option value="late_scalp">late_scalp · selective favorites (~0.90+)</option>
+          <option value="late_every">late_every · bet almost every 5m slot</option>
           <option value="hybrid">hybrid · late preferred, strict mid if exceptional</option>
         </select>
       </div>
@@ -1120,6 +1407,36 @@ body.trade-flash-lose { animation: page-flash-down 1.6s ease-out; }
       </div>
     </div>
     <div id="c-msg" class="ctl-msg"></div>
+  </div>
+
+  <!-- ===== STRATEGY SETTINGS (bands, risk, mid/late) ===== -->
+  <div class="settings-panel glass-card" id="settings-panel">
+    <div class="sp-head">
+      <div class="sp-title">Strategy settings · <span>bands &amp; risk</span></div>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <button type="button" class="btn-ghost" id="sp-toggle">Hide</button>
+      </div>
+    </div>
+    <div id="sp-body">
+      <div class="sp-tabs" id="sp-tabs">
+        <button type="button" class="sp-tab on" data-g="late">Late scalp</button>
+        <button type="button" class="sp-tab" data-g="mid">Mid</button>
+        <button type="button" class="sp-tab" data-g="hybrid">Hybrid</button>
+        <button type="button" class="sp-tab" data-g="risk">Risk</button>
+        <button type="button" class="sp-tab" data-g="general">General</button>
+      </div>
+      <div id="sp-groups"></div>
+      <div class="sp-actions">
+        <button type="button" class="btn-save" id="sp-save">Save settings to .env</button>
+        <button type="button" class="btn-ghost" id="sp-reload">Reload from .env</button>
+        <button type="button" class="btn-ghost" id="sp-preset-late-every">Preset: late EVERY 5m slot</button>
+        <button type="button" class="btn-ghost" id="sp-preset-late90">Preset: late 0.90–0.95 profit</button>
+        <button type="button" class="btn-ghost" id="sp-preset-late-strict">Preset: late strict 0.93–0.96</button>
+        <button type="button" class="btn-ghost" id="sp-preset-mid-active">Preset: mid paper-active</button>
+      </div>
+      <div class="sp-msg" id="sp-msg"></div>
+      <p class="sp-note" id="sp-note">Changes apply after you <b>Stop</b> and <b>Start</b> the bot (child process reads .env on launch).</p>
+    </div>
   </div>
 
   <!-- ===== LIVE WALLET SETUP ===== -->
@@ -1763,8 +2080,8 @@ async function pollWalletBalance() {
   }
 }
 pollWalletBalance();
-// 15s — Windows CLOB clients can hit WinError 10035 if polled too hard
-setInterval(pollWalletBalance, 15000);
+// 45s — CLOB balance can take 10-30s; 15s polls overlapped and spammed timeouts
+setInterval(pollWalletBalance, 45000);
 
 /* ===== CONTROL PANEL ===== */
 function setCtl(running, s) {
@@ -2019,6 +2336,226 @@ document.getElementById('lw-toggle').onclick = () => {
   btn.textContent = hide ? 'Show guide' : 'Hide guide';
 };
 
+/* ===== STRATEGY SETTINGS UI ===== */
+let settingsSchema = null;
+let settingsActiveGroup = 'late';
+
+function _spVal(field) {
+  const el = document.getElementById('sf-' + field.key);
+  if (!el) return field.value;
+  if (field.type === 'bool') return el.checked ? '1' : '0';
+  return el.value;
+}
+
+function renderSettings(data) {
+  settingsSchema = data;
+  if (!data || !data.ok) return;
+  const host = document.getElementById('sp-groups');
+  const groups = data.groups || {};
+  const byG = {};
+  (data.fields || []).forEach(f => {
+    (byG[f.group] = byG[f.group] || []).push(f);
+  });
+  host.innerHTML = Object.keys(groups).map(g => {
+    const fields = byG[g] || [];
+    const on = g === settingsActiveGroup ? 'on' : '';
+    const cells = fields.map(f => {
+      const id = 'sf-' + f.key;
+      const hint = f.hint ? `<div class="hint">${f.hint}</div>` : '<div class="hint"></div>';
+      if (f.type === 'bool') {
+        const checked = ['1','true','yes','y','on'].includes(String(f.value).toLowerCase());
+        return `<div class="sp-field bool">
+          <label>${f.label}</label>
+          <div class="bool-row"><input type="checkbox" id="${id}" ${checked ? 'checked' : ''}>
+          <span style="font-size:12px;color:var(--txt-soft)">${f.key}</span></div>
+          ${hint}</div>`;
+      }
+      if (f.key === 'STRATEGY') {
+        const v = f.value || 'mid';
+        return `<div class="sp-field"><label>${f.label}</label>
+          <select id="${id}">
+            <option value="mid" ${v==='mid'?'selected':''}>mid</option>
+            <option value="late_scalp" ${v==='late_scalp'?'selected':''}>late_scalp (selective)</option>
+            <option value="late_every" ${v==='late_every'?'selected':''}>late_every (every 5m)</option>
+            <option value="hybrid" ${v==='hybrid'?'selected':''}>hybrid</option>
+          </select>${hint}</div>`;
+      }
+      const step = f.type === 'int' ? '1' : 'any';
+      return `<div class="sp-field"><label>${f.label}</label>
+        <input id="${id}" type="number" step="${step}" value="${f.value ?? ''}" data-key="${f.key}">
+        ${hint}</div>`;
+    }).join('');
+    return `<div class="sp-group ${on}" data-g="${g}"><div class="sp-grid">${cells}</div></div>`;
+  }).join('');
+  document.querySelectorAll('.sp-tab').forEach(t => {
+    t.classList.toggle('on', t.dataset.g === settingsActiveGroup);
+  });
+  if (data.note) document.getElementById('sp-note').textContent = data.note;
+  // Sync Start panel strategy menu
+  const stratField = (data.fields || []).find(f => f.key === 'STRATEGY');
+  const everyField = (data.fields || []).find(f => f.key === 'LATE_SCALP_EVERY_SLOT');
+  let strat = stratField ? String(stratField.value || 'mid') : 'mid';
+  const everyOn = everyField && ['1','true','yes','on'].includes(String(everyField.value).toLowerCase());
+  if (strat === 'late_scalp' && everyOn) strat = 'late_every';
+  const cStrat = document.getElementById('c-strategy');
+  if (cStrat && [...cStrat.options].some(o => o.value === strat)) {
+    cStrat.value = strat;
+  }
+}
+
+async function loadSettings() {
+  const msg = document.getElementById('sp-msg');
+  try {
+    const data = await fetch('/api/settings', { cache: 'no-store' }).then(r => r.json());
+    renderSettings(data);
+    msg.textContent = '';
+    msg.className = 'sp-msg';
+  } catch (e) {
+    msg.textContent = 'Could not load settings: ' + e;
+    msg.className = 'sp-msg err';
+  }
+}
+
+function collectSettings() {
+  if (!settingsSchema || !settingsSchema.fields) return {};
+  const out = {};
+  settingsSchema.fields.forEach(f => { out[f.key] = _spVal(f); });
+  return out;
+}
+
+async function saveSettings(partial) {
+  const msg = document.getElementById('sp-msg');
+  msg.textContent = 'saving…';
+  msg.className = 'sp-msg';
+  const settings = partial || collectSettings();
+  try {
+    const r = await fetch('/api/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ settings }),
+    }).then(r => r.json());
+    if (!r.ok) {
+      msg.textContent = '⚠ ' + (r.error || 'save failed');
+      msg.className = 'sp-msg err';
+      return false;
+    }
+    renderSettings(r);
+    msg.textContent = 'Saved ' + (r.saved ? r.saved.length : '') + ' keys to .env — Stop + Start bot to apply.';
+    msg.className = 'sp-msg ok';
+    // Sync strategy dropdown if present
+    if (settings.STRATEGY && document.getElementById('c-strategy')) {
+      document.getElementById('c-strategy').value = settings.STRATEGY;
+    }
+    return true;
+  } catch (e) {
+    msg.textContent = '⚠ ' + e;
+    msg.className = 'sp-msg err';
+    return false;
+  }
+}
+
+document.getElementById('sp-tabs').onclick = (ev) => {
+  const t = ev.target.closest('.sp-tab');
+  if (!t) return;
+  settingsActiveGroup = t.dataset.g;
+  document.querySelectorAll('.sp-tab').forEach(x => x.classList.toggle('on', x === t));
+  document.querySelectorAll('.sp-group').forEach(g => {
+    g.classList.toggle('on', g.dataset.g === settingsActiveGroup);
+  });
+};
+document.getElementById('sp-save').onclick = () => saveSettings();
+document.getElementById('sp-reload').onclick = () => loadSettings();
+document.getElementById('sp-toggle').onclick = () => {
+  const body = document.getElementById('sp-body');
+  const btn = document.getElementById('sp-toggle');
+  const hide = body.style.display !== 'none';
+  body.style.display = hide ? 'none' : '';
+  btn.textContent = hide ? 'Show' : 'Hide';
+};
+document.getElementById('sp-preset-late-every').onclick = () => saveSettings({
+  STRATEGY: 'late_every',
+  LATE_SCALP_EVERY_SLOT: '1',
+  LATE_SCALP_MIN_ENTRY: '0.60',
+  LATE_SCALP_MAX_ENTRY: '0.99',
+  LATE_SCALP_PREFER_MAX: '0.99',
+  LATE_SCALP_MIN_REMAINING: '8',
+  LATE_SCALP_MAX_REMAINING: '50',
+  LATE_SCALP_MIN_FAVORITE_LEAD: '0.05',
+  LATE_SCALP_MAX_UNDERDOG_ASK: '0.42',
+  LATE_SCALP_REQUIRE_SPOT_ALIGN: '0',
+  LATE_SCALP_REQUOTE: '0',
+  LATE_SCALP_PAUSE_SLOTS_AFTER_LOSS: '0',
+  LATE_SCALP_MAX_STAKE_USD: '5.0',
+  LATE_SCALP_MAX_SPREAD: '0.15',
+});
+document.getElementById('sp-preset-late90').onclick = () => saveSettings({
+  STRATEGY: 'late_scalp',
+  LATE_SCALP_EVERY_SLOT: '0',
+  LATE_SCALP_MIN_ENTRY: '0.88',
+  LATE_SCALP_MAX_ENTRY: '0.99',
+  LATE_SCALP_PREFER_MAX: '0.95',
+  LATE_SCALP_MIN_REMAINING: '10',
+  LATE_SCALP_MAX_REMAINING: '45',
+  LATE_SCALP_MIN_FAVORITE_LEAD: '0.50',
+  LATE_SCALP_MAX_UNDERDOG_ASK: '0.14',
+  LATE_SCALP_REQUIRE_SPOT_ALIGN: '1',
+  LATE_SCALP_SPOT_ALIGN_EPS_USD: '8',
+  LATE_SCALP_KEEP_FIRST_ASK: '1',
+  LATE_SCALP_REQUOTE: '1',
+  LATE_SCALP_MAX_STAKE_USD: '5.0',
+});
+document.getElementById('sp-preset-late-strict').onclick = () => saveSettings({
+  STRATEGY: 'late_scalp',
+  LATE_SCALP_EVERY_SLOT: '0',
+  LATE_SCALP_MIN_ENTRY: '0.93',
+  LATE_SCALP_MAX_ENTRY: '0.96',
+  LATE_SCALP_PREFER_MAX: '0.96',
+  LATE_SCALP_MIN_FAVORITE_LEAD: '0.70',
+  LATE_SCALP_MAX_UNDERDOG_ASK: '0.08',
+  LATE_SCALP_MAX_REMAINING: '22',
+  LATE_SCALP_REQUIRE_SPOT_ALIGN: '1',
+  LATE_SCALP_REQUOTE: '1',
+});
+document.getElementById('sp-preset-mid-active').onclick = () => saveSettings({
+  STRATEGY: 'mid',
+  MIN_ENTRY_PRICE: '0.22',
+  MAX_ENTRY_PRICE: '0.72',
+  EDGE_THRESHOLD: '0.04',
+  MIN_EV: '0.02',
+  MIN_MOVE_USD: '5',
+  MID_NOISE_MOVE_CAP: '0',
+  MID_REQUIRE_CHAINLINK_STRIKE: '0',
+  MID_MIN_MODEL: '0.52',
+  MID_MAX_MODEL: '0.95',
+});
+
+// Save settings before start so bands always match UI
+const _origStart = document.getElementById('c-start').onclick;
+document.getElementById('c-start').addEventListener('click', async (ev) => {
+  // Auto-sync strategy menu → .env (late_every also flips EVERY_SLOT)
+  try {
+    const strat = document.getElementById('c-strategy').value;
+    const settings = { STRATEGY: strat };
+    if (strat === 'late_every') settings.LATE_SCALP_EVERY_SLOT = '1';
+    if (strat === 'late_scalp') settings.LATE_SCALP_EVERY_SLOT = '0';
+    await fetch('/api/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ settings }),
+    });
+  } catch (e) {}
+}, true);
+
+// When user changes strategy dropdown, reflect late_every in settings form if open
+document.getElementById('c-strategy').addEventListener('change', () => {
+  const strat = document.getElementById('c-strategy').value;
+  const el = document.getElementById('sf-STRATEGY');
+  if (el) el.value = strat;
+  const every = document.getElementById('sf-LATE_SCALP_EVERY_SLOT');
+  if (every) every.checked = (strat === 'late_every');
+});
+
+loadSettings();
 loadWallet();
 ctlState();
 setInterval(ctlState, 4000);
@@ -2090,6 +2627,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/api/wallet":
             return self._json(_wallet_status())
 
+        # Strategy bands / risk settings (safe keys only)
+        if path == "/api/settings":
+            return self._json(_settings_payload())
+
         # Live Polymarket USDC balance (authenticated CLOB)
         if path == "/api/balance":
             return self._json(_fetch_polymarket_balance())
@@ -2133,6 +2674,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._json(_stop())
         if route == "/api/wallet":
             return self._json(_save_wallet(opts if isinstance(opts, dict) else {}))
+        if route == "/api/settings":
+            return self._json(_save_settings(opts if isinstance(opts, dict) else {}))
         return self._json({"ok": False, "error": "Unknown endpoint."}, 404)
 
     def log_message(self, fmt, *args):
@@ -2161,8 +2704,10 @@ if __name__ == "__main__":
     print(f"  |  API stop:     POST /api/stop                        |")
     print(f"  |  API control:  GET  /api/control                     |")
     print(f"  |  API wallet:   GET/POST /api/wallet                  |")
+    print(f"  |  API settings: GET/POST /api/settings                |")
     print(f"  |  API balance:  GET  /api/balance                     |")
     print("  +------------------------------------------------------+")
+    print("  |  Edit late/mid bands in Strategy settings on the UI.  |")
     print("  |  Live money: use Live wallet setup on the dashboard.  |")
     print("  |  Ctrl+C to shut down.                                 |")
     print("  +------------------------------------------------------+")
