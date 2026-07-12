@@ -243,7 +243,8 @@ class RiskManager:
             )
             return 0.0
         fixed = getattr(config, "FIXED_STAKE_USD", 0.0) or 0.0
-        if fixed > 0:
+        use_edge_sizing = getattr(config, "LATE_SCALP_USE_EDGE_SIZING", True)
+        if fixed > 0 and not use_edge_sizing:
             stake = float(fixed)
         elif edge > 0:
             # Edge-scaled sizing: higher edge → larger stake (capped).
@@ -259,8 +260,14 @@ class RiskManager:
                 stake = float(config.BASE_TRADE_USD)
         else:
             stake = float(config.BASE_TRADE_USD)
-        # Prefer configured max, but min-share bump may exceed it (venue floor).
-        stake = min(stake, max(config.MAX_TRADE_USD, stake))
+
+        # Cap base stake to max trade size / late max stake first before min shares bump.
+        # This prevents skipping a trade just because Kelly sizing calculates a size > max_late.
+        max_late = float(getattr(config, "LATE_SCALP_MAX_STAKE_USD", 0) or 0)
+        max_allowed = max_late if max_late > 0 else float(config.MAX_TRADE_USD)
+        if stake > max_allowed:
+            stake = max_allowed
+
         if self.bankroll < 0.5:
             self.last_skip_reason = f"bankroll ${self.bankroll:.2f} too low"
             return 0.0
@@ -272,7 +279,6 @@ class RiskManager:
         if stake <= 0:
             return 0.0
         # Hard cap on late loss size (session R13-style -$4.45 blowups).
-        max_late = float(getattr(config, "LATE_SCALP_MAX_STAKE_USD", 0) or 0)
         if max_late > 0 and stake > max_late + 1e-9:
             self.last_skip_reason = (
                 f"late stake ${stake:.2f} > LATE_SCALP_MAX_STAKE_USD "

@@ -158,9 +158,9 @@ LATE_SCALP_MAX_REMAINING = int(os.getenv("LATE_SCALP_MAX_REMAINING", "50"))
 # Default band wide enough for every-slot mode (clamp if needed).
 # Min favorite ask — below this is near coin-flip (R5 lost @ 0.57).
 LATE_SCALP_MIN_ENTRY = float(os.getenv("LATE_SCALP_MIN_ENTRY", "0.60"))
-LATE_SCALP_MAX_ENTRY = float(os.getenv("LATE_SCALP_MAX_ENTRY", "0.99"))
+LATE_SCALP_MAX_ENTRY = float(os.getenv("LATE_SCALP_MAX_ENTRY", "0.95"))
 # Prefer entries at/under this ask (ignored when LATE_SCALP_EVERY_SLOT=1).
-LATE_SCALP_PREFER_MAX = float(os.getenv("LATE_SCALP_PREFER_MAX", "0.99"))
+LATE_SCALP_PREFER_MAX = float(os.getenv("LATE_SCALP_PREFER_MAX", "0.95"))
 # Minimum gap between favorite ask and underdog ask (favorite clearly leading).
 LATE_SCALP_MIN_FAVORITE_LEAD = float(os.getenv("LATE_SCALP_MIN_FAVORITE_LEAD", "0.05"))
 # Underdog ask must be this low (0 = off in every-slot).
@@ -185,11 +185,13 @@ LATE_SCALP_EVERY_SLOT = _env_bool("LATE_SCALP_EVERY_SLOT", True)
 
 # --- Late-scalp v2 improvements (smart filters) ---
 # Minimum |spot − strike| move in USD before entering. Skip coin-flip slots.
-LATE_SCALP_MIN_MOVE_USD = float(os.getenv("LATE_SCALP_MIN_MOVE_USD", "15.0"))
+LATE_SCALP_MIN_MOVE_USD = float(os.getenv("LATE_SCALP_MIN_MOVE_USD", "8.0"))
 # Require Chainlink Data Stream tick for strike (refuse exchange-proxy strikes).
 LATE_SCALP_REQUIRE_CHAINLINK = _env_bool("LATE_SCALP_REQUIRE_CHAINLINK", True)
 # Minimum model edge (model_prob − market_ask) to enter. 0 = off (legacy).
 LATE_SCALP_MIN_EDGE = float(os.getenv("LATE_SCALP_MIN_EDGE", "0.02"))
+# Enable edge-scaled/Kelly sizing for late-scalping.
+LATE_SCALP_USE_EDGE_SIZING = _env_bool("LATE_SCALP_USE_EDGE_SIZING", True)
 
 # --- Hybrid (STRATEGY=hybrid): prefer late; mid only if exceptional ---
 # When true (default), mid must clear HYBRID_MID_* bars on top of normal mid filters;

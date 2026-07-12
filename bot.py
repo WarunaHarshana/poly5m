@@ -244,6 +244,7 @@ def archive_records(trades, stats: dict) -> int:
         _copy_file_safe(HISTORY_JSONL, os.path.join(copy_dir, "trades_history.jsonl"))
         _copy_file_safe(HISTORY_CSV, os.path.join(copy_dir, "trades_history.csv"))
         _copy_file_safe(snap_path, os.path.join(copy_dir, "session.json"))
+        _copy_file_safe(os.path.join(STATE_DIR, "bot.log"), os.path.join(copy_dir, "bot.log"))
         with open(os.path.join(copy_dir, "readme.txt"), "w", encoding="utf-8") as f:
             f.write(
                 f"Session {sid}\nSaved {stamp} UTC\nMode={config.MODE} strategy={strat}\n"
@@ -881,6 +882,14 @@ def run_realtime(rounds: int = 100, paper: bool = True):
             config.MIN_SLOT_SECONDS = late_min
             config.MAX_TRADE_REMAINING = late_max
 
+            # Stagger entry: if we just entered the late window, add a tiny random
+            # delay (100-400ms) to reduce API rate-limiting/congestion and quote volatility.
+            if remaining is not None and remaining >= late_max - 0.5:
+                import random
+                delay = random.uniform(0.1, 0.4)
+                time.sleep(delay)
+                remaining -= delay
+
             def _late_skip(skip_key: str, msg: str, retry: bool = True):
                 """Skip this late attempt; optionally retry while window open."""
                 nonlocal pending_late_end_ts
@@ -1126,11 +1135,20 @@ def run_realtime(rounds: int = 100, paper: bool = True):
                 continue
 
             # --- V2 IMPROVEMENT: Use signal engine for independent edge ---
+            # Compute realized vol from recent prices
+            prices = feed.recent(int(getattr(config, "MOMENTUM_LOOKBACK", 12)))
+            rv = None
+            if prices:
+                from signal_engine import _realized_vol_daily
+                rv = _realized_vol_daily(prices, float(getattr(config, "SAMPLE_SECONDS", 5.0)))
+
             fv = fair_value(
                 spot=float(price_before),
                 strike=float(slot_open_ref),
                 remaining_seconds=float(remaining),
                 volatility_daily=float(getattr(config, "VOLATILITY_DAILY", 0.045)),
+                realized_vol_daily=rv,
+                vol_blend=float(getattr(config, "VOL_BLEND", 0.5)),
             )
             # Model probability for the chosen side
             model_side_prob = fv.fair_prob_up if side == "UP" else (1.0 - fv.fair_prob_up)

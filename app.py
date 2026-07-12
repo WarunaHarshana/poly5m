@@ -93,6 +93,8 @@ STRATEGY_FIELDS = [
      "default": "1", "group": "late", "hint": "Refuse trading on exchange-proxy strikes"},
     {"key": "LATE_SCALP_MIN_EDGE", "label": "Late min edge", "type": "float",
      "default": "0.02", "group": "late", "hint": "Min model probability edge over ask"},
+    {"key": "LATE_SCALP_USE_EDGE_SIZING", "label": "Late use edge sizing", "type": "bool",
+     "default": "1", "group": "late", "hint": "Scale stake dynamically by model edge (Kelly)"},
     # --- Mid ---
     {"key": "MIN_ENTRY_PRICE", "label": "Mid min entry", "type": "float",
      "default": "0.22", "group": "mid", "hint": "Do not buy cheaper than this"},
@@ -2494,9 +2496,10 @@ document.getElementById('sp-preset-late-every').onclick = () => saveSettings({
   LATE_SCALP_PAUSE_SLOTS_AFTER_LOSS: '2',
   LATE_SCALP_MAX_STAKE_USD: '5.0',
   LATE_SCALP_MAX_SPREAD: '0.10',
-  LATE_SCALP_MIN_MOVE_USD: '15.0',
+  LATE_SCALP_MIN_MOVE_USD: '8.0',
   LATE_SCALP_REQUIRE_CHAINLINK: '1',
   LATE_SCALP_MIN_EDGE: '0.02',
+  LATE_SCALP_USE_EDGE_SIZING: '1',
 });
 document.getElementById('sp-preset-late90').onclick = () => saveSettings({
   STRATEGY: 'late_scalp',
