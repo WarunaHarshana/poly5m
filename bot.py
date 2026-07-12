@@ -584,6 +584,7 @@ def run_realtime(rounds: int = 100, paper: bool = True):
         config.apply_strategy_flags()
     hybrid = config.is_hybrid()
     late_only = config.is_late_scalp() and not hybrid
+    late_momentum_only = config.is_late_momentum()
     prefer_late = bool(hybrid and config.hybrid_prefer_late())
     # Snapshot mid-window params before any late profile mutates them
     mid_min_slot = int(config.MIN_SLOT_SECONDS)
@@ -814,7 +815,7 @@ def run_realtime(rounds: int = 100, paper: bool = True):
             hybrid and pending_late_end_ts is not None
             and end_ts is not None and pending_late_end_ts == end_ts
         )
-        use_late = late_only or force_late
+        use_late = late_only or force_late or late_momentum_only
 
         if hybrid and not force_late and remaining is not None:
             # Past mid window with nothing pending → go straight toward late
@@ -833,9 +834,14 @@ def run_realtime(rounds: int = 100, paper: bool = True):
                       f"running late_scalp")
 
         if use_late:
-            min_slot = late_min
-            max_rem = late_max
-            phase_name = "late_scalp"
+            if config.is_late_momentum():
+                min_slot = int(config.LATE_MOMENTUM_MIN_REMAINING)
+                max_rem = int(config.LATE_MOMENTUM_TIME_LIMIT)
+                phase_name = "late_momentum"
+            else:
+                min_slot = late_min
+                max_rem = late_max
+                phase_name = "late_scalp"
         else:
             min_slot = mid_min_slot if hybrid else int(config.MIN_SLOT_SECONDS)
             max_rem = mid_max_rem if hybrid else (
@@ -894,8 +900,9 @@ def run_realtime(rounds: int = 100, paper: bool = True):
                 """Skip this late attempt; optionally retry while window open."""
                 nonlocal pending_late_end_ts
                 skips[skip_key] = skips.get(skip_key, 0) + 1
-                write_status(phase="waiting", message=msg, strategy="late_scalp")
-                print(f"  [late_scalp] {msg}")
+                write_status(phase="waiting", message=msg, strategy=phase_name)
+                print(f"  [{phase_name}] {msg}")
+
                 rem_now = (end_ts - _now(cl_stream)) if end_ts else remaining
                 if retry and rem_now is not None and rem_now > late_min + 2:
                     time.sleep(min(1.2, max(0.4, rem_now - late_min)))
@@ -907,14 +914,14 @@ def run_realtime(rounds: int = 100, paper: bool = True):
 
             # Cooldown after a late loss (harder to chain blowups).
             if late_pause_slots > 0:
-                print(f"  [late_scalp] pause after loss "
+                print(f"  [{phase_name}] pause after loss "
                       f"({late_pause_slots} late window(s) left); skip")
                 skips["no_edge"] = skips.get("no_edge", 0) + 1
                 late_pause_slots -= 1
                 if hybrid and pending_late_end_ts == end_ts:
                     pending_late_end_ts = None
                 write_status(phase="waiting", message="late pause after loss",
-                             strategy="late_scalp")
+                             strategy=phase_name)
                 _sleep_until_slot_end(end_ts, cl_stream)
                 continue
 
@@ -945,268 +952,374 @@ def run_realtime(rounds: int = 100, paper: bool = True):
                 slot_open_ref = price_before
                 strike_src = "warmup-fallback"
             move_usd = abs(price_before - slot_open_ref) if slot_open_ref else 0.0
-            print(f"  [late_scalp] strike=${slot_open_ref:,.2f} [{strike_src}]  "
+            rem_lbl = f"{remaining:.0f}s left" if remaining is not None else "n/a left"
+            print(f"  [{phase_name}] strike=${slot_open_ref:,.2f} [{strike_src}]  "
                   f"btc=${price_before:,.2f} move=${move_usd:.1f}  "
-                  f"{remaining:.0f}s left")
+                  f"{rem_lbl}")
 
-            # --- V2 IMPROVEMENT: Skip when Chainlink stream unavailable ---
-            require_cl = getattr(config, "LATE_SCALP_REQUIRE_CHAINLINK", True)
-            if require_cl and strike_src == "exchange-proxy":
-                if _late_skip(
-                    "proxy_strike",
-                    f"no Chainlink tick for slot open — resolution risk "
-                    f"too high (strike from {strike_src})",
-                    retry=False,
-                ) == "retry":
-                    continue
-                continue
+            if config.is_late_momentum():
+                # --- LATE MOMENTUM PATH ---
+                now_clk = _now(cl_stream)
+                price_now = price_before
 
-            # --- V2 IMPROVEMENT: Minimum move threshold ---
-            min_move = float(getattr(config, "LATE_SCALP_MIN_MOVE_USD", 15.0) or 0)
-            if min_move > 0 and move_usd < min_move:
-                if _late_skip(
-                    "thin_move",
-                    f"move ${move_usd:.1f} < min ${min_move:.1f} "
-                    f"(too flat to call direction)",
-                    retry=True,
-                ) == "retry":
-                    continue
-                continue
+                prices_recent = feed.recent(int(getattr(config, "MOMENTUM_LOOKBACK", 12)))
+                rv = None
+                if prices_recent:
+                    from signal_engine import _realized_vol_daily
+                    rv = _realized_vol_daily(prices_recent, float(getattr(config, "SAMPLE_SECONDS", 5.0)))
+                price_60s_ago = prices_recent[0] if prices_recent else price_now
 
-            every = bool(getattr(config, "LATE_SCALP_EVERY_SLOT", False))
-            picked = _pick_late_scalp_favorite(
-                pub, market, always=every,
-                spot=price_before, strike=slot_open_ref,
-            )
-            if not picked:
-                if _late_skip("quote_fail",
-                              "no clear favorite (lead/underdog gate)",
-                              retry=True) == "retry":
+
+                if slot_open_ref is None:
+                    if _late_skip("bad_samples", "no slot start price (strike) available", retry=True) == "retry":
+                        continue
                     continue
-                continue
-            side, q, q_dog = picked
-            mkt = float(q["price"])
-            dog_px = float(q_dog["price"]) if q_dog else None
-            ask_sz = q.get("ask_size")
-            min_entry = late_min_entry
-            max_entry = late_max_entry
-            dog_txt = f" dog={dog_px:.3f}" if dog_px is not None else ""
-            if mkt < min_entry or mkt > max_entry:
-                # Do NOT clamp below min_entry — that forced coin-flip bets (e.g. 0.57 loss).
-                # Soft favorites: wait/retry; only clamp if slightly above max_entry.
-                if every and mkt > max_entry:
-                    old = mkt
-                    mkt = max_entry
-                    print(f"  [late_scalp] EVERY_SLOT clamp ask {old:.3f}->{mkt:.3f} "
-                          f"(cap max {max_entry:.2f})")
-                else:
+
+                diff = price_now - slot_open_ref
+                min_move = float(config.LATE_MOMENTUM_MIN_MOVE)
+
+                side = None
+                if diff >= min_move:
+                    side = "UP"
+                elif diff <= -min_move and config.LATE_MOMENTUM_BIDIRECTIONAL:
+                    side = "DOWN"
+
+                if not side:
+                    if _late_skip(
+                        "thin_move",
+                        f"strike gap {diff:+.1f} < min ${min_move:.1f}",
+                        retry=True,
+                    ) == "retry":
+                        continue
+                    continue
+
+                # Fetch quote for decided side
+                try:
+                    token_id = market["tokens"][side]
+                    if hasattr(pub, "buy_quote"):
+                        q = pub.buy_quote(token_id)
+                    else:
+                        mid = pub.midpoint(token_id)
+                        q = {"price": mid, "mid": mid, "best_bid": None,
+                             "best_ask": None, "spread": None, "ask_size": None}
+                    mkt = float(q["price"])
+                except Exception as e:
+                    if _late_skip("quote_fail", f"failed to get quote for {side}: {e}", retry=True) == "retry":
+                        continue
+                    continue
+
+                min_entry = float(getattr(config, "MIN_ENTRY_PRICE", 0.10))
+                max_entry = float(getattr(config, "MAX_ENTRY_PRICE", 0.95))
+                if mkt < min_entry or mkt > max_entry:
                     if _late_skip(
                         "quote_range",
-                        f"favorite {side} ask {mkt:.3f}{dog_txt} outside "
-                        f"[{min_entry:.2f}, {max_entry:.2f}] "
-                        f"(need favorite >= {min_entry:.2f})",
+                        f"{side} ask {mkt:.3f} outside entry band [{min_entry:.2f}, {max_entry:.2f}]",
                         retry=True,
                     ) == "retry":
                         continue
                     continue
-            print(f"  [late_scalp] candidate {side} ask={mkt:.3f}{dog_txt} "
-                  f"in band [{min_entry:.2f},{max_entry:.2f}]"
-                  f"{' EVERY_SLOT' if every else ''}")
 
-            # Spot must agree with favorite side (book vs reality filter).
-            # V2: ALWAYS check alignment — never bet against actual price direction.
-            require_align = getattr(config, "LATE_SCALP_REQUIRE_SPOT_ALIGN", True)
-            eps = float(getattr(config, "LATE_SCALP_SPOT_ALIGN_EPS_USD", 3.0) or 0.0)
-            if require_align and slot_open_ref and price_before:
-                signed = float(price_before) - float(slot_open_ref)
-                if side == "UP" and signed < -eps:
+                fv = fair_value(
+                    spot=float(price_now),
+                    strike=float(slot_open_ref),
+                    remaining_seconds=float(remaining or 1.0),
+                    volatility_daily=float(getattr(config, "VOLATILITY_DAILY", 0.045)),
+                    realized_vol_daily=rv,
+                    vol_blend=float(getattr(config, "VOL_BLEND", 0.5)),
+                )
+                model_side_prob = fv.fair_prob_up if side == "UP" else (1.0 - fv.fair_prob_up)
+                edge = model_side_prob - mkt
+
+                stake = risk.size_late_scalp(mkt, edge=edge)
+
+                ask_sz = q.get("ask_size")
+                print(f"  [late_momentum] side={side} strike=${slot_open_ref:.2f} spot=${price_now:.2f} price_60s_ago=${price_60s_ago:.2f} gap=${diff:+.2f} ask={mkt:.3f} edge={edge:.3f} stake=${stake:.2f}")
+                write_status(
+                    phase="analyzing", btc_price=round(price_now, 2),
+                    side=side, model=round(model_side_prob, 4),
+                    mkt=round(mkt, 4), edge=round(edge, 4), stake=stake,
+                    confidence=round(fv.fair_prob_up, 4),
+                    end_ts=end_ts, question=question,
+                    strategy="late_momentum"
+                )
+
+                if stake <= 0:
+                    why = getattr(risk, "last_skip_reason", "") or "no stake"
+                    if _late_skip("no_edge", f"size skip ({why})", retry=True) == "retry":
+                        continue
+                    continue
+
+                pending_late_end_ts = None
+                sig = SimpleNamespace(
+                    side=side,
+                    confidence=round(fv.fair_prob_up, 4),
+                    model_prob_up=fv.fair_prob_up,
+                    realized_vol_daily=rv,
+                    z_score=fv.z_score,
+                    sigma_usd=fv.sigma_usd,
+                    fair_prob_up=fv.fair_prob_up,
+                )
+                picked = (side, q, None)  # dummy compatibility for requote block if bypassed
+            else:
+                # --- STANDARD LATE SCALP PATH ---
+                # --- V2 IMPROVEMENT: Skip when Chainlink stream unavailable ---
+                require_cl = getattr(config, "LATE_SCALP_REQUIRE_CHAINLINK", True)
+                if require_cl and strike_src == "exchange-proxy":
+                    if _late_skip(
+                        "proxy_strike",
+                        f"no Chainlink tick for slot open — resolution risk "
+                        f"too high (strike from {strike_src})",
+                        retry=False,
+                    ) == "retry":
+                        continue
+                    continue
+
+                # --- V2 IMPROVEMENT: Minimum move threshold ---
+                min_move = float(getattr(config, "LATE_SCALP_MIN_MOVE_USD", 15.0) or 0)
+                if min_move > 0 and move_usd < min_move:
                     if _late_skip(
                         "thin_move",
-                        f"spot vs strike DOWN (${signed:.1f}) but book favorite UP",
-                        retry=True,
-                    ) == "retry":
-                        continue
-                    continue
-                if side == "DOWN" and signed > eps:
-                    if _late_skip(
-                        "thin_move",
-                        f"spot vs strike UP (+${signed:.1f}) but book favorite DOWN",
+                        f"move ${move_usd:.1f} < min ${min_move:.1f} "
+                        f"(too flat to call direction)",
                         retry=True,
                     ) == "retry":
                         continue
                     continue
 
-            # Prefer better payout: ideally fill at/under PREFER_MAX (~0.95).
-            # EVERY_SLOT: prefer_max = hard max so we never skip on richness.
-            prefer_max = float(getattr(config, "LATE_SCALP_PREFER_MAX", 0.95)
-                               or max_entry)
-            if every:
-                prefer_max = max_entry
-            prefer_max = min(prefer_max, max_entry)
-
-            # Re-quote: V2 always re-checks the book before committing.
-            do_rq = getattr(config, "LATE_SCALP_REQUOTE", True)
-            if do_rq:
-                rq_sleep = float(getattr(config, "LATE_SCALP_REQUOTE_SLEEP_S", 0.35)
-                                 or 0.35)
-                if config.ROUND_SECONDS > 0 and rq_sleep > 0:
-                    time.sleep(min(rq_sleep, 1.0))
-                picked2 = _pick_late_scalp_favorite(
+                every = bool(getattr(config, "LATE_SCALP_EVERY_SLOT", False))
+                picked = _pick_late_scalp_favorite(
                     pub, market, always=every,
                     spot=price_before, strike=slot_open_ref,
                 )
-                if not picked2:
-                    if _late_skip("quote_fail", "requote lost favorite",
-                                 retry=True) == "retry":
-                        continue
-                    continue
-                side2, q2, _dog2 = picked2
-                mkt2 = float(q2["price"])
-                max_jump = float(getattr(config, "LATE_SCALP_MAX_ASK_JUMP", 0.04)
-                                 or 0.04)
-                keep_first = getattr(config, "LATE_SCALP_KEEP_FIRST_ASK", True)
-                if side2 != side:
+                if not picked:
                     if _late_skip("quote_fail",
-                                  f"requote side flip {side}->{side2}",
+                                  "no clear favorite (lead/underdog gate)",
                                   retry=True) == "retry":
                         continue
                     continue
-                if mkt2 > mkt + max_jump:
-                    if keep_first and min_entry <= mkt <= prefer_max:
-                        print(f"  [late_scalp] requote spiked {mkt:.3f}->{mkt2:.3f}; "
-                              f"keeping limit @ {mkt:.3f} (better profit)")
-                    else:
-                        if _late_skip(
-                            "wide_spread",
-                            f"requote ask jump {mkt:.3f}->{mkt2:.3f} "
-                            f"> {max_jump:.3f}",
-                            retry=True,
-                        ) == "retry":
-                            continue
-                        continue
-                elif mkt2 < mkt:
-                    print(f"  [late_scalp] requote improved {mkt:.3f}->{mkt2:.3f}")
-                    mkt = mkt2
-                    q = q2
-                    ask_sz = q2.get("ask_size")
-                elif mkt2 > mkt and mkt2 <= prefer_max:
-                    mkt = mkt2
-                    q = q2
-                    ask_sz = q2.get("ask_size")
+                side, q, q_dog = picked
+                mkt = float(q["price"])
+                dog_px = float(q_dog["price"]) if q_dog else None
+                ask_sz = q.get("ask_size")
+                min_entry = late_min_entry
+                max_entry = late_max_entry
+                dog_txt = f" dog={dog_px:.3f}" if dog_px is not None else ""
                 if mkt < min_entry or mkt > max_entry:
-                    if every:
-                        mkt = min(max_entry, max(min_entry, mkt))
+                    # Do NOT clamp below min_entry — that forced coin-flip bets (e.g. 0.57 loss).
+                    # Soft favorites: wait/retry; only clamp if slightly above max_entry.
+                    if every and mkt > max_entry:
+                        old = mkt
+                        mkt = max_entry
+                        print(f"  [late_scalp] EVERY_SLOT clamp ask {old:.3f}->{mkt:.3f} "
+                              f"(cap max {max_entry:.2f})")
                     else:
                         if _late_skip(
                             "quote_range",
-                            f"after requote ask {mkt:.3f} outside band",
+                            f"favorite {side} ask {mkt:.3f}{dog_txt} outside "
+                            f"[{min_entry:.2f}, {max_entry:.2f}] "
+                            f"(need favorite >= {min_entry:.2f})",
+                            retry=True,
+                        ) == "retry":
+                            continue
+                        continue
+                print(f"  [late_scalp] candidate {side} ask={mkt:.3f}{dog_txt} "
+                      f"in band [{min_entry:.2f},{max_entry:.2f}]"
+                      f"{' EVERY_SLOT' if every else ''}")
+
+                # Spot must agree with favorite side (book vs reality filter).
+                # V2: ALWAYS check alignment — never bet against actual price direction.
+                require_align = getattr(config, "LATE_SCALP_REQUIRE_SPOT_ALIGN", True)
+                eps = float(getattr(config, "LATE_SCALP_SPOT_ALIGN_EPS_USD", 3.0) or 0.0)
+                if require_align and slot_open_ref and price_before:
+                    signed = float(price_before) - float(slot_open_ref)
+                    if side == "UP" and signed < -eps:
+                        if _late_skip(
+                            "thin_move",
+                            f"spot vs strike DOWN (${signed:.1f}) but book favorite UP",
+                            retry=True,
+                        ) == "retry":
+                            continue
+                        continue
+                    if side == "DOWN" and signed > eps:
+                        if _late_skip(
+                            "thin_move",
+                            f"spot vs strike UP (+${signed:.1f}) but book favorite DOWN",
                             retry=True,
                         ) == "retry":
                             continue
                         continue
 
-            # Skip ultra-rich favorites when we want earlier/cheaper edge
-            if (not every) and mkt > prefer_max + 1e-9:
-                if _late_skip(
-                    "quote_range",
-                    f"ask {mkt:.3f} > prefer_max {prefer_max:.2f} "
-                    f"(wait for ~0.90-0.95 for better profit)",
-                    retry=True,
-                ) == "retry":
-                    continue
-                continue
+                # Prefer better payoff: ideally fill at/under PREFER_MAX (~0.95).
+                # EVERY_SLOT: prefer_max = hard max so we never skip on richness.
+                prefer_max = float(getattr(config, "LATE_SCALP_PREFER_MAX", 0.95)
+                                   or max_entry)
+                if every:
+                    prefer_max = max_entry
+                prefer_max = min(prefer_max, max_entry)
 
-            max_spread = float(getattr(config, "LATE_SCALP_MAX_SPREAD", 0)
-                               or getattr(config, "MAX_SPREAD", 0) or 0)
-            # V2: always enforce spread filter (was skipped in EVERY_SLOT).
-            if (max_spread > 0 and q.get("spread") is not None
-                    and q["spread"] > max_spread):
-                if _late_skip("wide_spread",
-                              f"spread {q['spread']:.3f} too wide",
-                              retry=False) == "retry":
-                    continue
-                continue
-            min_ask_sz = getattr(config, "MIN_ASK_SIZE", 0) or 0
-            if min_ask_sz > 0 and ask_sz is not None and ask_sz < min_ask_sz:
-                if _late_skip("thin_book",
-                              f"ask size {ask_sz:.2f} < {min_ask_sz:.2f}",
-                              retry=False) == "retry":
-                    continue
-                continue
+                # Re-quote: V2 always re-checks the book before committing.
+                do_rq = getattr(config, "LATE_SCALP_REQUOTE", True)
+                if do_rq:
+                    rq_sleep = float(getattr(config, "LATE_SCALP_REQUOTE_SLEEP_S", 0.35)
+                                     or 0.35)
+                    if config.ROUND_SECONDS > 0 and rq_sleep > 0:
+                        time.sleep(min(rq_sleep, 1.0))
+                    picked2 = _pick_late_scalp_favorite(
+                        pub, market, always=every,
+                        spot=price_before, strike=slot_open_ref,
+                    )
+                    if not picked2:
+                        if _late_skip("quote_fail", "requote lost favorite",
+                                     retry=True) == "retry":
+                            continue
+                        continue
+                    side2, q2, _dog2 = picked2
+                    mkt2 = float(q2["price"])
+                    max_jump = float(getattr(config, "LATE_SCALP_MAX_ASK_JUMP", 0.04)
+                                     or 0.04)
+                    keep_first = getattr(config, "LATE_SCALP_KEEP_FIRST_ASK", True)
+                    if side2 != side:
+                        if _late_skip("quote_fail",
+                                      f"requote side flip {side}->{side2}",
+                                      retry=True) == "retry":
+                            continue
+                        continue
+                    if mkt2 > mkt + max_jump:
+                        if keep_first and min_entry <= mkt <= prefer_max:
+                            print(f"  [late_scalp] requote spiked {mkt:.3f}->{mkt2:.3f}; "
+                                  f"keeping limit @ {mkt:.3f} (better profit)")
+                        else:
+                            if _late_skip(
+                                "wide_spread",
+                                f"requote ask jump {mkt:.3f}->{mkt2:.3f} "
+                                f"> {max_jump:.3f}",
+                                retry=True,
+                            ) == "retry":
+                                continue
+                            continue
+                    elif mkt2 < mkt:
+                        print(f"  [late_scalp] requote improved {mkt:.3f}->{mkt2:.3f}")
+                        mkt = mkt2
+                        q = q2
+                        ask_sz = q2.get("ask_size")
+                    elif mkt2 > mkt and mkt2 <= prefer_max:
+                        mkt = mkt2
+                        q = q2
+                        ask_sz = q2.get("ask_size")
+                    if mkt < min_entry or mkt > max_entry:
+                        if every:
+                            mkt = min(max_entry, max(min_entry, mkt))
+                        else:
+                            if _late_skip(
+                                "quote_range",
+                                f"after requote ask {mkt:.3f} outside band",
+                                retry=True,
+                            ) == "retry":
+                                continue
+                            continue
 
-            # --- V2 IMPROVEMENT: Use signal engine for independent edge ---
-            # Compute realized vol from recent prices
-            prices = feed.recent(int(getattr(config, "MOMENTUM_LOOKBACK", 12)))
-            rv = None
-            if prices:
-                from signal_engine import _realized_vol_daily
-                rv = _realized_vol_daily(prices, float(getattr(config, "SAMPLE_SECONDS", 5.0)))
-
-            fv = fair_value(
-                spot=float(price_before),
-                strike=float(slot_open_ref),
-                remaining_seconds=float(remaining),
-                volatility_daily=float(getattr(config, "VOLATILITY_DAILY", 0.045)),
-                realized_vol_daily=rv,
-                vol_blend=float(getattr(config, "VOL_BLEND", 0.5)),
-            )
-            # Model probability for the chosen side
-            model_side_prob = fv.fair_prob_up if side == "UP" else (1.0 - fv.fair_prob_up)
-            edge = model_side_prob - mkt  # positive = model thinks we're underpaying
-            min_edge = float(getattr(config, "LATE_SCALP_MIN_EDGE", 0.02) or 0)
-            print(f"  [late_scalp] model={model_side_prob:.3f} vs ask={mkt:.3f} "
-                  f"edge={edge:.3f} (Z={fv.z_score:.2f}, sigma=${fv.sigma_usd:.1f})")
-            if min_edge > 0 and edge < min_edge:
-                if _late_skip(
-                    "no_edge",
-                    f"edge {edge:.3f} < min {min_edge:.3f} "
-                    f"(model={model_side_prob:.3f} vs ask={mkt:.3f})",
-                    retry=True,
-                ) == "retry":
+                # Skip ultra-rich favorites when we want earlier/cheaper edge
+                if (not every) and mkt > prefer_max + 1e-9:
+                    if _late_skip(
+                        "quote_range",
+                        f"ask {mkt:.3f} > prefer_max {prefer_max:.2f} "
+                        f"(wait for ~0.90-0.95 for better profit)",
+                        retry=True,
+                    ) == "retry":
+                        continue
                     continue
-                continue
 
-            fee = getattr(config, "FEE_BUFFER", 0.0) or 0.0
-            stake = risk.size_late_scalp(mkt, edge=edge)
-            # EVERY_SLOT: if stake blocked only by max stake cap, allow venue min
-            if stake <= 0 and every:
-                why0 = getattr(risk, "last_skip_reason", "") or ""
-                if "LATE_SCALP_MAX_STAKE" in why0 or "max stake" in why0.lower():
-                    min_sh = float(getattr(config, "MIN_ORDER_SHARES", 5) or 5)
-                    need = round(min_sh * float(mkt), 2)
-                    if need <= risk.bankroll and need > 0:
-                        stake = need
-                        print(f"  [late_scalp] EVERY_SLOT override stake "
-                              f"to min shares ${stake:.2f}")
-            dog_txt = f" dog={dog_px:.3f}" if dog_px is not None else ""
-            mode_txt = "EVERY_SLOT" if every else "strict favorite"
-            print(f"  [late_scalp] side={side} ask={mkt:.3f}{dog_txt} "
-                  f"edge={edge:.3f} stake=${stake:.2f}  "
-                  f"({mode_txt}; limit buy; model-gated)")
-            write_status(phase="analyzing", btc_price=round(price_before, 2),
-                         side=side, model=round(model_side_prob, 4),
-                         mkt=round(mkt, 4), edge=round(edge, 4), stake=stake,
-                         confidence=round(fv.fair_prob_up, 4),
-                         end_ts=end_ts, question=question,
-                         strategy="late_scalp")
-            if stake <= 0:
-                why = getattr(risk, "last_skip_reason", "") or "no stake"
-                print(f"  size skip ({why})")
-                skips["no_edge"] += 1
-                if hybrid and pending_late_end_ts == end_ts:
-                    pending_late_end_ts = None
-                _sleep_until_slot_end(end_ts, cl_stream)
-                continue
-            pending_late_end_ts = None
-            token_id = market["tokens"][side]
-            sig = SimpleNamespace(
-                side=side,
-                confidence=round(fv.fair_prob_up, 4),
-                model_prob_up=fv.fair_prob_up,
-                realized_vol_daily=None,
-                z_score=fv.z_score,
-                sigma_usd=fv.sigma_usd,
-            )
+                max_spread = float(getattr(config, "LATE_SCALP_MAX_SPREAD", 0)
+                                   or getattr(config, "MAX_SPREAD", 0) or 0)
+                # V2: always enforce spread filter (was skipped in EVERY_SLOT).
+                if (max_spread > 0 and q.get("spread") is not None
+                        and q["spread"] > max_spread):
+                    if _late_skip("wide_spread",
+                                  f"spread {q['spread']:.3f} too wide",
+                                  retry=False) == "retry":
+                        continue
+                    continue
+                min_ask_sz = getattr(config, "MIN_ASK_SIZE", 0) or 0
+                if min_ask_sz > 0 and ask_sz is not None and ask_sz < min_ask_sz:
+                    if _late_skip("thin_book",
+                                  f"ask size {ask_sz:.2f} < {min_ask_sz:.2f}",
+                                  retry=False) == "retry":
+                        continue
+                    continue
+
+                # --- V2 IMPROVEMENT: Use signal engine for independent edge ---
+                # Compute realized vol from recent prices
+                prices = feed.recent(int(getattr(config, "MOMENTUM_LOOKBACK", 12)))
+                rv = None
+                if prices:
+                    from signal_engine import _realized_vol_daily
+                    rv = _realized_vol_daily(prices, float(getattr(config, "SAMPLE_SECONDS", 5.0)))
+
+                fv = fair_value(
+                    spot=float(price_before),
+                    strike=float(slot_open_ref),
+                    remaining_seconds=float(remaining or 1.0),
+                    volatility_daily=float(getattr(config, "VOLATILITY_DAILY", 0.045)),
+                    realized_vol_daily=rv,
+                    vol_blend=float(getattr(config, "VOL_BLEND", 0.5)),
+                )
+                # Model probability for the chosen side
+                model_side_prob = fv.fair_prob_up if side == "UP" else (1.0 - fv.fair_prob_up)
+                edge = model_side_prob - mkt  # positive = model thinks we're underpaying
+                min_edge = float(getattr(config, "LATE_SCALP_MIN_EDGE", 0.02) or 0)
+                print(f"  [late_scalp] model={model_side_prob:.3f} vs ask={mkt:.3f} "
+                      f"edge={edge:.3f} (Z={fv.z_score:.2f}, sigma=${fv.sigma_usd:.1f})")
+                if min_edge > 0 and edge < min_edge:
+                    if _late_skip(
+                        "no_edge",
+                        f"edge {edge:.3f} < min {min_edge:.3f} "
+                        f"(model={model_side_prob:.3f} vs ask={mkt:.3f})",
+                        retry=True,
+                    ) == "retry":
+                        continue
+                    continue
+
+                fee = getattr(config, "FEE_BUFFER", 0.0) or 0.0
+                stake = risk.size_late_scalp(mkt, edge=edge)
+                # EVERY_SLOT: if stake blocked only by max stake cap, allow venue min
+                if stake <= 0 and every:
+                    why0 = getattr(risk, "last_skip_reason", "") or ""
+                    if "LATE_SCALP_MAX_STAKE" in why0 or "max stake" in why0.lower():
+                        min_sh = float(getattr(config, "MIN_ORDER_SHARES", 5) or 5)
+                        need = round(min_sh * float(mkt), 2)
+                        if need <= risk.bankroll and need > 0:
+                            stake = need
+                            print(f"  [late_scalp] EVERY_SLOT override stake "
+                                  f"to min shares ${stake:.2f}")
+                dog_txt = f" dog={dog_px:.3f}" if dog_px is not None else ""
+                mode_txt = "EVERY_SLOT" if every else "strict favorite"
+                print(f"  [late_scalp] side={side} ask={mkt:.3f}{dog_txt} "
+                      f"edge={edge:.3f} stake=${stake:.2f}  "
+                      f"({mode_txt}; limit buy; model-gated)")
+                write_status(phase="analyzing", btc_price=round(price_before, 2),
+                             side=side, model=round(model_side_prob, 4),
+                             mkt=round(mkt, 4), edge=round(edge, 4), stake=stake,
+                             confidence=round(fv.fair_prob_up, 4),
+                             end_ts=end_ts, question=question,
+                             strategy="late_scalp")
+                if stake <= 0:
+                    why = getattr(risk, "last_skip_reason", "") or "no stake"
+                    print(f"  size skip ({why})")
+                    skips["no_edge"] += 1
+                    if hybrid and pending_late_end_ts == end_ts:
+                        pending_late_end_ts = None
+                    _sleep_until_slot_end(end_ts, cl_stream)
+                    continue
+                pending_late_end_ts = None
+                token_id = market["tokens"][side]
+                sig = SimpleNamespace(
+                    side=side,
+                    confidence=round(fv.fair_prob_up, 4),
+                    model_prob_up=fv.fair_prob_up,
+                    realized_vol_daily=None,
+                    z_score=fv.z_score,
+                    sigma_usd=fv.sigma_usd,
+                )
         else:
             # ---- MID-SLOT PATH (original + quality guards) ----
             config.MIN_ENTRY_PRICE = mid_min_entry
@@ -1684,7 +1797,10 @@ def run_realtime(rounds: int = 100, paper: bool = True):
         risk.on_open(stake)
         # Notify dashboard immediately (before multi-minute hold).
         trade_event_id = f"placed-{trade.round_id}-{int(trade.ts)}"
-        strat_lbl = "late_scalp" if use_late else "mid"
+        if config.is_late_momentum():
+            strat_lbl = "late_momentum"
+        else:
+            strat_lbl = "late_scalp" if use_late else "mid"
         # Decision journal: trade intent
         try:
             _journal(
@@ -1938,9 +2054,9 @@ if __name__ == "__main__":
     ap.add_argument("--mode", choices=["paper", "paper_live", "live"],
                     default=config.MODE, help="overrides MODE from .env")
     ap.add_argument("--strategy",
-                    choices=["mid", "late_scalp", "late_every", "hybrid"],
+                    choices=["mid", "late_scalp", "late_every", "hybrid", "late_momentum"],
                     default=None,
-                    help="mid | late_scalp | late_every (bet most 5m slots) | hybrid")
+                    help="mid | late_scalp | late_every (bet most 5m slots) | hybrid | late_momentum")
     ap.add_argument("--rounds", type=int, default=None)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--sleep", type=float, default=0.0)
@@ -1966,6 +2082,9 @@ if __name__ == "__main__":
         config.FIXED_STAKE_USD = args.bet
         if config.MAX_EXPOSURE_USD < args.bet:
             config.MAX_EXPOSURE_USD = args.bet
+        if args.mode != "live":
+            config.LATE_SCALP_MAX_STAKE_USD = max(getattr(config, "LATE_SCALP_MAX_STAKE_USD", 0.0), args.bet)
+            config.MID_MAX_STAKE_USD = max(getattr(config, "MID_MAX_STAKE_USD", 0.0), args.bet)
     if args.reset:
         reset_state()
 

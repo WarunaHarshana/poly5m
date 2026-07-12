@@ -193,6 +193,12 @@ LATE_SCALP_MIN_EDGE = float(os.getenv("LATE_SCALP_MIN_EDGE", "0.02"))
 # Enable edge-scaled/Kelly sizing for late-scalping.
 LATE_SCALP_USE_EDGE_SIZING = _env_bool("LATE_SCALP_USE_EDGE_SIZING", True)
 
+# --- Late momentum strategy (STRATEGY=late_momentum) ---
+LATE_MOMENTUM_MIN_MOVE = float(os.getenv("LATE_MOMENTUM_MIN_MOVE", "10.0"))
+LATE_MOMENTUM_TIME_LIMIT = int(os.getenv("LATE_MOMENTUM_TIME_LIMIT", "40"))
+LATE_MOMENTUM_MIN_REMAINING = int(os.getenv("LATE_MOMENTUM_MIN_REMAINING", "8"))
+LATE_MOMENTUM_BIDIRECTIONAL = _env_bool("LATE_MOMENTUM_BIDIRECTIONAL", True)
+
 # --- Hybrid (STRATEGY=hybrid): prefer late; mid only if exceptional ---
 # When true (default), mid must clear HYBRID_MID_* bars on top of normal mid filters;
 # otherwise the slot is queued for late_scalp. Set HYBRID_PREFER_LATE=0 for old
@@ -392,6 +398,13 @@ def is_hybrid() -> bool:
     )
 
 
+def is_late_momentum() -> bool:
+    """True for late momentum breakout strategy."""
+    return (STRATEGY or "mid").strip().lower() in (
+        "late_momentum", "momentum_late", "late_min_move", "momentum",
+    )
+
+
 def apply_strategy_flags() -> None:
     """Normalize STRATEGY aliases and set LATE_SCALP_EVERY_SLOT from menu choice.
 
@@ -410,6 +423,8 @@ def apply_strategy_flags() -> None:
         LATE_SCALP_EVERY_SLOT = False
     elif s in ("hybrid", "mid_then_late", "both", "late_then_mid", "prefer_late"):
         STRATEGY = "hybrid"
+    elif s in ("late_momentum", "momentum_late", "late_min_move", "momentum"):
+        STRATEGY = "late_momentum"
     elif s in ("mid", "middle", "value"):
         STRATEGY = "mid"
 
@@ -454,4 +469,6 @@ def strategy_name() -> str:
         return "late_every"
     if is_late_scalp():
         return "late_scalp"
+    if is_late_momentum():
+        return "late_momentum"
     return "mid"

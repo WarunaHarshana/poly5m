@@ -52,7 +52,16 @@ STRATEGY_FIELDS = [
     # --- Strategy / mode-ish ---
     {"key": "STRATEGY", "label": "Default strategy", "type": "str",
      "default": "mid", "group": "general",
-     "hint": "mid | late_scalp | late_every | hybrid (Start menu can override)"},
+     "hint": "mid | late_scalp | late_every | late_momentum | hybrid (Start menu can override)"},
+    # --- Late momentum strategy ---
+    {"key": "LATE_MOMENTUM_MIN_MOVE", "label": "Momentum min move $", "type": "float",
+     "default": "10.0", "group": "late_momentum", "hint": "Min price gap vs strike (price to beat) when timer hits"},
+    {"key": "LATE_MOMENTUM_TIME_LIMIT", "label": "Momentum max seconds left", "type": "int",
+     "default": "40", "group": "late_momentum", "hint": "Start checking when seconds left is under this"},
+    {"key": "LATE_MOMENTUM_MIN_REMAINING", "label": "Momentum min seconds left", "type": "int",
+     "default": "8", "group": "late_momentum", "hint": "Stop trading below this many seconds"},
+    {"key": "LATE_MOMENTUM_BIDIRECTIONAL", "label": "Momentum bidirectional", "type": "bool",
+     "default": "1", "group": "late_momentum", "hint": "1=bet UP on pump / DOWN on dump, 0=only UP"},
     # --- Late scalp bands ---
     {"key": "LATE_SCALP_EVERY_SLOT", "label": "Trade every 5m slot", "type": "bool",
      "default": "1", "group": "late",
@@ -185,6 +194,7 @@ def _settings_payload() -> dict:
     env = _parse_env_file()
     groups = {
         "general": "General",
+        "late_momentum": "Late Momentum strategy",
         "late": "Late scalp bands & guards",
         "mid": "Mid strategy",
         "hybrid": "Hybrid",
@@ -235,9 +245,9 @@ def _save_settings(body: dict) -> dict:
                 continue
         elif k == "STRATEGY":
             s = s.lower()
-            if s not in ("mid", "late_scalp", "late_every", "hybrid"):
+            if s not in ("mid", "late_scalp", "late_every", "hybrid", "late_momentum"):
                 errors.append(
-                    "STRATEGY must be mid, late_scalp, late_every, or hybrid")
+                    "STRATEGY must be mid, late_scalp, late_every, hybrid, or late_momentum")
                 continue
             # Keep LATE_SCALP_EVERY_SLOT in sync with strategy menu choice
             if s == "late_every":
@@ -676,7 +686,7 @@ def _start(opts: dict) -> dict:
         # Use python -u for unbuffered output to make logs real-time
         cmd = [sys.executable, "-u", "bot.py", "--mode", mode]
         strategy = str(opts.get("strategy") or "mid").strip().lower()
-        if strategy not in ("mid", "late_scalp", "late_every", "hybrid"):
+        if strategy not in ("mid", "late_scalp", "late_every", "hybrid", "late_momentum"):
             strategy = "mid"
         # Persist menu choice + every-slot flag for next load
         try:
@@ -1384,6 +1394,7 @@ body.trade-flash-lose { animation: page-flash-down 1.6s ease-out; }
           <option value="mid">mid · edge / fair-value mid-slot</option>
           <option value="late_scalp">late_scalp · selective favorites (~0.90+)</option>
           <option value="late_every">late_every · bet almost every 5m slot</option>
+          <option value="late_momentum">late_momentum · breakout move in last minute</option>
           <option value="hybrid">hybrid · late preferred, strict mid if exceptional</option>
         </select>
       </div>
@@ -1428,6 +1439,7 @@ body.trade-flash-lose { animation: page-flash-down 1.6s ease-out; }
     <div id="sp-body">
       <div class="sp-tabs" id="sp-tabs">
         <button type="button" class="sp-tab on" data-g="late">Late scalp</button>
+        <button type="button" class="sp-tab" data-g="late_momentum">Late Momentum</button>
         <button type="button" class="sp-tab" data-g="mid">Mid</button>
         <button type="button" class="sp-tab" data-g="hybrid">Hybrid</button>
         <button type="button" class="sp-tab" data-g="risk">Risk</button>
@@ -2348,6 +2360,36 @@ document.getElementById('lw-toggle').onclick = () => {
 let settingsSchema = null;
 let settingsActiveGroup = 'late';
 
+function updateTabsVisibility(strat) {
+  let allowed = [];
+  const s = String(strat || 'mid').toLowerCase();
+  if (s === 'mid') {
+    allowed = ['mid', 'risk', 'general'];
+  } else if (s === 'late_scalp' || s === 'late_every') {
+    allowed = ['late', 'risk', 'general'];
+  } else if (s === 'late_momentum') {
+    allowed = ['late_momentum', 'risk', 'general'];
+  } else if (s === 'hybrid') {
+    allowed = ['mid', 'late', 'hybrid', 'risk', 'general'];
+  } else {
+    allowed = ['mid', 'late', 'late_momentum', 'hybrid', 'risk', 'general'];
+  }
+
+  let firstVisible = null;
+  document.querySelectorAll('.sp-tab').forEach(btn => {
+    const g = btn.dataset.g;
+    const ok = allowed.includes(g);
+    btn.style.display = ok ? '' : 'none';
+    if (ok && !firstVisible) {
+      firstVisible = btn;
+    }
+  });
+
+  if (!allowed.includes(settingsActiveGroup) && firstVisible) {
+    firstVisible.click();
+  }
+}
+
 function _spVal(field) {
   const el = document.getElementById('sf-' + field.key);
   if (!el) return field.value;
@@ -2385,6 +2427,7 @@ function renderSettings(data) {
             <option value="mid" ${v==='mid'?'selected':''}>mid</option>
             <option value="late_scalp" ${v==='late_scalp'?'selected':''}>late_scalp (selective)</option>
             <option value="late_every" ${v==='late_every'?'selected':''}>late_every (every 5m)</option>
+            <option value="late_momentum" ${v==='late_momentum'?'selected':''}>late_momentum (last minute move)</option>
             <option value="hybrid" ${v==='hybrid'?'selected':''}>hybrid</option>
           </select>${hint}</div>`;
       }
@@ -2409,6 +2452,7 @@ function renderSettings(data) {
   if (cStrat && [...cStrat.options].some(o => o.value === strat)) {
     cStrat.value = strat;
   }
+  updateTabsVisibility(strat);
 }
 
 async function loadSettings() {
@@ -2566,6 +2610,7 @@ document.getElementById('c-strategy').addEventListener('change', () => {
   if (el) el.value = strat;
   const every = document.getElementById('sf-LATE_SCALP_EVERY_SLOT');
   if (every) every.checked = (strat === 'late_every');
+  updateTabsVisibility(strat);
 });
 
 loadSettings();

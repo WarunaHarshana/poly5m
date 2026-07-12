@@ -25,6 +25,7 @@ config.FIXED_STAKE_USD = 0
 config.MIN_MOVE_USD = 0
 config.MIN_ENTRY_PRICE = 0.05
 config.MAX_ENTRY_PRICE = 0.95
+
 config.FEE_BUFFER = 0.0
 config.MIN_CONFIDENCE = 0.0
 config.MAX_SPREAD = 0.0
@@ -59,7 +60,7 @@ class FakePub:
     tokens{} map, so bot.run_realtime exercises the real code path."""
     def __init__(self, *a, **k):
         self.n = 0
-    def find_btc_5min_market(self):
+    def find_btc_5min_market(self, *args, **kwargs):
         self.n += 1
         up, down = "UP_%d" % self.n, "DOWN_%d" % self.n
         return {
