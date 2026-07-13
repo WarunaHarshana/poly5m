@@ -63,6 +63,7 @@ class ChainlinkDataStream:
         self._ticks: deque[tuple[float, float]] = deque(maxlen=history_maxlen)
         self._latest: float | None = None
         self._latest_ts: float | None = None
+        self._local_latest_ts: float | None = None  # Local arrival time to detect freezes
         # stream_wall_clock - local_wall_clock (fixes PC clock skew vs Polymarket)
         self._clock_offset: float = 0.0
         self._lock = threading.Lock()
@@ -73,6 +74,11 @@ class ChainlinkDataStream:
 
     @property
     def ready(self) -> bool:
+        with self._lock:
+            # If the latest tick is older than 10 seconds, mark stream as NOT ready (stale/disconnected)
+            if self._local_latest_ts is not None:
+                if time.time() - self._local_latest_ts > 10.0:
+                    return False
         return self._ready.is_set() and self._latest is not None
 
     def start(self) -> None:
@@ -158,6 +164,7 @@ class ChainlinkDataStream:
             first = self._latest is None
             self._latest = value
             self._latest_ts = ts_s
+            self._local_latest_ts = local
             # Track PC clock skew vs stream (often 10–20s on unsynced Windows).
             if first:
                 self._clock_offset = sample_off

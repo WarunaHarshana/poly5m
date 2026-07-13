@@ -31,6 +31,8 @@ class RiskManager:
         return max(limit, 0.0)
 
     def daily_loss_ok(self) -> bool:
+        if config.MODE != "live":
+            return True
         limit = self._daily_loss_limit()
         if limit > 0 and self.realized_pnl_today <= -limit:
             self.halted = True

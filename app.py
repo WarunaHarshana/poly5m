@@ -1561,6 +1561,10 @@ body.trade-flash-lose { animation: page-flash-down 1.6s ease-out; }
       <span class="sb-v" id="sb-signal">—</span>
     </div>
     <div class="sb-item">
+      <span class="sb-k">Time Guard</span>
+      <span class="sb-v" id="sb-time-suitability">—</span>
+    </div>
+    <div class="sb-item">
       <span class="sb-k">PM Wallet</span>
       <span class="sb-v big mono" id="sb-wallet">—</span>
     </div>
@@ -1846,6 +1850,23 @@ function renderStatus(st) {
     sig.innerHTML = `<span class="${cls}">${st.last_result} ${(st.last_pnl >= 0 ? '+' : '') + Number(st.last_pnl || 0).toFixed(2)}</span>`;
   } else {
     sig.textContent = '—';
+  }
+
+  const tsEl = document.getElementById('sb-time-suitability');
+  if (tsEl) {
+    const suit = st.time_suitability || '—';
+    if (suit === '—') {
+      tsEl.textContent = '—';
+    } else {
+      const idx = suit.indexOf(':');
+      const action = idx !== -1 ? suit.substring(0, idx).trim() : suit;
+      const reason = idx !== -1 ? suit.substring(idx + 1).trim() : '';
+      let cls = 'dim';
+      if (action === 'GOOD') cls = 'won';
+      else if (action === 'AVOID') cls = 'lost';
+      else if (action === 'CAUTION') cls = 'amb';
+      tsEl.innerHTML = `<span class="${cls}" style="font-weight:bold">${action}</span> <span style="font-size:10px;opacity:0.8">${reason}</span>`;
+    }
   }
 
   slotEndTs = (st.end_ts && ['analyzing', 'holding', 'waiting', 'resolving'].includes(st.phase)) ? st.end_ts : null;

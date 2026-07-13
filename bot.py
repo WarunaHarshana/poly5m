@@ -83,10 +83,17 @@ def write_status(**kw):
     _status["mode"] = config.MODE
     _status["updated_at"] = time.time()
     try:
+        from config import get_time_suitability
+        suitability, reason = get_time_suitability()
+        _status["time_suitability"] = f"{suitability}: {reason}"
+    except Exception:
+        pass
+    try:
         with open(STATUS_PATH, "w") as f:
             json.dump(_status, f, indent=2)
     except Exception:
         pass
+
 
 
 def market_price_from_model(model_prob_up: float, side: str, noise_rng) -> float:
@@ -807,8 +814,15 @@ def run_realtime(rounds: int = 100, paper: bool = True):
         remaining = (end_ts - _now(cl_stream)) if end_ts else None
         rem_txt = f"{remaining:.0f}s left" if remaining is not None else "no end time"
         print(f"\nslot: {question}  ({rem_txt})")
+        try:
+            from config import get_time_suitability
+            suitability, reason = get_time_suitability()
+            print(f"  [Time Guard] Suitability: {suitability} - {reason}")
+        except Exception:
+            pass
         write_status(phase="analyzing", question=question, slug=market.get("slug"),
                      end_ts=end_ts, side=None, edge=None, mkt=None)
+
 
         # Decide phase for this iteration: mid | late
         force_late = (

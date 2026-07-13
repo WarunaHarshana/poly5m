@@ -472,3 +472,57 @@ def strategy_name() -> str:
     if is_late_momentum():
         return "late_momentum"
     return "mid"
+
+
+def get_time_suitability(ts: float | None = None) -> tuple[str, str]:
+    """Check if the current time is suitable for trading.
+    
+    Returns (suitability, reason)
+    - "GOOD", reason description
+    - "AVOID", reason description
+    - "CAUTION", reason description
+    - "OK", reason description
+    """
+    import datetime
+    import time
+    if ts is None:
+        ts = time.time()
+    dt = datetime.datetime.fromtimestamp(ts, datetime.timezone.utc)
+    hour = dt.hour
+    minute = dt.minute
+    
+    # SLST is UTC + 5:30
+    slst_dt = dt + datetime.timedelta(hours=5, minutes=30)
+    slst_hour = slst_dt.hour
+    slst_minute = slst_dt.minute
+    slst_str = f"{slst_hour:02d}:{slst_minute:02d} SLST"
+
+    # Red Zone 1: US Pre-Market & Open (12:00 - 15:00 UTC / 5:30 PM - 8:30 PM SLST)
+    if 12 <= hour < 15:
+        return "AVOID", f"US Open Volatility ({slst_str})"
+        
+    # Red Zone 2: London Open (08:00 - 10:00 UTC / 1:30 PM - 3:30 PM SLST)
+    if 8 <= hour < 10:
+        return "AVOID", f"London Open Volatility ({slst_str})"
+        
+    # Caution Zone: US Close (19:55 - 20:05 UTC / 1:25 AM - 1:35 AM SLST)
+    if hour == 19 and 55 <= minute <= 59:
+        return "CAUTION", f"US Close rebalance ({slst_str})"
+    if hour == 20 and 0 <= minute <= 5:
+        return "CAUTION", f"US Close rebalance ({slst_str})"
+
+    # Best Windows:
+    # 1. Midday US Session (15:00 - 17:00 UTC / 8:30 PM - 10:30 PM SLST)
+    if 15 <= hour < 17:
+        return "GOOD", f"Midday US - stable trend ({slst_str})"
+        
+    # 2. Asian Morning (00:00 - 04:00 UTC / 5:30 AM - 9:30 AM SLST)
+    if 0 <= hour < 4:
+        return "GOOD", f"Asian Morning - low vol ({slst_str})"
+        
+    # 3. US Post-Close (21:00 - 23:00 UTC / 2:30 AM - 4:30 AM SLST)
+    if 21 <= hour < 23:
+        return "GOOD", f"US Post-Close quiet ({slst_str})"
+
+    return "OK", f"Normal conditions ({slst_str})"
+
