@@ -1,10 +1,4 @@
-"""Offline self-test for the real-data (paper_live) code path.
-
-Stubs the network (LivePriceFeed + PolymarketPublic) so we can exercise
-run_realtime end-to-end with zero network and instant rounds. Proves the wiring
-is correct and generates realistic state/*.json (+ status.json) for a dashboard
-preview.
-"""
+import asyncio
 import math
 import random
 
@@ -79,5 +73,5 @@ class FakePub:
 bot.LivePriceFeed = FakeFeed
 polymarket_client.PolymarketPublic = FakePub
 
-stats = bot.run_realtime(rounds=40, paper=True)
+stats = asyncio.run(bot.run_realtime(rounds=40, paper=True))
 print("\nSELFTEST_OK trades=", stats["trades"], "mode=", stats["mode"])

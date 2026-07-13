@@ -67,9 +67,9 @@ class ChainlinkDataStream:
         # stream_wall_clock - local_wall_clock (fixes PC clock skew vs Polymarket)
         self._clock_offset: float = 0.0
         self._lock = threading.Lock()
-        self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
-        self._ready = threading.Event()
+        self._stop_requested: bool = False
+        self._task: asyncio.Task | None = None
+        self._ready = asyncio.Event()
         self._err: str | None = None
 
     @property
@@ -82,20 +82,23 @@ class ChainlinkDataStream:
         return self._ready.is_set() and self._latest is not None
 
     def start(self) -> None:
-        if self._thread and self._thread.is_alive():
+        if self._task and not self._task.done():
             return
-        self._stop.clear()
-        self._thread = threading.Thread(
-            target=self._run, name="chainlink-rtds", daemon=True)
-        self._thread.start()
+        self._stop_requested = False
+        self._ready.clear()
+        self._task = asyncio.create_task(self._async_loop())
 
     def stop(self) -> None:
-        self._stop.set()
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=3.0)
+        self._stop_requested = True
+        if self._task:
+            self._task.cancel()
 
-    def wait_ready(self, timeout: float = 15.0) -> bool:
-        return self._ready.wait(timeout=timeout) and self._latest is not None
+    async def wait_ready(self, timeout: float = 15.0) -> bool:
+        try:
+            await asyncio.wait_for(self._ready.wait(), timeout=timeout)
+            return self._latest is not None
+        except Exception:
+            return False
 
     def market_now(self) -> float:
         """Wall clock aligned to Chainlink stream timestamps (not skewed PC clock)."""
@@ -173,16 +176,11 @@ class ChainlinkDataStream:
             self._ticks.append((ts_s, value))
         self._ready.set()
 
-    def _run(self) -> None:
-        try:
-            asyncio.run(self._async_loop())
-        except Exception as e:
-            self._err = str(e)
-
     async def _async_loop(self) -> None:
         import websockets  # optional dep; required for paper_live Chainlink stream
 
-        while not self._stop.is_set():
+        is_first_tick = True
+        while not self._stop_requested:
             try:
                 async with websockets.connect(
                     self.WS_URL,
@@ -200,7 +198,8 @@ class ChainlinkDataStream:
                         }],
                     }
                     await ws.send(json.dumps(sub))
-                    while not self._stop.is_set():
+                    is_first_tick = True  # reset on reconnect to drop stale cached snapshot
+                    while not self._stop_requested:
                         try:
                             raw = await asyncio.wait_for(ws.recv(), timeout=5.0)
                         except asyncio.TimeoutError:
@@ -227,6 +226,20 @@ class ChainlinkDataStream:
                             value = float(payload.get("value"))
                         except (TypeError, ValueError):
                             continue
+                        
+                        # --- Drop First Tick (stale cached snapshot) ---
+                        if is_first_tick:
+                            is_first_tick = False
+                            continue
+
+                        # --- Delta Price Validation (reject anomalous jumps > $1,500) ---
+                        if self._latest is not None:
+                            delta = abs(value - self._latest)
+                            if delta > 1500.0:
+                                print(f"  [price_feed] WARNING: Rejected anomalous price tick jump: "
+                                      f"${self._latest:,.2f} -> ${value:,.2f} (delta=${delta:,.2f})")
+                                continue
+
                         # payload timestamp is ms
                         ts_ms = payload.get("timestamp") or msg.get("timestamp")
                         try:
@@ -235,6 +248,8 @@ class ChainlinkDataStream:
                             ts_s = time.time()
                         if value > 0:
                             self._record(ts_s, value)
+            except asyncio.CancelledError:
+                break
             except Exception as e:
                 self._err = str(e)
                 # brief backoff then reconnect

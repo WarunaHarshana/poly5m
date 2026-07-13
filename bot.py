@@ -20,6 +20,7 @@ NOTE on resolution: Polymarket settles BTC 5m markets on Chainlink Data Streams
 Gamma outcome after the slot closes so WON/LOST matches the website.
 """
 from __future__ import annotations
+import asyncio
 import json
 import os
 import time
@@ -377,7 +378,7 @@ def run_sim(rounds: int = 200, sleep_between: float = 0.0, seed: int = 42):
     return stats
 
 
-def _warmup_prices(feed, remaining):
+async def _warmup_prices(feed, remaining):
     """Collect a short momentum window of real prices, bounded so it fits inside
     the current slot (leave room to place the trade before the slot ends)."""
     n = config.MOMENTUM_LOOKBACK
@@ -389,11 +390,12 @@ def _warmup_prices(feed, remaining):
     prices = []
     for i in range(n):
         try:
-            prices.append(feed.price())
+            px = await asyncio.to_thread(feed.price)
+            prices.append(px)
         except Exception as e:
             print(f"  price sample failed: {e}")
         if i < n - 1 and spacing > 0:
-            time.sleep(spacing)
+            await asyncio.sleep(spacing)
     return prices
 
 
@@ -404,7 +406,7 @@ def _now(cl_stream: ChainlinkDataStream | None = None) -> float:
     return time.time()
 
 
-def _sleep_until_slot_end(end_ts, cl_stream: ChainlinkDataStream | None = None):
+async def _sleep_until_slot_end(end_ts, cl_stream: ChainlinkDataStream | None = None):
     """Wait out the current slot so the next fetch returns a fresh one.
 
     Honors ROUND_SECONDS<=0 as a 'fast/test' setting (no artificial wait), which
@@ -419,20 +421,20 @@ def _sleep_until_slot_end(end_ts, cl_stream: ChainlinkDataStream | None = None):
         wait = end_ts - _now(cl_stream)
         if wait > 0:
             cap = config.ROUND_SECONDS + 1
-            time.sleep(min(wait + 1.0, cap))
+            await asyncio.sleep(min(wait + 1.0, cap))
         else:
             # Past end already — don't tight-loop; give Gamma/discovery a moment
             # to roll to the next slug (and let stream clock advance).
-            time.sleep(min(5.0, max(2.0, config.ROUND_SECONDS * 0.02)))
+            await asyncio.sleep(min(5.0, max(2.0, config.ROUND_SECONDS * 0.02)))
         return
-    time.sleep(min(5.0, config.ROUND_SECONDS))
+    await asyncio.sleep(min(5.0, config.ROUND_SECONDS))
 
 
-def _backoff(seconds):
+async def _backoff(seconds):
     """Bounded retry sleep that is skipped in fast/test mode (ROUND_SECONDS<=0)."""
     if config.ROUND_SECONDS <= 0:
         return
-    time.sleep(seconds)
+    await asyncio.sleep(seconds)
 
 
 def _quote_side(pub, market, side: str) -> dict | None:
@@ -542,7 +544,7 @@ def _pick_late_scalp_favorite(
     return None
 
 
-def run_realtime(rounds: int = 100, paper: bool = True):
+async def run_realtime(rounds: int = 100, paper: bool = True):
     """Real BTC data + real Polymarket quotes, discovering the current slot's
     token IDs from Gamma at the start of every round.
 
@@ -715,11 +717,11 @@ def run_realtime(rounds: int = 100, paper: bool = True):
 
     # Hybrid: after mid skip on a slot, remember to try late on same end_ts
     pending_late_end_ts = None
-    if not cl_stream.wait_ready(timeout=20.0):
+    if not await cl_stream.wait_ready(timeout=20.0):
         print("  [warn] Chainlink Data Stream slow/unavailable; "
               "falling back to other feeds (NOT official resolution source)")
     try:
-        spot = feed.price()
+        spot = await asyncio.to_thread(feed.price)
         src = "chainlink-data-stream" if cl_stream.ready else "fallback"
         print(f"  BTC spot now: ${spot:,.2f}  [{src}]")
         if cl_stream.ready:
@@ -738,7 +740,7 @@ def run_realtime(rounds: int = 100, paper: bool = True):
     # Live: show real Polymarket USDC balance at startup
     if not paper and live_client is not None:
         try:
-            bal = live_client.get_usdc_balance(refresh=True)
+            bal = await asyncio.to_thread(live_client.get_usdc_balance, refresh=True)
             if bal.get("ok") and bal.get("balance_usd") is not None:
                 print(f"  Polymarket wallet USDC: ${bal['balance_usd']:,.2f}  "
                       f"(funder {bal.get('funder')})")
@@ -788,15 +790,15 @@ def run_realtime(rounds: int = 100, paper: bool = True):
         try:
             if hybrid and pending_late_end_ts is not None:
                 pin_start = int(pending_late_end_ts) - int(config.SLOT_SECONDS)
-                market = pub.find_btc_5min_market_at(pin_start, now=now_clk)
+                market = await asyncio.to_thread(pub.find_btc_5min_market_at, pin_start, now=now_clk)
                 if market is None:
                     # Pinned slot ended or unfetchable — clear and rediscover.
                     print(f"  [hybrid] pinned late slot end={int(pending_late_end_ts)} "
                           f"gone; clearing late queue")
                     pending_late_end_ts = None
-                    market = pub.find_btc_5min_market(now=now_clk)
+                    market = await asyncio.to_thread(pub.find_btc_5min_market, now=now_clk)
             else:
-                market = pub.find_btc_5min_market(now=now_clk)
+                market = await asyncio.to_thread(pub.find_btc_5min_market, now=now_clk)
             lookup_fails = 0
         except Exception as e:
             lookup_fails += 1
@@ -806,7 +808,7 @@ def run_realtime(rounds: int = 100, paper: bool = True):
                 print("[giving up] market not found after 20 tries. Run discover.py.")
                 write_status(phase="error", message="market not found after 20 tries")
                 break
-            _backoff(15)
+            await _backoff(15)
             continue
 
         question = market.get("question") or "BTC 5-minute Up/Down"
@@ -868,7 +870,7 @@ def run_realtime(rounds: int = 100, paper: bool = True):
             print(f"  slot closing ({remaining:.0f}s); waiting for the next slot...")
             skips["slot_closing"] += 1
             write_status(phase="waiting", message="slot closing")
-            _sleep_until_slot_end(end_ts, cl_stream)
+            await _sleep_until_slot_end(end_ts, cl_stream)
             continue
         if remaining is not None and max_rem > 0 and remaining > max_rem:
             wait = remaining - max_rem
@@ -880,9 +882,9 @@ def run_realtime(rounds: int = 100, paper: bool = True):
                 # Late handoff: sleep almost until the window opens so we don't
                 # thrash discovery and miss 8–35s. Mid still polls every ~30s.
                 if use_late:
-                    time.sleep(min(wait, max(1.0, wait - 1.5)))
+                    await asyncio.sleep(min(wait, max(1.0, wait - 1.5)))
                 else:
-                    time.sleep(min(wait, 30.0))
+                    await asyncio.sleep(min(wait, 30.0))
             continue
 
         remaining = (end_ts - _now(cl_stream)) if end_ts else remaining
@@ -891,7 +893,7 @@ def run_realtime(rounds: int = 100, paper: bool = True):
                 pending_late_end_ts = None
             print(f"  window missed ({remaining:.0f}s left); next slot...")
             skips["slot_closing"] += 1
-            _sleep_until_slot_end(end_ts, cl_stream)
+            await _sleep_until_slot_end(end_ts, cl_stream)
             continue
 
         # ---- LATE SCALP PATH: book favorite + hard quality filters ----
@@ -907,10 +909,10 @@ def run_realtime(rounds: int = 100, paper: bool = True):
             if remaining is not None and remaining >= late_max - 0.5:
                 import random
                 delay = random.uniform(0.1, 0.4)
-                time.sleep(delay)
+                await asyncio.sleep(delay)
                 remaining -= delay
 
-            def _late_skip(skip_key: str, msg: str, retry: bool = True):
+            async def _late_skip(skip_key: str, msg: str, retry: bool = True):
                 """Skip this late attempt; optionally retry while window open."""
                 nonlocal pending_late_end_ts
                 skips[skip_key] = skips.get(skip_key, 0) + 1
@@ -919,11 +921,11 @@ def run_realtime(rounds: int = 100, paper: bool = True):
 
                 rem_now = (end_ts - _now(cl_stream)) if end_ts else remaining
                 if retry and rem_now is not None and rem_now > late_min + 2:
-                    time.sleep(min(1.2, max(0.4, rem_now - late_min)))
+                    await asyncio.sleep(min(1.2, max(0.4, rem_now - late_min)))
                     return "retry"
                 if hybrid and pending_late_end_ts == end_ts:
                     pending_late_end_ts = None
-                _sleep_until_slot_end(end_ts, cl_stream)
+                await _sleep_until_slot_end(end_ts, cl_stream)
                 return "done"
 
             # Cooldown after a late loss (harder to chain blowups).
@@ -936,7 +938,7 @@ def run_realtime(rounds: int = 100, paper: bool = True):
                     pending_late_end_ts = None
                 write_status(phase="waiting", message="late pause after loss",
                              strategy=phase_name)
-                _sleep_until_slot_end(end_ts, cl_stream)
+                await _sleep_until_slot_end(end_ts, cl_stream)
                 continue
 
             slot_start_time = (end_ts - config.SLOT_SECONDS) if end_ts else None
@@ -944,7 +946,7 @@ def run_realtime(rounds: int = 100, paper: bool = True):
             strike_src = "unknown"
             if slot_start_time:
                 try:
-                    slot_open_ref = feed.get_slot_start_price(slot_start_time)
+                    slot_open_ref = await asyncio.to_thread(feed.get_slot_start_price, slot_start_time)
                     if slot_open_ref is not None:
                         has_cl = bool(
                             cl_stream.ready and (
@@ -959,7 +961,7 @@ def run_realtime(rounds: int = 100, paper: bool = True):
                 except Exception as e:
                     print(f"  failed to fetch slot start price: {e}")
             try:
-                price_before = feed.price()
+                price_before = await asyncio.to_thread(feed.price)
             except Exception:
                 price_before = slot_open_ref or 0.0
             if slot_open_ref is None:
@@ -985,7 +987,7 @@ def run_realtime(rounds: int = 100, paper: bool = True):
 
 
                 if slot_open_ref is None:
-                    if _late_skip("bad_samples", "no slot start price (strike) available", retry=True) == "retry":
+                    if await _late_skip("bad_samples", "no slot start price (strike) available", retry=True) == "retry":
                         continue
                     continue
 
@@ -999,7 +1001,7 @@ def run_realtime(rounds: int = 100, paper: bool = True):
                     side = "DOWN"
 
                 if not side:
-                    if _late_skip(
+                    if await _late_skip(
                         "thin_move",
                         f"strike gap {diff:+.1f} < min ${min_move:.1f}",
                         retry=True,
@@ -1011,21 +1013,21 @@ def run_realtime(rounds: int = 100, paper: bool = True):
                 try:
                     token_id = market["tokens"][side]
                     if hasattr(pub, "buy_quote"):
-                        q = pub.buy_quote(token_id)
+                        q = await asyncio.to_thread(pub.buy_quote, token_id)
                     else:
-                        mid = pub.midpoint(token_id)
+                        mid = await asyncio.to_thread(pub.midpoint, token_id)
                         q = {"price": mid, "mid": mid, "best_bid": None,
                              "best_ask": None, "spread": None, "ask_size": None}
                     mkt = float(q["price"])
                 except Exception as e:
-                    if _late_skip("quote_fail", f"failed to get quote for {side}: {e}", retry=True) == "retry":
+                    if await _late_skip("quote_fail", f"failed to get quote for {side}: {e}", retry=True) == "retry":
                         continue
                     continue
 
                 min_entry = float(getattr(config, "MIN_ENTRY_PRICE", 0.10))
                 max_entry = float(getattr(config, "MAX_ENTRY_PRICE", 0.95))
                 if mkt < min_entry or mkt > max_entry:
-                    if _late_skip(
+                    if await _late_skip(
                         "quote_range",
                         f"{side} ask {mkt:.3f} outside entry band [{min_entry:.2f}, {max_entry:.2f}]",
                         retry=True,
@@ -1059,7 +1061,7 @@ def run_realtime(rounds: int = 100, paper: bool = True):
 
                 if stake <= 0:
                     why = getattr(risk, "last_skip_reason", "") or "no stake"
-                    if _late_skip("no_edge", f"size skip ({why})", retry=True) == "retry":
+                    if await _late_skip("no_edge", f"size skip ({why})", retry=True) == "retry":
                         continue
                     continue
 
@@ -1079,7 +1081,7 @@ def run_realtime(rounds: int = 100, paper: bool = True):
                 # --- V2 IMPROVEMENT: Skip when Chainlink stream unavailable ---
                 require_cl = getattr(config, "LATE_SCALP_REQUIRE_CHAINLINK", True)
                 if require_cl and strike_src == "exchange-proxy":
-                    if _late_skip(
+                    if await _late_skip(
                         "proxy_strike",
                         f"no Chainlink tick for slot open — resolution risk "
                         f"too high (strike from {strike_src})",
@@ -1091,7 +1093,7 @@ def run_realtime(rounds: int = 100, paper: bool = True):
                 # --- V2 IMPROVEMENT: Minimum move threshold ---
                 min_move = float(getattr(config, "LATE_SCALP_MIN_MOVE_USD", 15.0) or 0)
                 if min_move > 0 and move_usd < min_move:
-                    if _late_skip(
+                    if await _late_skip(
                         "thin_move",
                         f"move ${move_usd:.1f} < min ${min_move:.1f} "
                         f"(too flat to call direction)",
@@ -1101,12 +1103,13 @@ def run_realtime(rounds: int = 100, paper: bool = True):
                     continue
 
                 every = bool(getattr(config, "LATE_SCALP_EVERY_SLOT", False))
-                picked = _pick_late_scalp_favorite(
+                picked = await asyncio.to_thread(
+                    _pick_late_scalp_favorite,
                     pub, market, always=every,
                     spot=price_before, strike=slot_open_ref,
                 )
                 if not picked:
-                    if _late_skip("quote_fail",
+                    if await _late_skip("quote_fail",
                                   "no clear favorite (lead/underdog gate)",
                                   retry=True) == "retry":
                         continue
@@ -1127,7 +1130,7 @@ def run_realtime(rounds: int = 100, paper: bool = True):
                         print(f"  [late_scalp] EVERY_SLOT clamp ask {old:.3f}->{mkt:.3f} "
                               f"(cap max {max_entry:.2f})")
                     else:
-                        if _late_skip(
+                        if await _late_skip(
                             "quote_range",
                             f"favorite {side} ask {mkt:.3f}{dog_txt} outside "
                             f"[{min_entry:.2f}, {max_entry:.2f}] "
@@ -1147,7 +1150,7 @@ def run_realtime(rounds: int = 100, paper: bool = True):
                 if require_align and slot_open_ref and price_before:
                     signed = float(price_before) - float(slot_open_ref)
                     if side == "UP" and signed < -eps:
-                        if _late_skip(
+                        if await _late_skip(
                             "thin_move",
                             f"spot vs strike DOWN (${signed:.1f}) but book favorite UP",
                             retry=True,
@@ -1155,7 +1158,7 @@ def run_realtime(rounds: int = 100, paper: bool = True):
                             continue
                         continue
                     if side == "DOWN" and signed > eps:
-                        if _late_skip(
+                        if await _late_skip(
                             "thin_move",
                             f"spot vs strike UP (+${signed:.1f}) but book favorite DOWN",
                             retry=True,
@@ -1177,13 +1180,14 @@ def run_realtime(rounds: int = 100, paper: bool = True):
                     rq_sleep = float(getattr(config, "LATE_SCALP_REQUOTE_SLEEP_S", 0.35)
                                      or 0.35)
                     if config.ROUND_SECONDS > 0 and rq_sleep > 0:
-                        time.sleep(min(rq_sleep, 1.0))
-                    picked2 = _pick_late_scalp_favorite(
+                        await asyncio.sleep(min(rq_sleep, 1.0))
+                    picked2 = await asyncio.to_thread(
+                        _pick_late_scalp_favorite,
                         pub, market, always=every,
                         spot=price_before, strike=slot_open_ref,
                     )
                     if not picked2:
-                        if _late_skip("quote_fail", "requote lost favorite",
+                        if await _late_skip("quote_fail", "requote lost favorite",
                                      retry=True) == "retry":
                             continue
                         continue
@@ -1193,7 +1197,7 @@ def run_realtime(rounds: int = 100, paper: bool = True):
                                      or 0.04)
                     keep_first = getattr(config, "LATE_SCALP_KEEP_FIRST_ASK", True)
                     if side2 != side:
-                        if _late_skip("quote_fail",
+                        if await _late_skip("quote_fail",
                                       f"requote side flip {side}->{side2}",
                                       retry=True) == "retry":
                             continue
@@ -1203,7 +1207,7 @@ def run_realtime(rounds: int = 100, paper: bool = True):
                             print(f"  [late_scalp] requote spiked {mkt:.3f}->{mkt2:.3f}; "
                                   f"keeping limit @ {mkt:.3f} (better profit)")
                         else:
-                            if _late_skip(
+                            if await _late_skip(
                                 "wide_spread",
                                 f"requote ask jump {mkt:.3f}->{mkt2:.3f} "
                                 f"> {max_jump:.3f}",
@@ -1224,7 +1228,7 @@ def run_realtime(rounds: int = 100, paper: bool = True):
                         if every:
                             mkt = min(max_entry, max(min_entry, mkt))
                         else:
-                            if _late_skip(
+                            if await _late_skip(
                                 "quote_range",
                                 f"after requote ask {mkt:.3f} outside band",
                                 retry=True,
@@ -1234,7 +1238,7 @@ def run_realtime(rounds: int = 100, paper: bool = True):
 
                 # Skip ultra-rich favorites when we want earlier/cheaper edge
                 if (not every) and mkt > prefer_max + 1e-9:
-                    if _late_skip(
+                    if await _late_skip(
                         "quote_range",
                         f"ask {mkt:.3f} > prefer_max {prefer_max:.2f} "
                         f"(wait for ~0.90-0.95 for better profit)",
@@ -1248,14 +1252,14 @@ def run_realtime(rounds: int = 100, paper: bool = True):
                 # V2: always enforce spread filter (was skipped in EVERY_SLOT).
                 if (max_spread > 0 and q.get("spread") is not None
                         and q["spread"] > max_spread):
-                    if _late_skip("wide_spread",
+                    if await _late_skip("wide_spread",
                                   f"spread {q['spread']:.3f} too wide",
                                   retry=False) == "retry":
                         continue
                     continue
                 min_ask_sz = getattr(config, "MIN_ASK_SIZE", 0) or 0
                 if min_ask_sz > 0 and ask_sz is not None and ask_sz < min_ask_sz:
-                    if _late_skip("thin_book",
+                    if await _late_skip("thin_book",
                                   f"ask size {ask_sz:.2f} < {min_ask_sz:.2f}",
                                   retry=False) == "retry":
                         continue
@@ -1284,7 +1288,7 @@ def run_realtime(rounds: int = 100, paper: bool = True):
                 print(f"  [late_scalp] model={model_side_prob:.3f} vs ask={mkt:.3f} "
                       f"edge={edge:.3f} (Z={fv.z_score:.2f}, sigma=${fv.sigma_usd:.1f})")
                 if min_edge > 0 and edge < min_edge:
-                    if _late_skip(
+                    if await _late_skip(
                         "no_edge",
                         f"edge {edge:.3f} < min {min_edge:.3f} "
                         f"(model={model_side_prob:.3f} vs ask={mkt:.3f})",
@@ -1322,7 +1326,7 @@ def run_realtime(rounds: int = 100, paper: bool = True):
                     skips["no_edge"] += 1
                     if hybrid and pending_late_end_ts == end_ts:
                         pending_late_end_ts = None
-                    _sleep_until_slot_end(end_ts, cl_stream)
+                    await _sleep_until_slot_end(end_ts, cl_stream)
                     continue
                 pending_late_end_ts = None
                 token_id = market["tokens"][side]
@@ -1351,10 +1355,10 @@ def run_realtime(rounds: int = 100, paper: bool = True):
                 mid_pause_slots -= 1
                 write_status(phase="waiting", message="mid pause after loss",
                              strategy="mid")
-                _sleep_until_slot_end(end_ts, cl_stream)
+                await _sleep_until_slot_end(end_ts, cl_stream)
                 continue
 
-            prices = _warmup_prices(feed, remaining)
+            prices = await _warmup_prices(feed, remaining)
             if len(prices) < 3:
                 print("  not enough price samples; retrying in 5s")
                 skips["bad_samples"] += 1
@@ -1364,10 +1368,10 @@ def run_realtime(rounds: int = 100, paper: bool = True):
                     print("  [hybrid] mid samples weak; will try late_scalp later")
                     rem_now = (end_ts - _now(cl_stream)) if end_ts else None
                     if rem_now is not None and rem_now > late_max and config.ROUND_SECONDS > 0:
-                        time.sleep(min(rem_now - late_max,
+                        await asyncio.sleep(min(rem_now - late_max,
                                        max(1.0, rem_now - late_max - 1.5)))
                     continue
-                _backoff(5)
+                await _backoff(5)
                 continue
 
             # Strike = BTC price at beginning of the range (Polymarket rules).
@@ -1376,7 +1380,7 @@ def run_realtime(rounds: int = 100, paper: bool = True):
             strike_src = "unknown"
             if slot_start_time:
                 try:
-                    slot_open_ref = feed.get_slot_start_price(slot_start_time)
+                    slot_open_ref = await asyncio.to_thread(feed.get_slot_start_price, slot_start_time)
                     if slot_open_ref is not None:
                         has_cl = bool(
                             cl_stream.ready and (
@@ -1407,7 +1411,7 @@ def run_realtime(rounds: int = 100, paper: bool = True):
             price_before = prices[-1] if prices else None
             journal_extra: dict = {}
 
-            def _mid_no_trade(
+            async def _mid_no_trade(
                 skip_key: str,
                 msg: str,
                 extra: dict | None = None,
@@ -1451,7 +1455,7 @@ def run_realtime(rounds: int = 100, paper: bool = True):
                     rem_now = (end_ts - _now(cl_stream)) if end_ts else None
                     # Sleep almost to late window so pin+discovery can't drift
                     if rem_now is not None and rem_now > late_max and config.ROUND_SECONDS > 0:
-                        time.sleep(min(rem_now - late_max, max(1.0, rem_now - late_max - 1.5)))
+                        await asyncio.sleep(min(rem_now - late_max, max(1.0, rem_now - late_max - 1.5)))
                     return "hybrid_late"
                 # Pure mid: recheck often until ~40s left (old logic stopped at
                 # mid_min_slot+12 and only got 1-2 peeks per slot).
@@ -1463,10 +1467,10 @@ def run_realtime(rounds: int = 100, paper: bool = True):
                     wait = min(12.0, max(6.0, rem_now - recheck_floor - 5))
                     print(f"  [mid] soft skip ({msg}); recheck in {wait:.0f}s "
                           f"({rem_now:.0f}s left)")
-                    time.sleep(wait)
+                    await asyncio.sleep(wait)
                     return "retry"
                 print(f"  [mid] slot done ({msg})")
-                _sleep_until_slot_end(end_ts, cl_stream)
+                await _sleep_until_slot_end(end_ts, cl_stream)
                 return "done"
 
             # Mid signal is strike-relative; exchange-proxy strike produced
@@ -1476,7 +1480,7 @@ def run_realtime(rounds: int = 100, paper: bool = True):
                 print(f"  mid blocked: strike source [{strike_src}] "
                       f"(need chainlink-data-stream)")
                 # Hard skip: no amount of waiting fixes a missing open tick mid-slot
-                _mid_no_trade("proxy_strike", f"strike={strike_src}", hard=True)
+                await _mid_no_trade("proxy_strike", f"strike={strike_src}", hard=True)
                 continue
 
             remaining_secs = (end_ts - _now(cl_stream)) if end_ts else None
@@ -1489,7 +1493,7 @@ def run_realtime(rounds: int = 100, paper: bool = True):
                     spacing = max(0.5, allowed / (n - 1)) if allowed > 0 else 0.5
 
             try:
-                oracle_now = feed.price()
+                oracle_now = await asyncio.to_thread(feed.price)
                 if oracle_now and oracle_now > 0:
                     price_before = oracle_now
                     prices = prices[:-1] + [oracle_now]
@@ -1497,7 +1501,7 @@ def run_realtime(rounds: int = 100, paper: bool = True):
                 pass
 
             # Tier 2: both-side arb scan (log only — capital-light research path)
-            arb = _scan_sum_to_one_arb(pub, market)
+            arb = await asyncio.to_thread(_scan_sum_to_one_arb, pub, market)
             if arb:
                 print(f"  [arb] sum-to-one edge={arb['edge']:+.3f} "
                       f"UP@{arb['ask_up']:.3f}+DOWN@{arb['ask_down']:.3f}="
@@ -1528,7 +1532,7 @@ def run_realtime(rounds: int = 100, paper: bool = True):
             max_chop = int(getattr(config, "MID_MAX_CHOP_CROSSES", 3) or 0)
             if max_chop > 0 and chop_n > max_chop:
                 print(f"  chop filter: {chop_n} strike crosses > {max_chop}; skip")
-                if _mid_no_trade("thin_move", f"chop crosses={chop_n}") == "hybrid_late":
+                if await _mid_no_trade("thin_move", f"chop crosses={chop_n}") == "hybrid_late":
                     continue
                 continue
 
@@ -1568,7 +1572,7 @@ def run_realtime(rounds: int = 100, paper: bool = True):
                 print(f"  move ${move_usd:.2f} < min ${eff_min_move:.2f} "
                       f"(Z={fv.z_score:+.2f} sigma=${fv.sigma_usd:.0f} "
                       f"cap=${noise_cap:.0f}); skip")
-                if _mid_no_trade("thin_move", "move too small vs noise") == "hybrid_late":
+                if await _mid_no_trade("thin_move", "move too small vs noise") == "hybrid_late":
                     continue
                 continue
             # Significant Z is advisory only when REQUIRE is off (default paper).
@@ -1577,7 +1581,7 @@ def run_realtime(rounds: int = 100, paper: bool = True):
                     and not fv.significant):
                 print(f"  fair-value not significant |Z|={abs(fv.z_score):.2f} "
                       f"< {z_min:.2f}; skip")
-                if _mid_no_trade("thin_move", f"|Z|={abs(fv.z_score):.2f}") == "hybrid_late":
+                if await _mid_no_trade("thin_move", f"|Z|={abs(fv.z_score):.2f}") == "hybrid_late":
                     continue
                 continue
 
@@ -1595,22 +1599,22 @@ def run_realtime(rounds: int = 100, paper: bool = True):
             token_id = market["tokens"][sig.side]
             try:
                 if hasattr(pub, "buy_quote"):
-                    q = pub.buy_quote(token_id)
+                    q = await asyncio.to_thread(pub.buy_quote, token_id)
                 else:
-                    mid = pub.midpoint(token_id)
+                    mid = await asyncio.to_thread(pub.midpoint, token_id)
                     q = {"price": mid, "mid": mid, "best_bid": None,
                          "best_ask": None, "spread": None, "ask_size": None}
                 mkt = q["price"]
             except Exception as e:
                 print(f"  quote fetch failed ({e}); skipping slot")
-                if _mid_no_trade("quote_fail", "quote fetch failed") == "hybrid_late":
+                if await _mid_no_trade("quote_fail", "quote fetch failed") == "hybrid_late":
                     continue
                 continue
             if not (config.MIN_QUOTE <= mkt <= config.MAX_QUOTE):
                 print(f"  quote {mkt:.4f} outside tradeable range "
                       f"[{config.MIN_QUOTE:.2f}, {config.MAX_QUOTE:.2f}] "
                       "(empty/illiquid book); skipping slot")
-                if _mid_no_trade("quote_range", f"quote {mkt:.3f} out of range") == "hybrid_late":
+                if await _mid_no_trade("quote_range", f"quote {mkt:.3f} out of range") == "hybrid_late":
                     continue
                 continue
             min_entry = getattr(config, "MIN_ENTRY_PRICE", 0.0) or 0.0
@@ -1618,13 +1622,13 @@ def run_realtime(rounds: int = 100, paper: bool = True):
             if mkt < min_entry or mkt > max_entry:
                 print(f"  ask {mkt:.3f} outside entry band "
                       f"[{min_entry:.2f}, {max_entry:.2f}]; skip (avoid bad payoff odds)")
-                if _mid_no_trade("quote_range", f"ask {mkt:.3f} outside entry band") == "hybrid_late":
+                if await _mid_no_trade("quote_range", f"ask {mkt:.3f} outside entry band") == "hybrid_late":
                     continue
                 continue
             max_spread = getattr(config, "MAX_SPREAD", 0) or 0
             if max_spread > 0 and q.get("spread") is not None and q["spread"] > max_spread:
                 print(f"  spread {q['spread']:.3f} > MAX_SPREAD {max_spread:.3f}; skipping")
-                if _mid_no_trade("wide_spread", f"spread {q['spread']:.3f} too wide") == "hybrid_late":
+                if await _mid_no_trade("wide_spread", f"spread {q['spread']:.3f} too wide") == "hybrid_late":
                     continue
                 continue
             min_ask_sz = getattr(config, "MIN_ASK_SIZE", 0) or 0
@@ -1634,7 +1638,7 @@ def run_realtime(rounds: int = 100, paper: bool = True):
             journal_extra["spread"] = q.get("spread")
             if min_ask_sz > 0 and ask_sz is not None and ask_sz < min_ask_sz:
                 print(f"  ask size {ask_sz:.2f} < MIN_ASK_SIZE {min_ask_sz:.2f}; thin book")
-                if _mid_no_trade("thin_book", "thin ask") == "hybrid_late":
+                if await _mid_no_trade("thin_book", "thin ask") == "hybrid_late":
                     continue
                 continue
             # Tier 2: book imbalance — if bid is tiny vs ask, toxic lift risk
@@ -1643,7 +1647,7 @@ def run_realtime(rounds: int = 100, paper: bool = True):
                     and ask_sz > 0 and float(bid_sz) / float(ask_sz) < min_ba):
                 print(f"  thin bid/ask ratio {float(bid_sz)/float(ask_sz):.2f} "
                       f"< {min_ba:.2f}; skip")
-                if _mid_no_trade("thin_book", "bid/ask imbalance") == "hybrid_late":
+                if await _mid_no_trade("thin_book", "bid/ask imbalance") == "hybrid_late":
                     continue
                 continue
 
@@ -1660,14 +1664,14 @@ def run_realtime(rounds: int = 100, paper: bool = True):
             mid_lo = float(getattr(config, "MID_MIN_MODEL", 0.60) or 0.0)
             mid_hi = float(getattr(config, "MID_MAX_MODEL", 0.88) or 1.0)
             if mid_lo > 0 and model_side_prob < mid_lo:
-                if _mid_no_trade(
+                if await _mid_no_trade(
                     "no_edge",
                     f"model {model_side_prob:.2f} < MID_MIN_MODEL {mid_lo:.2f}",
                 ) == "hybrid_late":
                     continue
                 continue
             if mid_hi < 1.0 and model_side_prob > mid_hi:
-                if _mid_no_trade(
+                if await _mid_no_trade(
                     "no_edge",
                     f"model {model_side_prob:.2f} > MID_MAX_MODEL {mid_hi:.2f} "
                     f"(overconfident)",
@@ -1678,7 +1682,7 @@ def run_realtime(rounds: int = 100, paper: bool = True):
             cheap_ask = float(getattr(config, "MID_CHEAP_ASK", 0.38) or 0.0)
             cheap_max_model = float(getattr(config, "MID_CHEAP_MAX_MODEL", 0.82) or 1.0)
             if cheap_ask > 0 and mkt < cheap_ask and model_side_prob > cheap_max_model:
-                if _mid_no_trade(
+                if await _mid_no_trade(
                     "no_edge",
                     f"cheap overconf ask {mkt:.2f} model {model_side_prob:.2f}",
                 ) == "hybrid_late":
@@ -1689,23 +1693,23 @@ def run_realtime(rounds: int = 100, paper: bool = True):
             if getattr(config, "MID_REQUOTE", True):
                 rq_sleep = float(getattr(config, "MID_REQUOTE_SLEEP_S", 0.40) or 0.0)
                 if config.ROUND_SECONDS > 0 and rq_sleep > 0:
-                    time.sleep(min(rq_sleep, 1.0))
+                    await asyncio.sleep(min(rq_sleep, 1.0))
                 try:
                     if hasattr(pub, "buy_quote"):
-                        q2 = pub.buy_quote(token_id)
+                        q2 = await asyncio.to_thread(pub.buy_quote, token_id)
                     else:
                         q2 = q
                     mkt2 = float(q2["price"])
                     max_jump = float(getattr(config, "MID_MAX_ASK_JUMP", 0.02) or 0.02)
                     if mkt2 > mkt + max_jump:
-                        if _mid_no_trade(
+                        if await _mid_no_trade(
                             "wide_spread",
                             f"requote ask jumped {mkt:.3f}->{mkt2:.3f}",
                         ) == "hybrid_late":
                             continue
                         continue
                     if mkt2 < min_entry or mkt2 > max_entry:
-                        if _mid_no_trade(
+                        if await _mid_no_trade(
                             "quote_range",
                             f"requote ask {mkt2:.3f} outside band",
                         ) == "hybrid_late":
@@ -1717,7 +1721,7 @@ def run_realtime(rounds: int = 100, paper: bool = True):
                         q = q2
                         ask_sz = q2.get("ask_size")
                 except Exception as e:
-                    if _mid_no_trade("quote_fail", f"requote failed ({e})") == "hybrid_late":
+                    if await _mid_no_trade("quote_fail", f"requote failed ({e})") == "hybrid_late":
                         continue
                     continue
 
@@ -1745,7 +1749,7 @@ def run_realtime(rounds: int = 100, paper: bool = True):
             if stake <= 0:
                 why = getattr(risk, "last_skip_reason", "") or "no qualifying edge"
                 print(f"  size skip ({why}) -> skip this slot")
-                if _mid_no_trade("no_edge", why, {
+                if await _mid_no_trade("no_edge", why, {
                     "side": sig.side, "model_prob": model_side_prob,
                     "fair_prob": fair_side_prob, "ask": mkt, "edge": edge,
                 }) == "hybrid_late":
@@ -1763,7 +1767,7 @@ def run_realtime(rounds: int = 100, paper: bool = True):
                 if not ok_mid:
                     print(f"  [hybrid] mid not exceptional ({mid_why}); "
                           f"prefer late_scalp")
-                    if _mid_no_trade("no_edge", f"prefer late: {mid_why}") == "hybrid_late":
+                    if await _mid_no_trade("no_edge", f"prefer late: {mid_why}") == "hybrid_late":
                         continue
                     continue
                 print(f"  [hybrid] exceptional mid OK ({mid_why}) - taking mid")
@@ -1777,7 +1781,7 @@ def run_realtime(rounds: int = 100, paper: bool = True):
             if stake < 0.5:
                 print("  sized below dust after depth cap; skip")
                 skips["thin_book"] += 1
-                _sleep_until_slot_end(end_ts, cl_stream)
+                await _sleep_until_slot_end(end_ts, cl_stream)
                 continue
 
         # Tier 1: pessimistic paper fills — pay ask + slippage (not optimistic mid)
@@ -1871,7 +1875,7 @@ def run_realtime(rounds: int = 100, paper: bool = True):
             try:
                 # Re-check quote right before order (latency / adverse selection).
                 try:
-                    q2 = pub.buy_quote(token_id)
+                    q2 = await asyncio.to_thread(pub.buy_quote, token_id)
                     if q2["price"] > mkt + 0.02:
                         raise RuntimeError(
                             f"ask moved {mkt:.3f} -> {q2['price']:.3f} before order")
@@ -1884,7 +1888,7 @@ def run_realtime(rounds: int = 100, paper: bool = True):
                     raise
                 except Exception:
                     pass
-                resp = live_client.buy(token_id, float(mkt),
+                resp = await asyncio.to_thread(live_client.buy, token_id, float(mkt),
                                        shares, market["conditionId"])
                 print(f"  ORDER PLACED: {resp}")
                 if isinstance(resp, dict):
@@ -1894,7 +1898,7 @@ def run_realtime(rounds: int = 100, paper: bool = True):
                 print(f"  order failed: {e}")
                 skips["order_fail"] += 1
                 risk.on_close(stake, 0.0)
-                _sleep_until_slot_end(end_ts, cl_stream)
+                await _sleep_until_slot_end(end_ts, cl_stream)
                 continue
 
         # Hold until this slot actually resolves.
@@ -1905,14 +1909,14 @@ def run_realtime(rounds: int = 100, paper: bool = True):
                      question=question, slug=trade.slug,
                      message=f"holding {sig.side} @ {mkt:.2f}")
         if hold and hold > 0:
-            time.sleep(hold)
+            await asyncio.sleep(hold)
 
         # Live: cancel any resting leftovers so they don't fill next slot.
         if not paper and live_client is not None:
             try:
                 if order_id:
-                    live_client.cancel_order(str(order_id))
-                live_client.cancel_all()
+                    await asyncio.to_thread(live_client.cancel_order, str(order_id))
+                await asyncio.to_thread(live_client.cancel_all)
             except Exception as e:
                 print(f"  cancel cleanup: {e}")
 
@@ -1924,12 +1928,12 @@ def run_realtime(rounds: int = 100, paper: bool = True):
         price_after = None
         if slot_start_time:
             try:
-                price_after = feed.get_slot_close_price(slot_start_time)
+                price_after = await asyncio.to_thread(feed.get_slot_close_price, slot_start_time)
             except Exception as e:
                 print(f"  failed to fetch slot close price: {e}")
         if price_after is None:
             try:
-                price_after = feed.price()
+                price_after = await asyncio.to_thread(feed.price)
             except Exception:
                 price_after = price_before
         local_up = price_after >= slot_open_ref
@@ -1939,18 +1943,18 @@ def run_realtime(rounds: int = 100, paper: bool = True):
         # Proxy strike / late on-chain settlement: poll longer (~3 min).
         # Healthy-book wait on the *next* slot still leaves room for this.
         proxy_strike = strike_src in ("exchange-proxy", "warmup-fallback")
-        poll_attempts = 90 if proxy_strike else 60  # 270s or 180s @ 3s
+        poll_attempts = 90
         if slug:
             write_status(phase="resolving", message="waiting for Polymarket outcome",
                          end_ts=end_ts, question=question, side=sig.side)
             # Brief grace — Gamma often lags end_ts by 10–30s+
             if config.ROUND_SECONDS > 0:
-                time.sleep(12.0)
+                await asyncio.sleep(12.0)
             print(f"  [resolve] polling official outcome up to "
                   f"~{poll_attempts * 3}s (strike={strike_src})...")
             for attempt in range(poll_attempts):
                 try:
-                    official = pub.get_official_btc_updown_outcome(slug)
+                    official = await asyncio.to_thread(pub.get_official_btc_updown_outcome, slug)
                 except Exception as e:
                     if attempt == 0:
                         print(f"  [resolve] official lookup error: {e}")
@@ -1962,7 +1966,7 @@ def run_realtime(rounds: int = 100, paper: bool = True):
                 if attempt > 0 and attempt % 10 == 0:
                     print(f"  [resolve] still waiting for Gamma "
                           f"({attempt * 3}s)...")
-                time.sleep(3.0)
+                await asyncio.sleep(3.0)
 
         if official in ("UP", "DOWN"):
             resolved_up = official == "UP"
@@ -2022,7 +2026,7 @@ def run_realtime(rounds: int = 100, paper: bool = True):
             print("  note: live wallet PnL is on Polymarket; local bankroll is estimate")
             if live_client is not None:
                 try:
-                    bal = live_client.get_usdc_balance(refresh=True)
+                    bal = await asyncio.to_thread(live_client.get_usdc_balance, refresh=True)
                     if bal.get("ok") and bal.get("balance_usd") is not None:
                         wallet_usd = bal["balance_usd"]
                         print(f"  Polymarket wallet USDC now: ${wallet_usd:,.2f}")
@@ -2105,7 +2109,7 @@ if __name__ == "__main__":
     if args.mode == "paper":
         run_sim(rounds=args.rounds or 200, sleep_between=args.sleep, seed=args.seed)
     elif args.mode == "paper_live":
-        run_realtime(rounds=args.rounds or 100, paper=True)
+        asyncio.run(run_realtime(rounds=args.rounds or 100, paper=True))
     elif args.mode == "live":
         # Default to very few live rounds; override with --rounds if needed.
-        run_realtime(rounds=args.rounds or 5, paper=False)
+        asyncio.run(run_realtime(rounds=args.rounds or 5, paper=False))
