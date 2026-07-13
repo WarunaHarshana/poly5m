@@ -49,6 +49,8 @@ class RiskManager:
         return True
 
     def consecutive_loss_ok(self) -> bool:
+        if getattr(config, "MODE", "paper") != "live":
+            return True
         cap = getattr(config, "MAX_CONSECUTIVE_LOSSES", 0) or 0
         if cap > 0 and self.consecutive_losses >= cap:
             self.halted = True
