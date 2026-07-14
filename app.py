@@ -50,12 +50,15 @@ _ENV_KEYS = (
 # Each field: key, label, type (float|int|bool|str), default, group, hint
 STRATEGY_FIELDS = [
     # --- Strategy / mode-ish ---
+    {"key": "ASSET", "label": "Default asset", "type": "str",
+     "default": "btc", "group": "general",
+     "hint": "btc | eth | sol (Start menu can override)"},
     {"key": "STRATEGY", "label": "Default strategy", "type": "str",
      "default": "mid", "group": "general",
      "hint": "mid | late_scalp | late_every | late_momentum | hybrid (Start menu can override)"},
     # --- Late momentum strategy ---
     {"key": "LATE_MOMENTUM_MIN_MOVE", "label": "Momentum min move $", "type": "float",
-     "default": "10.0", "group": "late_momentum", "hint": "Min price gap vs strike (price to beat) when timer hits"},
+     "default": "15.0", "group": "late_momentum", "hint": "Min price gap vs strike (price to beat) when timer hits"},
     {"key": "LATE_MOMENTUM_TIME_LIMIT", "label": "Momentum max seconds left", "type": "int",
      "default": "40", "group": "late_momentum", "hint": "Start checking when seconds left is under this"},
     {"key": "LATE_MOMENTUM_MIN_REMAINING", "label": "Momentum min seconds left", "type": "int",
@@ -70,9 +73,9 @@ STRATEGY_FIELDS = [
      "default": "0.60", "group": "late",
      "hint": "Skip softer favorites (0.57 loss) — try 0.60+"},
     {"key": "LATE_SCALP_MAX_ENTRY", "label": "Late max entry (hard cap)", "type": "float",
-     "default": "0.99", "group": "late", "hint": "Hard max ask allowed"},
+     "default": "0.90", "group": "late", "hint": "Hard max ask allowed"},
     {"key": "LATE_SCALP_PREFER_MAX", "label": "Late prefer max (sweet spot)", "type": "float",
-     "default": "0.99", "group": "late",
+     "default": "0.90", "group": "late",
      "hint": "Ignored when Trade every 5m slot is ON"},
     {"key": "LATE_SCALP_MIN_REMAINING", "label": "Late min seconds left", "type": "int",
      "default": "8", "group": "late", "hint": "Stop trading below this many seconds"},
@@ -101,7 +104,7 @@ STRATEGY_FIELDS = [
     {"key": "LATE_SCALP_REQUIRE_CHAINLINK", "label": "Late require Chainlink", "type": "bool",
      "default": "1", "group": "late", "hint": "Refuse trading on exchange-proxy strikes"},
     {"key": "LATE_SCALP_MIN_EDGE", "label": "Late min edge", "type": "float",
-     "default": "0.02", "group": "late", "hint": "Min model probability edge over ask"},
+     "default": "-0.05", "group": "late", "hint": "Min model probability edge over ask"},
     {"key": "LATE_SCALP_USE_EDGE_SIZING", "label": "Late use edge sizing", "type": "bool",
      "default": "1", "group": "late", "hint": "Scale stake dynamically by model edge (Kelly)"},
     # --- Mid ---
@@ -243,6 +246,10 @@ def _save_settings(body: dict) -> dict:
             except ValueError:
                 errors.append(f"{k}: need number")
                 continue
+        elif k == "ASSET":
+            s = s.lower()
+            if s not in ("btc", "eth", "sol"):
+                errors.append("ASSET must be btc, eth, or sol")
         elif k == "STRATEGY":
             s = s.lower()
             if s not in ("mid", "late_scalp", "late_every", "hybrid", "late_momentum"):
@@ -688,14 +695,21 @@ def _start(opts: dict) -> dict:
         strategy = str(opts.get("strategy") or "mid").strip().lower()
         if strategy not in ("mid", "late_scalp", "late_every", "hybrid", "late_momentum"):
             strategy = "mid"
-        # Persist menu choice + every-slot flag for next load
+        asset = str(opts.get("asset") or "btc").strip().lower()
+        if asset not in ("btc", "eth", "sol"):
+            asset = "btc"
+        cmd += ["--asset", asset]
+        
+        # Persist menu choice + every-slot flag + asset choice for next load
         try:
+            updates = {"ASSET": asset}
             if strategy == "late_every":
-                _upsert_env({"STRATEGY": "late_every", "LATE_SCALP_EVERY_SLOT": "1"})
+                updates.update({"STRATEGY": "late_every", "LATE_SCALP_EVERY_SLOT": "1"})
             elif strategy == "late_scalp":
-                _upsert_env({"STRATEGY": "late_scalp", "LATE_SCALP_EVERY_SLOT": "0"})
+                updates.update({"STRATEGY": "late_scalp", "LATE_SCALP_EVERY_SLOT": "0"})
             else:
-                _upsert_env({"STRATEGY": strategy})
+                updates.update({"STRATEGY": strategy})
+            _upsert_env(updates)
         except Exception:
             pass
         cmd += ["--strategy", strategy]
@@ -1386,6 +1400,14 @@ body.trade-flash-lose { animation: page-flash-down 1.6s ease-out; }
           <option value="paper_live">paper_live · real data, fake fills</option>
           <option value="paper">paper · offline sim</option>
           <option value="live" class="mode-live-opt">live · REAL MONEY</option>
+        </select>
+      </div>
+      <div class="ctl-field">
+        <span class="ctl-label">Asset</span>
+        <select id="c-asset" class="ctl-select">
+          <option value="btc">BTC · Bitcoin</option>
+          <option value="eth">ETH · Ethereum</option>
+          <option value="sol">SOL · Solana</option>
         </select>
       </div>
       <div class="ctl-field">
@@ -2174,6 +2196,7 @@ document.getElementById('c-start').onclick = async () => {
   const mode = document.getElementById('c-mode').value;
   const body = {
     mode,
+    asset:    document.getElementById('c-asset').value,
     strategy: document.getElementById('c-strategy').value,
     bankroll: document.getElementById('c-bankroll').value,
     bet:      document.getElementById('c-bet').value,
@@ -2473,6 +2496,13 @@ function renderSettings(data) {
   if (cStrat && [...cStrat.options].some(o => o.value === strat)) {
     cStrat.value = strat;
   }
+  // Sync Start panel asset menu
+  const assetField = (data.fields || []).find(f => f.key === 'ASSET');
+  let asset = assetField ? String(assetField.value || 'btc').toLowerCase() : 'btc';
+  const cAsset = document.getElementById('c-asset');
+  if (cAsset && [...cAsset.options].some(o => o.value === asset)) {
+    cAsset.value = asset;
+  }
   updateTabsVisibility(strat);
 }
 
@@ -2518,6 +2548,10 @@ async function saveSettings(partial) {
     // Sync strategy dropdown if present
     if (settings.STRATEGY && document.getElementById('c-strategy')) {
       document.getElementById('c-strategy').value = settings.STRATEGY;
+    }
+    // Sync asset dropdown if present
+    if (settings.ASSET && document.getElementById('c-asset')) {
+      document.getElementById('c-asset').value = settings.ASSET.toLowerCase();
     }
     return true;
   } catch (e) {
