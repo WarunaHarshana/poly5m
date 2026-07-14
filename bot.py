@@ -437,15 +437,34 @@ async def _backoff(seconds):
     await asyncio.sleep(seconds)
 
 
+_last_contract_prices = {}
+
+def validate_and_record_quote(token_id: str, q: dict) -> dict:
+    if not q or "price" not in q:
+        return q
+    mkt = float(q["price"])
+    global _last_contract_prices
+    if token_id in _last_contract_prices:
+        prev_mkt = _last_contract_prices[token_id]
+        delta = abs(mkt - prev_mkt)
+        if delta > 0.15:
+            print(f"  [safety] WARNING: Rejected anomalous contract price jump: "
+                  f"{prev_mkt:.3f} -> {mkt:.3f} (delta={delta:.3f})")
+            raise ValueError(f"Anomalous contract price jump: {prev_mkt:.3f} -> {mkt:.3f}")
+    _last_contract_prices[token_id] = mkt
+    return q
+
 def _quote_side(pub, market, side: str) -> dict | None:
     """Best-ask buy quote for UP or DOWN, or None on failure."""
     try:
         token_id = market["tokens"][side]
         if hasattr(pub, "buy_quote"):
-            return pub.buy_quote(token_id)
-        mid = pub.midpoint(token_id)
-        return {"price": mid, "mid": mid, "best_bid": None,
-                "best_ask": None, "spread": None, "ask_size": None}
+            q = pub.buy_quote(token_id)
+        else:
+            mid = pub.midpoint(token_id)
+            q = {"price": mid, "mid": mid, "best_bid": None,
+                 "best_ask": None, "spread": None, "ask_size": None}
+        return validate_and_record_quote(token_id, q)
     except Exception:
         return None
 
@@ -558,9 +577,9 @@ async def run_realtime(rounds: int = 100, paper: bool = True):
     """
     from polymarket_client import PolymarketPublic
     pub = PolymarketPublic()
-    cl_stream = ChainlinkDataStream()
+    cl_stream = ChainlinkDataStream(asset=config.ASSET)
     cl_stream.start()
-    feed = LivePriceFeed(sources=list(config.BTC_PRICE_SOURCES),
+    feed = LivePriceFeed(asset=config.ASSET, sources=list(config.BTC_PRICE_SOURCES),
                          chainlink_stream=cl_stream)
     risk = RiskManager(config.STARTING_BANKROLL)
     executor = PaperExecutor()
@@ -787,29 +806,46 @@ async def run_realtime(rounds: int = 100, paper: bool = True):
         # When hybrid queued late_scalp for a slot, PIN that end_ts so discovery
         # cannot skip to the next market before the late window (8–35s).
         now_clk = _now(cl_stream)
-        try:
-            if hybrid and pending_late_end_ts is not None:
-                pin_start = int(pending_late_end_ts) - int(config.SLOT_SECONDS)
-                market = await asyncio.to_thread(pub.find_btc_5min_market_at, pin_start, now=now_clk)
-                if market is None:
-                    # Pinned slot ended or unfetchable — clear and rediscover.
-                    print(f"  [hybrid] pinned late slot end={int(pending_late_end_ts)} "
-                          f"gone; clearing late queue")
-                    pending_late_end_ts = None
+        market = None
+        lookup_err = None
+        
+        # Tight retry loop (poll every 1s, up to 6 attempts) to handle market creation lag (Lesson 7)
+        for attempt in range(6):
+            try:
+                if hybrid and pending_late_end_ts is not None:
+                    pin_start = int(pending_late_end_ts) - int(config.SLOT_SECONDS)
+                    market = await asyncio.to_thread(pub.find_btc_5min_market_at, pin_start, now=now_clk)
+                    if market is None:
+                        # Pinned slot ended or unfetchable — clear and rediscover.
+                        print(f"  [hybrid] pinned late slot end={int(pending_late_end_ts)} "
+                              f"gone; clearing late queue")
+                        pending_late_end_ts = None
+                        market = await asyncio.to_thread(pub.find_btc_5min_market, now=now_clk)
+                else:
                     market = await asyncio.to_thread(pub.find_btc_5min_market, now=now_clk)
-            else:
-                market = await asyncio.to_thread(pub.find_btc_5min_market, now=now_clk)
-            lookup_fails = 0
-        except Exception as e:
+                
+                if market is not None:
+                    break
+            except Exception as e:
+                lookup_err = e
+                if attempt < 5:
+                    print(f"  [market lookup] Not found yet (attempt {attempt+1}/6); retrying in 1s...")
+                    await asyncio.sleep(1.0)
+                    now_clk = _now(cl_stream)
+        
+        if market is None:
             lookup_fails += 1
-            print(f"[market lookup failed] {e}; retrying in 15s")
-            write_status(phase="searching", message=str(e))
+            err_msg = lookup_err or "Market not found"
+            print(f"[market lookup failed] {err_msg}; retrying in 15s")
+            write_status(phase="searching", message=str(err_msg))
             if lookup_fails >= 20:
                 print("[giving up] market not found after 20 tries. Run discover.py.")
                 write_status(phase="error", message="market not found after 20 tries")
                 break
             await _backoff(15)
             continue
+            
+        lookup_fails = 0
 
         question = market.get("question") or "BTC 5-minute Up/Down"
         end_ts = market.get("end_ts")
@@ -1016,12 +1052,9 @@ async def run_realtime(rounds: int = 100, paper: bool = True):
                 # Fetch quote for decided side
                 try:
                     token_id = market["tokens"][side]
-                    if hasattr(pub, "buy_quote"):
-                        q = await asyncio.to_thread(pub.buy_quote, token_id)
-                    else:
-                        mid = await asyncio.to_thread(pub.midpoint, token_id)
-                        q = {"price": mid, "mid": mid, "best_bid": None,
-                             "best_ask": None, "spread": None, "ask_size": None}
+                    q = await asyncio.to_thread(_quote_side, pub, market, side)
+                    if not q:
+                        raise ValueError("Failed to get quote")
                     mkt = float(q["price"])
                 except Exception as e:
                     if await _late_skip("quote_fail", f"failed to get quote for {side}: {e}", retry=True) == "retry":
@@ -1049,6 +1082,17 @@ async def run_realtime(rounds: int = 100, paper: bool = True):
                 )
                 model_side_prob = fv.fair_prob_up if side == "UP" else (1.0 - fv.fair_prob_up)
                 edge = model_side_prob - mkt
+
+                min_edge = float(getattr(config, "LATE_SCALP_MIN_EDGE", 0.02) or 0)
+                if edge < min_edge:
+                    if await _late_skip(
+                        "no_edge",
+                        f"edge {edge:.3f} < min {min_edge:.3f} "
+                        f"(model {model_side_prob:.3f} vs ask {mkt:.3f})",
+                        retry=True,
+                    ) == "retry":
+                        continue
+                    continue
 
                 stake = risk.size_late_scalp(mkt, edge=edge)
 
@@ -1602,12 +1646,9 @@ async def run_realtime(rounds: int = 100, paper: bool = True):
 
             token_id = market["tokens"][sig.side]
             try:
-                if hasattr(pub, "buy_quote"):
-                    q = await asyncio.to_thread(pub.buy_quote, token_id)
-                else:
-                    mid = await asyncio.to_thread(pub.midpoint, token_id)
-                    q = {"price": mid, "mid": mid, "best_bid": None,
-                         "best_ask": None, "spread": None, "ask_size": None}
+                q = await asyncio.to_thread(_quote_side, pub, market, sig.side)
+                if not q:
+                    raise ValueError("Failed to get quote")
                 mkt = q["price"]
             except Exception as e:
                 print(f"  quote fetch failed ({e}); skipping slot")
@@ -1699,9 +1740,8 @@ async def run_realtime(rounds: int = 100, paper: bool = True):
                 if config.ROUND_SECONDS > 0 and rq_sleep > 0:
                     await asyncio.sleep(min(rq_sleep, 1.0))
                 try:
-                    if hasattr(pub, "buy_quote"):
-                        q2 = await asyncio.to_thread(pub.buy_quote, token_id)
-                    else:
+                    q2 = await asyncio.to_thread(_quote_side, pub, market, sig.side)
+                    if not q2 or "price" not in q2:
                         q2 = q
                     mkt2 = float(q2["price"])
                     max_jump = float(getattr(config, "MID_MAX_ASK_JUMP", 0.02) or 0.02)
@@ -1879,7 +1919,9 @@ async def run_realtime(rounds: int = 100, paper: bool = True):
             try:
                 # Re-check quote right before order (latency / adverse selection).
                 try:
-                    q2 = await asyncio.to_thread(pub.buy_quote, token_id)
+                    q2 = await asyncio.to_thread(_quote_side, pub, market, sig.side)
+                    if not q2 or "price" not in q2:
+                        raise RuntimeError("failed to re-check quote before order")
                     if q2["price"] > mkt + 0.02:
                         raise RuntimeError(
                             f"ask moved {mkt:.3f} -> {q2['price']:.3f} before order")
@@ -2079,6 +2121,8 @@ if __name__ == "__main__":
                     choices=["mid", "late_scalp", "late_every", "hybrid", "late_momentum"],
                     default=None,
                     help="mid | late_scalp | late_every (bet most 5m slots) | hybrid | late_momentum")
+    ap.add_argument("--asset", choices=["btc", "eth", "sol"], default=None,
+                    help="btc | eth | sol (defaults to asset in .env/config)")
     ap.add_argument("--rounds", type=int, default=None)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--sleep", type=float, default=0.0)
@@ -2091,6 +2135,9 @@ if __name__ == "__main__":
                     help="clear previous trades/stats/status before running")
     args = ap.parse_args()
     config.MODE = args.mode
+    if args.asset:
+        config.ASSET = args.asset.lower()
+        config.reapply_asset_config()
     if args.strategy:
         config.STRATEGY = args.strategy
     # Normalize menu aliases (late_every -> EVERY_SLOT on, late_scalp selective)
