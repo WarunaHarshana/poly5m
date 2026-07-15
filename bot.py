@@ -1966,14 +1966,46 @@ async def run_realtime(rounds: int = 100, paper: bool = True):
         if hold and hold > 0:
             await asyncio.sleep(hold)
 
-        # Live: cancel any resting leftovers so they don't fill next slot.
+        # Live: cancel any resting leftovers and check the matched fill amount
+        matched_shares = float(shares)
         if not paper and live_client is not None:
             try:
                 if order_id:
+                    print(f"  [live fill] cancelling order {order_id} to check fills...")
                     await asyncio.to_thread(live_client.cancel_order, str(order_id))
-                await asyncio.to_thread(live_client.cancel_all)
+                    
+                    # Fetch recent fills/trades to see how much was matched
+                    try:
+                        c = live_client._client()
+                        trades_list = await asyncio.to_thread(c.get_trades)
+                        filled = 0.0
+                        if trades_list and isinstance(trades_list, list):
+                            for tr in trades_list:
+                                tok_id = tr.get("taker_order_id") or tr.get("id")
+                                if tok_id == order_id:
+                                    filled += float(tr.get("size") or 0.0)
+                                else:
+                                    maker_ords = tr.get("maker_orders") or []
+                                    for mo in maker_ords:
+                                        if mo.get("order_id") == order_id:
+                                            filled += float(mo.get("matched_amount") or 0.0)
+                        
+                        print(f"  [live fill] matched shares: {filled:.4f} (requested: {shares:.4f})")
+                        matched_shares = filled
+                    except Exception as fe:
+                        print(f"  [live fill check error] {fe}. Defaulting to full size.")
+                else:
+                    await asyncio.to_thread(live_client.cancel_all)
             except Exception as e:
                 print(f"  cancel cleanup: {e}")
+
+        # Update trade shares/stake based on actual fill size
+        if not paper:
+            trade.shares = matched_shares
+            trade.stake_usd = round(matched_shares * trade.entry_price, 4)
+            if matched_shares == 0.0:
+                print("  [live fill] Trade was completely unfilled. Setting PnL to 0.")
+                risk.trades_today = max(0, risk.trades_today - 1)
 
         # --- Resolution (Polymarket rules) ---
         # Up iff end_price >= start_price on Chainlink Data Streams BTC/USD.
