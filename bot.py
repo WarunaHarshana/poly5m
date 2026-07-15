@@ -858,6 +858,15 @@ async def run_realtime(rounds: int = 100, paper: bool = True):
             print(f"  [Time Guard] Suitability: {suitability} - {reason}")
             if suitability == "AVOID":
                 print(f"  [Time Guard] Skipping slot due to unsuitable trading period: {reason}")
+                write_status(
+                    phase="waiting",
+                    question=question,
+                    slug=market.get("slug"),
+                    end_ts=end_ts,
+                    side=None,
+                    edge=None,
+                    mkt=None
+                )
                 await _sleep_until_slot_end(end_ts, cl_stream)
                 continue
         except Exception:
