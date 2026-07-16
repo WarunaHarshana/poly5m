@@ -58,7 +58,9 @@ class ChainlinkDataStream:
     WS_URL = "wss://ws-live-data.polymarket.com"
     SYMBOL = "btc/usd"
 
-    def __init__(self, history_maxlen: int = 20_000):
+    def __init__(self, asset: str = "btc", history_maxlen: int = 20_000):
+        self.asset = asset.lower()
+        self.SYMBOL = f"{self.asset}/usd"
         # (unix_ts_seconds float, price float) — stream timestamps (UTC)
         self._ticks: deque[tuple[float, float]] = deque(maxlen=history_maxlen)
         self._latest: float | None = None
@@ -220,7 +222,7 @@ class ChainlinkDataStream:
                             continue
                         payload = msg.get("payload") or {}
                         sym = str(payload.get("symbol") or "").lower()
-                        if sym not in (self.SYMBOL, "btc-usd", "btcusd"):
+                        if sym not in (self.SYMBOL, f"{self.asset}-usd", f"{self.asset}usd"):
                             continue
                         try:
                             value = float(payload.get("value"))
@@ -266,10 +268,11 @@ class LivePriceFeed:
     connectivity only — they are NOT Polymarket's 5m resolution source.
     """
 
-    def __init__(self, sources: list[str] | None = None, timeout: float = 8.0,
+    def __init__(self, asset: str = "btc", sources: list[str] | None = None, timeout: float = 8.0,
                  chainlink_stream: ChainlinkDataStream | None = None):
         import requests  # lazy: offline sim needs no deps
         self.requests = requests
+        self.asset = asset.lower()
         self.sources = sources or config.BTC_PRICE_SOURCES
         self.timeout = timeout
         self.history: deque[float] = deque(maxlen=512)
@@ -277,19 +280,21 @@ class LivePriceFeed:
         if self.stream is None and any(
                 s in ("chainlink_stream", "chainlink_ds", "rtds")
                 for s in self.sources):
-            self.stream = ChainlinkDataStream()
+            self.stream = ChainlinkDataStream(asset=self.asset)
             self.stream.start()
 
     def start_resolution_stream(self) -> ChainlinkDataStream:
         """Ensure the Polymarket Chainlink Data Stream is running."""
         if self.stream is None:
-            self.stream = ChainlinkDataStream()
+            self.stream = ChainlinkDataStream(asset=self.asset)
         self.stream.start()
         return self.stream
 
     def _chainlink_stream(self):
         if self.stream is None:
             raise RuntimeError("Chainlink Data Stream not started")
+        if not self.stream.ready:
+            raise RuntimeError("Chainlink Data Stream is stale or disconnected")
         return self.stream.price()
 
     # Alias names that can appear in BTC_PRICE_SOURCES
@@ -297,8 +302,13 @@ class LivePriceFeed:
     _rtds = _chainlink_stream
 
     def _chainlink(self):
-        # Arbitrum BTC/USD *aggregator* — NOT Data Streams. Fallback only.
-        addr = "0x6ce185860a4963106506C203335A2910413708e9"
+        # Arbitrum aggregator — NOT Data Streams. Fallback only.
+        rpc_feeds = {
+            "btc": "0x6ce185860a4963106506C203335A2910413708e9",
+            "eth": "0x639Fe6ab55C921f74e7fac1ee960C0B6293ba612",
+            "sol": "0x32338Cff0B6ED70C15d0389EDCa48A8d53086ebc",
+        }
+        addr = rpc_feeds.get(self.asset, rpc_feeds["btc"])
         rpcs = [
             "https://arb1.arbitrum.io/rpc",
             "https://rpc.ankr.com/arbitrum",
@@ -334,9 +344,14 @@ class LivePriceFeed:
         raise RuntimeError("Chainlink RPC failed: " + ", ".join(errors))
 
     def _pyth(self):
-        # Pyth BTC/USD Price Feed ID with 0x prefix
-        btc_feed_id = "0xe62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43"
-        url = f"https://hermes.pyth.network/v2/updates/price/latest?ids[]={btc_feed_id}"
+        # Pyth Price Feed IDs with 0x prefix
+        pyth_feed_ids = {
+            "btc": "0xe62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43",
+            "eth": "0xff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0aec",
+            "sol": "0xef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d",
+        }
+        feed_id = pyth_feed_ids.get(self.asset, pyth_feed_ids["btc"])
+        url = f"https://hermes.pyth.network/v2/updates/price/latest?ids[]={feed_id}"
         r = self.requests.get(url, timeout=self.timeout)
         if r.status_code == 200:
             data = r.json()
@@ -347,19 +362,21 @@ class LivePriceFeed:
 
     def _coinbase(self):
         r = self.requests.get(
-            "https://api.coinbase.com/v2/prices/BTC-USD/spot", timeout=self.timeout)
+            f"https://api.coinbase.com/v2/prices/{self.asset.upper()}-USD/spot", timeout=self.timeout)
         return float(r.json()["data"]["amount"])
 
     def _binance(self):
+        symbol = f"{self.asset.upper()}USDT"
         r = self.requests.get(
             "https://api.binance.com/api/v3/ticker/price",
-            params={"symbol": "BTCUSDT"}, timeout=self.timeout)
+            params={"symbol": symbol}, timeout=self.timeout)
         return float(r.json()["price"])
 
     def _kraken(self):
+        pair = "XBTUSD" if self.asset == "btc" else f"{self.asset.upper()}USD"
         r = self.requests.get(
             "https://api.kraken.com/0/public/Ticker",
-            params={"pair": "XBTUSD"}, timeout=self.timeout)
+            params={"pair": pair}, timeout=self.timeout)
         res = r.json()["result"]
         key = next(iter(res))
         return float(res[key]["c"][0])  # last trade close
@@ -422,7 +439,7 @@ class LivePriceFeed:
         try:
             headers = {"User-Agent": "polymarket-btc-bot/1.0"}
             r = self.requests.get(
-                "https://api.exchange.coinbase.com/products/BTC-USD/candles",
+                f"https://api.exchange.coinbase.com/products/{self.asset.upper()}-USD/candles",
                 params={"granularity": "300", "limit": "5"},
                 headers=headers,
                 timeout=(3.05, self.timeout),
@@ -440,9 +457,10 @@ class LivePriceFeed:
 
         # 3) Proxy: Binance 5m open
         try:
+            symbol = f"{self.asset.upper()}USDT"
             r = self.requests.get(
                 "https://api.binance.com/api/v3/klines",
-                params={"symbol": "BTCUSDT", "interval": "5m", "limit": "5"},
+                params={"symbol": symbol, "interval": "5m", "limit": "5"},
                 timeout=(3.05, self.timeout),
             )
             if r.status_code == 200:
@@ -502,7 +520,7 @@ class LivePriceFeed:
         try:
             headers = {"User-Agent": "polymarket-btc-bot/1.0"}
             r = self.requests.get(
-                "https://api.exchange.coinbase.com/products/BTC-USD/candles",
+                f"https://api.exchange.coinbase.com/products/{self.asset.upper()}-USD/candles",
                 params={"granularity": "300", "limit": "5"},
                 headers=headers,
                 timeout=(3.05, self.timeout),
@@ -517,9 +535,10 @@ class LivePriceFeed:
             print(f"  [price_feed] Coinbase close candles failed: {e}")
 
         try:
+            symbol = f"{self.asset.upper()}USDT"
             r = self.requests.get(
                 "https://api.binance.com/api/v3/klines",
-                params={"symbol": "BTCUSDT", "interval": "5m", "limit": "5"},
+                params={"symbol": symbol, "interval": "5m", "limit": "5"},
                 timeout=(3.05, self.timeout),
             )
             if r.status_code == 200:
