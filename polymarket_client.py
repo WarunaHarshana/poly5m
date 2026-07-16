@@ -266,9 +266,8 @@ class PolymarketPublic:
                 or m.get("closed") is True
                 or m.get("automaticallyResolved") is True
             )
-            if best_px < 0.9 and not (resolved and best_px >= 0.99):
-                if best_px < 0.95:
-                    return None
+            if not resolved:
+                return None
             if best_label in UP_WORDS or best_label == "UP":
                 return "UP"
             if best_label in DOWN_WORDS or best_label == "DOWN":
