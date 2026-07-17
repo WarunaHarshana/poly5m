@@ -100,12 +100,22 @@ class Trade:
 
 class PaperExecutor:
     """Simulated fills. Buys the chosen side at the market price; pays $1 per
-    winning contract, $0 per losing one."""
+    winning contract, $0 per losing one.
+
+    side="ARB" is a paired position (equal shares of UP and DOWN bought when
+    ask_UP + ask_DOWN < 1): exactly one leg pays $1/share whichever way the
+    slot resolves, so payout = shares regardless of direction. entry_price
+    stores the SUM of both asks; won = the pair cost less than it paid."""
 
     def open_and_resolve(self, trade: Trade, resolved_up: bool) -> Trade:
         trade.outcome = "UP" if resolved_up else "DOWN"
-        trade.won = (trade.side == trade.outcome)
-        payout = trade.shares * (1.0 if trade.won else 0.0)
-        trade.pnl = round(payout - trade.stake_usd, 4)
+        if trade.side == "ARB":
+            payout = trade.shares  # winning leg pays $1/share, other pays $0
+            trade.pnl = round(payout - trade.stake_usd, 4)
+            trade.won = trade.pnl > 0
+        else:
+            trade.won = (trade.side == trade.outcome)
+            payout = trade.shares * (1.0 if trade.won else 0.0)
+            trade.pnl = round(payout - trade.stake_usd, 4)
         stamp_resolved_times(trade)
         return trade

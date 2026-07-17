@@ -187,7 +187,10 @@ def compute_signal(
     vol_sec = used_vol / math.sqrt(86400.0)
     std_dev = max(current_price * vol_sec * math.sqrt(max(remaining_seconds, 1.0)), 1e-4)
     window_secs = max(sample_seconds * (len(clean) - 1), sample_seconds)
-    drift_rate_per_sec = max(-0.0001, min(0.0001, log_ret / window_secs))
+    if window_secs > 0:
+        drift_rate_per_sec = max(-0.0001, min(0.0001, log_ret / window_secs))
+    else:  # zero-spacing samples (fast/test mode): no measurable drift
+        drift_rate_per_sec = 0.0
     drift_amount = drift_rate_per_sec * remaining_seconds * current_price
     drift_cap = 0.35 * std_dev  # lighter than before — window delta dominates
     drift_amount = max(-drift_cap, min(drift_cap, drift_amount))

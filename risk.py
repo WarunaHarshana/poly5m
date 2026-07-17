@@ -291,12 +291,15 @@ class RiskManager:
             return 0.0
         # Extra safety: never risk more than MAX_EXPOSURE_USD * 1.7 on late
         # (min-shares can exceed MAX_EXPOSURE slightly; keep a hard ceiling).
+        # Counts OPEN exposure too — trades now settle in the background, so
+        # without this a new late bet could stack on an unresolved one.
         exp_cap = float(getattr(config, "MAX_EXPOSURE_USD", 0) or 0)
         if exp_cap > 0:
             hard = max(exp_cap * 1.7, max_late if max_late > 0 else exp_cap)
-            if stake > hard + 1e-9:
+            if self.open_exposure + stake > hard + 1e-9:
                 self.last_skip_reason = (
-                    f"late stake ${stake:.2f} > exposure hard cap ${hard:.2f}"
+                    f"open ${self.open_exposure:.2f} + stake ${stake:.2f} "
+                    f"> exposure hard cap ${hard:.2f}"
                 )
                 return 0.0
         return stake

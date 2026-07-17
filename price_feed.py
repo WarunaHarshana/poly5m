@@ -186,7 +186,11 @@ class ChainlinkDataStream:
             try:
                 async with websockets.connect(
                     self.WS_URL,
-                    ping_interval=None,
+                    # Protocol-level keepalive: with ping disabled the server
+                    # silently dropped idle connections overnight, costing
+                    # slot-open ticks (68 proxy_strike skips in one session).
+                    ping_interval=20,
+                    ping_timeout=10,
                     open_timeout=12,
                     close_timeout=2,
                     max_size=2**20,
@@ -229,10 +233,21 @@ class ChainlinkDataStream:
                         except (TypeError, ValueError):
                             continue
                         
-                        # --- Drop First Tick (stale cached snapshot) ---
+                        # payload timestamp is ms
+                        ts_ms = payload.get("timestamp") or msg.get("timestamp")
+                        try:
+                            ts_s = float(ts_ms) / 1000.0
+                        except (TypeError, ValueError):
+                            ts_s = time.time()
+
+                        # --- First tick after (re)connect: drop only if it is
+                        # actually a stale cached snapshot. Unconditionally
+                        # dropping it threw away good ticks right at slot
+                        # opens after reconnects (missed strikes).
                         if is_first_tick:
                             is_first_tick = False
-                            continue
+                            if time.time() - ts_s > 5.0:
+                                continue
 
                         # --- Delta Price Validation (reject anomalous jumps > $1,500) ---
                         if self._latest is not None:
@@ -242,12 +257,6 @@ class ChainlinkDataStream:
                                       f"${self._latest:,.2f} -> ${value:,.2f} (delta=${delta:,.2f})")
                                 continue
 
-                        # payload timestamp is ms
-                        ts_ms = payload.get("timestamp") or msg.get("timestamp")
-                        try:
-                            ts_s = float(ts_ms) / 1000.0
-                        except (TypeError, ValueError):
-                            ts_s = time.time()
                         if value > 0:
                             self._record(ts_s, value)
             except asyncio.CancelledError:

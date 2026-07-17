@@ -69,16 +69,39 @@ LIVE_AGGRESSIVE = _env_bool("LIVE_AGGRESSIVE", False)
 # Unix start time, e.g. "btc-updown-5m-1771582500" (always a multiple of 300).
 # The bot computes the current slot as floor(now/SLOT_SECONDS)*SLOT_SECONDS and
 # fetches that event by slug. Override the prefix only if Polymarket renames it.
+ASSET = os.getenv("ASSET", "btc").strip().lower()
 SLOT_SECONDS = int(os.getenv("SLOT_SECONDS", "300"))  # 5-minute slots
-BTC_SLUG_PREFIX = os.getenv("BTC_SLUG_PREFIX", "btc-updown-5m-")
+
+BTC_SLUG_PREFIX = ""
+BTC_MARKET_ASSET_TERMS = []
+BTC_MARKET_UPDOWN_TERMS = []
+BTC_MARKET_MATCH = ""
+BTC_PRICE_SOURCES = []
+
+def reapply_asset_config():
+    global BTC_SLUG_PREFIX, BTC_MARKET_ASSET_TERMS, BTC_MARKET_UPDOWN_TERMS, BTC_MARKET_MATCH, BTC_PRICE_SOURCES
+    
+    # Target slug prefix dynamically mapped to ASSET
+    BTC_SLUG_PREFIX = os.getenv("BTC_SLUG_PREFIX") or f"{ASSET}-updown-5m-"
+    
+    # Asset terms dynamically mapped
+    default_asset_terms = f"{ASSET},bitcoin" if ASSET == "btc" else (f"{ASSET},ethereum" if ASSET == "eth" else f"{ASSET},solana")
+    BTC_MARKET_ASSET_TERMS = [s.strip().lower() for s in os.getenv(
+        "BTC_MARKET_ASSET_TERMS", default_asset_terms).split(",") if s.strip()]
+        
+    BTC_MARKET_UPDOWN_TERMS = [s.strip().lower() for s in os.getenv(
+        "BTC_MARKET_UPDOWN_TERMS",
+        "up or down,up-or-down,updown,5 min,5-min,5min,next 5").split(",") if s.strip()]
+        
+    BTC_MARKET_MATCH = os.getenv("BTC_MARKET_MATCH", "").strip().lower()
+    
+    BTC_PRICE_SOURCES = [s.strip() for s in os.getenv(
+        "BTC_PRICE_SOURCES",
+        "chainlink_stream,chainlink,pyth,coinbase,binance,kraken").split(",") if s.strip()]
+
+reapply_asset_config()
 
 # --- Market discovery (fuzzy fallback only) ---
-BTC_MARKET_ASSET_TERMS = [s.strip().lower() for s in os.getenv(
-    "BTC_MARKET_ASSET_TERMS", "btc,bitcoin").split(",") if s.strip()]
-BTC_MARKET_UPDOWN_TERMS = [s.strip().lower() for s in os.getenv(
-    "BTC_MARKET_UPDOWN_TERMS",
-    "up or down,up-or-down,updown,5 min,5-min,5min,next 5").split(",") if s.strip()]
-BTC_MARKET_MATCH = os.getenv("BTC_MARKET_MATCH", "").strip().lower()
 SLOT_MIN_SECONDS = int(os.getenv("SLOT_MIN_SECONDS", "180"))
 SLOT_MAX_SECONDS = int(os.getenv("SLOT_MAX_SECONDS", "420"))
 # Skip slots with too little time left (need room to decide + place).
@@ -91,12 +114,6 @@ MAX_TRADE_REMAINING = int(os.getenv("MAX_TRADE_REMAINING", "240"))
 # tied to MIN_SLOT_SECONDS=90, which abandoned slots ~100s early).
 MARKET_ADVANCE_REMAINING = int(os.getenv("MARKET_ADVANCE_REMAINING", "5"))
 
-# --- BTC price feed (real data) ---
-# Polymarket 5m BTC markets resolve on Chainlink BTC/USD — put chainlink first
-# for live accuracy. Public endpoints, no key.
-BTC_PRICE_SOURCES = [s.strip() for s in os.getenv(
-    "BTC_PRICE_SOURCES",
-    "chainlink_stream,chainlink,pyth,coinbase,binance,kraken").split(",") if s.strip()]
 
 # --- Strategy (stricter mid defaults — fewer, higher-conviction mid entries) ---
 ROUND_SECONDS = int(os.getenv("ROUND_SECONDS", "300"))
@@ -157,10 +174,10 @@ LATE_SCALP_MIN_REMAINING = int(os.getenv("LATE_SCALP_MIN_REMAINING", "8"))
 LATE_SCALP_MAX_REMAINING = int(os.getenv("LATE_SCALP_MAX_REMAINING", "50"))
 # Default band wide enough for every-slot mode (clamp if needed).
 # Min favorite ask — below this is near coin-flip (R5 lost @ 0.57).
-LATE_SCALP_MIN_ENTRY = float(os.getenv("LATE_SCALP_MIN_ENTRY", "0.60"))
-LATE_SCALP_MAX_ENTRY = float(os.getenv("LATE_SCALP_MAX_ENTRY", "0.95"))
+LATE_SCALP_MIN_ENTRY = float(os.getenv("LATE_SCALP_MIN_ENTRY", "0.88"))
+LATE_SCALP_MAX_ENTRY = float(os.getenv("LATE_SCALP_MAX_ENTRY", "0.93"))
 # Prefer entries at/under this ask (ignored when LATE_SCALP_EVERY_SLOT=1).
-LATE_SCALP_PREFER_MAX = float(os.getenv("LATE_SCALP_PREFER_MAX", "0.95"))
+LATE_SCALP_PREFER_MAX = float(os.getenv("LATE_SCALP_PREFER_MAX", "0.93"))
 # Minimum gap between favorite ask and underdog ask (favorite clearly leading).
 LATE_SCALP_MIN_FAVORITE_LEAD = float(os.getenv("LATE_SCALP_MIN_FAVORITE_LEAD", "0.05"))
 # Underdog ask must be this low (0 = off in every-slot).
@@ -198,6 +215,33 @@ LATE_MOMENTUM_MIN_MOVE = float(os.getenv("LATE_MOMENTUM_MIN_MOVE", "10.0"))
 LATE_MOMENTUM_TIME_LIMIT = int(os.getenv("LATE_MOMENTUM_TIME_LIMIT", "40"))
 LATE_MOMENTUM_MIN_REMAINING = int(os.getenv("LATE_MOMENTUM_MIN_REMAINING", "8"))
 LATE_MOMENTUM_BIDIRECTIONAL = _env_bool("LATE_MOMENTUM_BIDIRECTIONAL", True)
+# Own entry band. Inheriting the late_scalp favorite band (0.88+) made the
+# momentum gates mutually unsatisfiable: a modest move + edge>=0 requires an
+# ask well below where the book prices favorites late in the slot.
+LATE_MOMENTUM_MIN_ENTRY = float(os.getenv("LATE_MOMENTUM_MIN_ENTRY", "0.55"))
+LATE_MOMENTUM_MAX_ENTRY = float(os.getenv("LATE_MOMENTUM_MAX_ENTRY", "0.92"))
+# Edge floor AND ceiling (model_prob − ask). Archive buckets: edge 0–0.05 was
+# the best performer; edge ≥ 0.15 was the WORST (75% WR, −$0.15/trade) — a
+# huge "model edge" in the last minute usually means stale strike / vol
+# misestimate, and the book is right. 0 = gate off.
+LATE_MOMENTUM_MIN_EDGE = float(os.getenv("LATE_MOMENTUM_MIN_EDGE",
+                               os.getenv("LATE_SCALP_MIN_EDGE", "0.0")))
+LATE_MOMENTUM_MAX_EDGE = float(os.getenv("LATE_MOMENTUM_MAX_EDGE", "0.10"))
+# Skip slots where price crossed the strike more than this many times in the
+# recent sample window (lead = noise, not momentum). 0 = off.
+LATE_MOMENTUM_MAX_CHOP = int(os.getenv("LATE_MOMENTUM_MAX_CHOP", "3"))
+
+# --- Sum-to-one arbitrage (runs alongside late_momentum) ---
+# When ask_UP + ask_DOWN < 1 − ARB_MIN_EDGE, buying BOTH sides pays $1/share
+# whichever way the slot resolves — structural edge, no prediction needed.
+# Execution is PAPER-ONLY: live needs both legs to fill (leg risk unhandled).
+ARB_TRADE_ENABLED = _env_bool("ARB_TRADE_ENABLED", True)
+ARB_MAX_STAKE_USD = float(os.getenv("ARB_MAX_STAKE_USD", "10.0"))
+# Minimum LOCKED profit per pair after simulated slippage (real fees/fills
+# would eat razor-thin pairs; don't let paper count them).
+ARB_MIN_LOCKED_EDGE = float(os.getenv("ARB_MIN_LOCKED_EDGE", "0.02"))
+# Only scan when at least this many seconds remain (books settle, time to fill).
+ARB_MIN_REMAINING = int(os.getenv("ARB_MIN_REMAINING", "20"))
 
 # --- Hybrid (STRATEGY=hybrid): prefer late; mid only if exceptional ---
 # When true (default), mid must clear HYBRID_MID_* bars on top of normal mid filters;
@@ -376,102 +420,29 @@ def apply_late_scalp_profile() -> list[str]:
     return notes
 
 
-def is_late_every() -> bool:
-    """True for every-5m-slot late mode (menu: late_every)."""
-    return (STRATEGY or "mid").strip().lower() in (
-        "late_every", "late_scalp_every", "every_slot", "every", "late_all",
-    )
-
-
-def is_late_scalp() -> bool:
-    """True for pure late strategies (selective or every-slot), not hybrid."""
-    if is_late_every():
-        return True
-    return (STRATEGY or "mid").strip().lower() in (
-        "late_scalp", "latescalp", "late", "scalp", "bone_reaper", "convergence",
-    )
-
-
-def is_hybrid() -> bool:
-    return (STRATEGY or "mid").strip().lower() in (
-        "hybrid", "mid_then_late", "both", "late_then_mid", "prefer_late",
-    )
-
-
 def is_late_momentum() -> bool:
-    """True for late momentum breakout strategy."""
-    return (STRATEGY or "mid").strip().lower() in (
-        "late_momentum", "momentum_late", "late_min_move", "momentum",
-    )
+    """Always true — late_momentum is the only trading strategy.
+
+    mid / late_scalp / late_every / hybrid were retired 2026-07-17: the trade
+    archive showed negative live expectancy (rich-favorite buying can't clear
+    its ~92% breakeven) or paper results inflated by simulation bugs. The
+    sum-to-one arb runs alongside momentum when ARB_TRADE_ENABLED.
+    """
+    return True
 
 
 def apply_strategy_flags() -> None:
-    """Normalize STRATEGY aliases and set LATE_SCALP_EVERY_SLOT from menu choice.
-
-    Call after CLI/env STRATEGY is set so dashboard menu options behave:
-      late_every  -> late path + EVERY_SLOT on
-      late_scalp  -> late path + EVERY_SLOT off (unless env already forced)
-    """
-    global STRATEGY, LATE_SCALP_EVERY_SLOT
-    s = (STRATEGY or "mid").strip().lower()
-    if s in ("late_every", "late_scalp_every", "every_slot", "every", "late_all"):
-        STRATEGY = "late_every"
-        LATE_SCALP_EVERY_SLOT = True
-    elif s in ("late_scalp", "latescalp", "late", "scalp", "bone_reaper", "convergence"):
-        STRATEGY = "late_scalp"
-        # Menu "late_scalp" = selective; only keep EVERY_SLOT if explicitly late_every
-        LATE_SCALP_EVERY_SLOT = False
-    elif s in ("hybrid", "mid_then_late", "both", "late_then_mid", "prefer_late"):
-        STRATEGY = "hybrid"
-    elif s in ("late_momentum", "momentum_late", "late_min_move", "momentum"):
-        STRATEGY = "late_momentum"
-    elif s in ("mid", "middle", "value"):
-        STRATEGY = "mid"
-
-
-def hybrid_prefer_late() -> bool:
-    """Hybrid default: wait for late unless mid is exceptional."""
-    return bool(is_hybrid() and HYBRID_PREFER_LATE)
-
-
-def mid_exceptional_ok(
-    edge: float,
-    move_usd: float,
-    model_side_prob: float,
-    confidence: float,
-) -> tuple[bool, str]:
-    """Return (ok, reason) for hybrid mid-only exceptional gate.
-
-    Used when HYBRID_PREFER_LATE so weak mid signals defer to late_scalp.
-    """
-    need_edge = float(HYBRID_MID_MIN_EDGE)
-    need_move = float(HYBRID_MID_MIN_MOVE_USD)
-    need_model = float(HYBRID_MID_MIN_MODEL)
-    need_conf = float(HYBRID_MID_MIN_CONFIDENCE)
-    fails: list[str] = []
-    if edge < need_edge:
-        fails.append(f"edge {edge:+.3f}<{need_edge:.3f}")
-    if move_usd < need_move:
-        fails.append(f"move ${move_usd:.1f}<${need_move:.1f}")
-    if model_side_prob < need_model:
-        fails.append(f"model {model_side_prob:.2f}<{need_model:.2f}")
-    if confidence < need_conf:
-        fails.append(f"conf {confidence:.2f}<{need_conf:.2f}")
-    if fails:
-        return False, "; ".join(fails)
-    return True, "exceptional mid"
+    """Coerce any legacy STRATEGY value to late_momentum (single strategy)."""
+    global STRATEGY
+    s = (STRATEGY or "").strip().lower()
+    if s and s not in ("late_momentum", "momentum_late", "late_min_move",
+                       "momentum"):
+        print(f"[config] STRATEGY '{s}' was retired -> using late_momentum")
+    STRATEGY = "late_momentum"
 
 
 def strategy_name() -> str:
-    if is_hybrid():
-        return "hybrid"
-    if is_late_every():
-        return "late_every"
-    if is_late_scalp():
-        return "late_scalp"
-    if is_late_momentum():
-        return "late_momentum"
-    return "mid"
+    return "late_momentum"
 
 
 def get_time_suitability(ts: float | None = None) -> tuple[str, str]:

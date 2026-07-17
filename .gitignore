@@ -2,8 +2,12 @@
 .env
 .env.local
 .env.*.local
+.env.bak*
 *.pem
 *.key
+
+# Claude Code local files (worktrees, local settings)
+.claude/
 
 # Runtime / local data
 state/

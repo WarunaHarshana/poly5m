@@ -48,122 +48,80 @@ _ENV_KEYS = (
 
 # Tunables editable from the dashboard (never secrets).
 # Each field: key, label, type (float|int|bool|str), default, group, hint
+# NOTE 2026-07-17: mid / late_scalp / late_every / hybrid strategies were
+# retired (negative or simulation-inflated expectancy) — the bot now runs
+# late_momentum plus a sum-to-one arb scanner. Their settings are gone too.
 STRATEGY_FIELDS = [
-    # --- Strategy / mode-ish ---
+    # --- General ---
     {"key": "ASSET", "label": "Default asset", "type": "str",
      "default": "btc", "group": "general",
      "hint": "btc | eth | sol (Start menu can override)"},
-    {"key": "STRATEGY", "label": "Default strategy", "type": "str",
-     "default": "mid", "group": "general",
-     "hint": "mid | late_scalp | late_every | late_momentum | hybrid (Start menu can override)"},
+    {"key": "STRATEGY", "label": "Strategy", "type": "str",
+     "default": "late_momentum", "group": "general",
+     "hint": "late_momentum is the only strategy (others retired 2026-07-17)"},
     # --- Late momentum strategy ---
-    {"key": "LATE_MOMENTUM_MIN_MOVE", "label": "Momentum min move $", "type": "float",
-     "default": "15.0", "group": "late_momentum", "hint": "Min price gap vs strike (price to beat) when timer hits"},
-    {"key": "LATE_MOMENTUM_TIME_LIMIT", "label": "Momentum max seconds left", "type": "int",
-     "default": "40", "group": "late_momentum", "hint": "Start checking when seconds left is under this"},
-    {"key": "LATE_MOMENTUM_MIN_REMAINING", "label": "Momentum min seconds left", "type": "int",
-     "default": "8", "group": "late_momentum", "hint": "Stop trading below this many seconds"},
-    {"key": "LATE_MOMENTUM_BIDIRECTIONAL", "label": "Momentum bidirectional", "type": "bool",
-     "default": "1", "group": "late_momentum", "hint": "1=bet UP on pump / DOWN on dump, 0=only UP"},
-    # --- Late scalp bands ---
-    {"key": "LATE_SCALP_EVERY_SLOT", "label": "Trade every 5m slot", "type": "bool",
-     "default": "1", "group": "late",
-     "hint": "1=relaxed gates, try to bet every slot (more risk)"},
-    {"key": "LATE_SCALP_MIN_ENTRY", "label": "Late min entry (favorite ask)", "type": "float",
-     "default": "0.75", "group": "late",
-     "hint": "Skip softer favorites (0.57 loss) — try 0.60+"},
-    {"key": "LATE_SCALP_MAX_ENTRY", "label": "Late max entry (hard cap)", "type": "float",
-     "default": "0.96", "group": "late", "hint": "Hard max ask allowed"},
-    {"key": "LATE_SCALP_PREFER_MAX", "label": "Late prefer max (sweet spot)", "type": "float",
-     "default": "0.95", "group": "late",
-     "hint": "Ignored when Trade every 5m slot is ON"},
-    {"key": "LATE_SCALP_MIN_REMAINING", "label": "Late min seconds left", "type": "int",
-     "default": "8", "group": "late", "hint": "Stop trading below this many seconds"},
-    {"key": "LATE_SCALP_MAX_REMAINING", "label": "Late max seconds left", "type": "int",
-     "default": "50", "group": "late", "hint": "Start late window at this many seconds"},
-    {"key": "LATE_SCALP_MIN_FAVORITE_LEAD", "label": "Min favorite lead", "type": "float",
-     "default": "0.02", "group": "late", "hint": "fav_ask - dog_ask must be >= this"},
-    {"key": "LATE_SCALP_MAX_UNDERDOG_ASK", "label": "Max underdog ask", "type": "float",
-     "default": "0.49", "group": "late", "hint": "Other side max (relaxed for every-slot)"},
-    {"key": "LATE_SCALP_REQUIRE_SPOT_ALIGN", "label": "Require spot aligns with favorite", "type": "bool",
-     "default": "0", "group": "late", "hint": "0 recommended for every-slot mode"},
-    {"key": "LATE_SCALP_SPOT_ALIGN_EPS_USD", "label": "Spot align epsilon $", "type": "float",
-     "default": "8", "group": "late", "hint": "Allow this $ noise vs strike"},
-    {"key": "LATE_SCALP_REQUOTE", "label": "Late requote before fill", "type": "bool",
-     "default": "0", "group": "late"},
-    {"key": "LATE_SCALP_KEEP_FIRST_ASK", "label": "Keep first ask if requote spikes", "type": "bool",
-     "default": "1", "group": "late", "hint": "1=limit at first ask instead of chasing"},
-    {"key": "LATE_SCALP_PAUSE_SLOTS_AFTER_LOSS", "label": "Pause late windows after loss", "type": "int",
-     "default": "0", "group": "late"},
-    {"key": "LATE_SCALP_MAX_STAKE_USD", "label": "Late max stake $", "type": "float",
-     "default": "5.00", "group": "late"},
-    {"key": "LATE_SCALP_MAX_SPREAD", "label": "Late max spread", "type": "float",
-     "default": "0.15", "group": "late"},
-    {"key": "LATE_SCALP_MIN_MOVE_USD", "label": "Late min move $", "type": "float",
-     "default": "15.0", "group": "late", "hint": "BTC price must move this much from strike"},
-    {"key": "LATE_SCALP_REQUIRE_CHAINLINK", "label": "Late require Chainlink", "type": "bool",
-     "default": "1", "group": "late", "hint": "Refuse trading on exchange-proxy strikes"},
-    {"key": "LATE_SCALP_MIN_EDGE", "label": "Late min edge", "type": "float",
-     "default": "-0.05", "group": "late", "hint": "Min model probability edge over ask"},
-    {"key": "LATE_SCALP_USE_EDGE_SIZING", "label": "Late use edge sizing", "type": "bool",
-     "default": "1", "group": "late", "hint": "Scale stake dynamically by model edge (Kelly)"},
-    # --- Mid ---
-    {"key": "MIN_ENTRY_PRICE", "label": "Mid min entry", "type": "float",
-     "default": "0.22", "group": "mid", "hint": "Do not buy cheaper than this"},
-    {"key": "MAX_ENTRY_PRICE", "label": "Mid max entry", "type": "float",
-     "default": "0.72", "group": "mid", "hint": "Do not buy richer than this"},
-    {"key": "EDGE_THRESHOLD", "label": "Min edge", "type": "float",
-     "default": "0.04", "group": "mid"},
-    {"key": "MIN_EV", "label": "Min EV", "type": "float",
-     "default": "0.02", "group": "mid"},
-    {"key": "MIN_MOVE_USD", "label": "Min move $ vs strike", "type": "float",
-     "default": "5", "group": "mid"},
-    {"key": "MIN_CONFIDENCE", "label": "Min confidence", "type": "float",
-     "default": "0.40", "group": "mid"},
-    {"key": "MAX_SPREAD", "label": "Max spread (mid)", "type": "float",
-     "default": "0.08", "group": "mid"},
-    {"key": "FEE_BUFFER", "label": "Fee buffer", "type": "float",
-     "default": "0.01", "group": "mid"},
-    {"key": "MIN_SLOT_SECONDS", "label": "Min seconds left (mid window)", "type": "int",
-     "default": "60", "group": "mid"},
-    {"key": "MAX_TRADE_REMAINING", "label": "Max seconds left (mid window)", "type": "int",
-     "default": "240", "group": "mid"},
-    {"key": "MID_MIN_MODEL", "label": "Mid min model prob", "type": "float",
-     "default": "0.52", "group": "mid"},
-    {"key": "MID_MAX_MODEL", "label": "Mid max model prob", "type": "float",
-     "default": "0.95", "group": "mid"},
-    {"key": "MID_NOISE_MOVE_CAP", "label": "Noise move cap $ (0=off)", "type": "float",
-     "default": "0", "group": "mid", "hint": "0 = only MIN_MOVE_USD applies"},
-    {"key": "MID_Z_MIN", "label": "Fair-value Z min", "type": "float",
-     "default": "0.15", "group": "mid"},
-    {"key": "MID_USE_FAIR_VALUE", "label": "Use fair-value model", "type": "bool",
-     "default": "1", "group": "mid"},
-    {"key": "MID_REQUIRE_SIGNIFICANT", "label": "Require significant Z", "type": "bool",
-     "default": "0", "group": "mid"},
-    {"key": "MID_REQUIRE_CHAINLINK_STRIKE", "label": "Require Chainlink strike", "type": "bool",
-     "default": "0", "group": "mid", "hint": "1=block exchange-proxy strikes"},
-    {"key": "MID_MAX_CHOP_CROSSES", "label": "Max chop crosses", "type": "int",
-     "default": "6", "group": "mid"},
-    {"key": "MID_REQUOTE", "label": "Mid requote", "type": "bool",
-     "default": "1", "group": "mid"},
-    {"key": "MID_PAUSE_SLOTS_AFTER_LOSS", "label": "Pause mid slots after loss", "type": "int",
-     "default": "1", "group": "mid"},
-    {"key": "MID_MAX_STAKE_USD", "label": "Mid max stake $", "type": "float",
-     "default": "4.00", "group": "mid"},
-    {"key": "PAPER_FILL_SLIPPAGE", "label": "Paper fill slippage", "type": "float",
-     "default": "0.01", "group": "mid"},
-    # --- Hybrid ---
-    {"key": "HYBRID_PREFER_LATE", "label": "Hybrid prefer late", "type": "bool",
-     "default": "1", "group": "hybrid"},
-    {"key": "HYBRID_MID_MIN_EDGE", "label": "Hybrid mid min edge", "type": "float",
-     "default": "0.10", "group": "hybrid"},
-    {"key": "HYBRID_MID_MIN_MOVE_USD", "label": "Hybrid mid min move $", "type": "float",
-     "default": "15", "group": "hybrid"},
-    {"key": "HYBRID_MID_MIN_MODEL", "label": "Hybrid mid min model", "type": "float",
-     "default": "0.65", "group": "hybrid"},
-    {"key": "HYBRID_MID_MIN_CONFIDENCE", "label": "Hybrid mid min conf", "type": "float",
-     "default": "0.55", "group": "hybrid"},
+    {"key": "LATE_MOMENTUM_MIN_MOVE", "label": "Min move $ vs strike", "type": "float",
+     "default": "10.0", "group": "late_momentum",
+     "hint": "Required lead at 20s left; auto-scales with sqrt(time left)"},
+    {"key": "LATE_MOMENTUM_MAX_CHOP", "label": "Max strike crossings (0=off)", "type": "int",
+     "default": "3", "group": "late_momentum",
+     "hint": "Skip choppy slots where price keeps flipping across the strike"},
+    {"key": "LATE_MOMENTUM_TIME_LIMIT", "label": "Window opens (s left)", "type": "int",
+     "default": "40", "group": "late_momentum",
+     "hint": "Start checking when seconds left drops under this"},
+    {"key": "LATE_MOMENTUM_MIN_REMAINING", "label": "Window closes (s left)", "type": "int",
+     "default": "8", "group": "late_momentum",
+     "hint": "Stop trading below this many seconds"},
+    {"key": "LATE_MOMENTUM_BIDIRECTIONAL", "label": "Bidirectional", "type": "bool",
+     "default": "1", "group": "late_momentum",
+     "hint": "1=bet UP on pump / DOWN on dump, 0=only UP"},
+    {"key": "LATE_MOMENTUM_MIN_ENTRY", "label": "Min entry ask", "type": "float",
+     "default": "0.55", "group": "late_momentum",
+     "hint": "Archive: entries under ~0.92 carried the profit"},
+    {"key": "LATE_MOMENTUM_MAX_ENTRY", "label": "Max entry ask", "type": "float",
+     "default": "0.92", "group": "late_momentum",
+     "hint": "0.95+ favorites were net losers (93% WR still loses)"},
+    {"key": "LATE_MOMENTUM_MIN_EDGE", "label": "Edge floor (0=off)", "type": "float",
+     "default": "0.0", "group": "late_momentum",
+     "hint": "Min model_prob − ask; archive says small/no floor is fine"},
+    {"key": "LATE_MOMENTUM_MAX_EDGE", "label": "Edge ceiling (0=off)", "type": "float",
+     "default": "0.10", "group": "late_momentum",
+     "hint": "Skip when model is FAR above book — stale strike, book usually right"},
+    {"key": "LATE_SCALP_REQUIRE_CHAINLINK", "label": "Require Chainlink strike", "type": "bool",
+     "default": "1", "group": "late_momentum",
+     "hint": "Refuse exchange-proxy strikes (resolution risk)"},
+    {"key": "LATE_SCALP_REQUOTE", "label": "Requote before fill", "type": "bool",
+     "default": "1", "group": "late_momentum",
+     "hint": "Re-check the book before committing; skip on ask jumps"},
+    {"key": "LATE_SCALP_MAX_SPREAD", "label": "Max spread", "type": "float",
+     "default": "0.10", "group": "late_momentum"},
+    {"key": "LATE_SCALP_MAX_STAKE_USD", "label": "Max stake $", "type": "float",
+     "default": "5.00", "group": "late_momentum"},
+    {"key": "LATE_SCALP_PAUSE_SLOTS_AFTER_LOSS", "label": "Pause windows after loss", "type": "int",
+     "default": "2", "group": "late_momentum"},
+    {"key": "LATE_SCALP_USE_EDGE_SIZING", "label": "Edge-scaled sizing", "type": "bool",
+     "default": "1", "group": "late_momentum",
+     "hint": "Scale stake by model edge (fractional Kelly)"},
+    # --- Sum-to-one arbitrage ---
+    {"key": "ARB_TRADE_ENABLED", "label": "Arb scanner + paper execution", "type": "bool",
+     "default": "1", "group": "arb",
+     "hint": "Buy BOTH sides when ask_UP+ask_DOWN < 1 − min edge. Paper-only; live logs signals."},
+    {"key": "ARB_MIN_EDGE", "label": "Min arb edge (raw)", "type": "float",
+     "default": "0.04", "group": "arb",
+     "hint": "Required 1 − (ask_UP + ask_DOWN) before slippage"},
+    {"key": "ARB_MIN_LOCKED_EDGE", "label": "Min locked edge / pair", "type": "float",
+     "default": "0.02", "group": "arb",
+     "hint": "Required profit per pair AFTER slippage — thin pairs don't survive real fees"},
+    {"key": "ARB_MAX_STAKE_USD", "label": "Max arb stake $", "type": "float",
+     "default": "10.0", "group": "arb",
+     "hint": "Total for both legs of one pair"},
+    {"key": "ARB_MIN_REMAINING", "label": "Min seconds left to scan", "type": "int",
+     "default": "20", "group": "arb",
+     "hint": "Skip arbs too close to slot end"},
     # --- Risk ---
+    {"key": "PAPER_FILL_SLIPPAGE", "label": "Paper fill slippage", "type": "float",
+     "default": "0.01", "group": "risk",
+     "hint": "Added to ask on simulated fills (both arb legs too)"},
     {"key": "FIXED_STAKE_USD", "label": "Fixed stake $", "type": "float",
      "default": "1", "group": "risk"},
     {"key": "BASE_TRADE_USD", "label": "Base trade $", "type": "float",
@@ -196,12 +154,10 @@ def _settings_payload() -> dict:
     """Current strategy settings from .env + schema for the UI."""
     env = _parse_env_file()
     groups = {
-        "general": "General",
         "late_momentum": "Late Momentum strategy",
-        "late": "Late scalp bands & guards",
-        "mid": "Mid strategy",
-        "hybrid": "Hybrid",
+        "arb": "Sum-to-one arbitrage",
         "risk": "Risk & size",
+        "general": "General",
     }
     fields = []
     for f in STRATEGY_FIELDS:
@@ -251,16 +207,8 @@ def _save_settings(body: dict) -> dict:
             if s not in ("btc", "eth", "sol"):
                 errors.append("ASSET must be btc, eth, or sol")
         elif k == "STRATEGY":
-            s = s.lower()
-            if s not in ("mid", "late_scalp", "late_every", "hybrid", "late_momentum"):
-                errors.append(
-                    "STRATEGY must be mid, late_scalp, late_every, hybrid, or late_momentum")
-                continue
-            # Keep LATE_SCALP_EVERY_SLOT in sync with strategy menu choice
-            if s == "late_every":
-                updates["LATE_SCALP_EVERY_SLOT"] = "1"
-            elif s == "late_scalp":
-                updates["LATE_SCALP_EVERY_SLOT"] = "0"
+            # Only strategy left; coerce legacy values instead of erroring.
+            s = "late_momentum"
         updates[k] = s
     if errors and not updates:
         return {"ok": False, "error": "; ".join(errors)}
@@ -692,24 +640,15 @@ def _start(opts: dict) -> dict:
 
         # Use python -u for unbuffered output to make logs real-time
         cmd = [sys.executable, "-u", "bot.py", "--mode", mode]
-        strategy = str(opts.get("strategy") or "mid").strip().lower()
-        if strategy not in ("mid", "late_scalp", "late_every", "hybrid", "late_momentum"):
-            strategy = "mid"
+        strategy = "late_momentum"  # only strategy (others retired)
         asset = str(opts.get("asset") or "btc").strip().lower()
         if asset not in ("btc", "eth", "sol"):
             asset = "btc"
         cmd += ["--asset", asset]
-        
-        # Persist menu choice + every-slot flag + asset choice for next load
+
+        # Persist asset choice for next load
         try:
-            updates = {"ASSET": asset}
-            if strategy == "late_every":
-                updates.update({"STRATEGY": "late_every", "LATE_SCALP_EVERY_SLOT": "1"})
-            elif strategy == "late_scalp":
-                updates.update({"STRATEGY": "late_scalp", "LATE_SCALP_EVERY_SLOT": "0"})
-            else:
-                updates.update({"STRATEGY": strategy})
-            _upsert_env(updates)
+            _upsert_env({"ASSET": asset, "STRATEGY": strategy})
         except Exception:
             pass
         cmd += ["--strategy", strategy]
@@ -800,34 +739,35 @@ DASHBOARD_HTML = r"""<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Polymarket BTC Bot — Live Dashboard</title>
+<title>Momentum Desk — Polymarket 5m Bot</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
-/* ===== DESIGN TOKENS ===== */
+/* ===== DESIGN TOKENS (2026-07 refresh: graphite + violet/mint) ===== */
 :root {
-  --bg:        #0a0e17;
-  --bg2:       #0d1220;
-  --panel:     rgba(14, 20, 35, 0.75);
-  --panel2:    rgba(10, 15, 28, 0.9);
-  --glass:     rgba(20, 28, 50, 0.45);
-  --glass-border: rgba(255,255,255,0.06);
-  --line:      rgba(255,255,255,0.06);
-  --line2:     rgba(255,255,255,0.03);
-  --dim:       #5a6478;
-  --txt:       #e2e6ed;
-  --txt-soft:  #9aa3b4;
-  --accent:    #00d4ff;
-  --accent-dim:rgba(0,212,255,0.15);
-  --green:     #00ff88;
-  --green-dim: rgba(0,255,136,0.12);
-  --red:       #ff4757;
-  --red-dim:   rgba(255,71,87,0.12);
-  --amber:     #ffa502;
-  --amber-dim: rgba(255,165,2,0.12);
-  --radius:    12px;
-  --radius-sm: 8px;
+  --bg:        #07090f;
+  --bg2:       #0b0e18;
+  --panel:     rgba(17, 21, 36, 0.82);
+  --panel2:    rgba(11, 14, 26, 0.92);
+  --glass:     rgba(22, 27, 48, 0.55);
+  --glass-border: rgba(255,255,255,0.07);
+  --line:      rgba(255,255,255,0.07);
+  --line2:     rgba(255,255,255,0.035);
+  --dim:       #667089;
+  --txt:       #e8ecf4;
+  --txt-soft:  #a4adc2;
+  --accent:    #8b7bff;
+  --accent-dim:rgba(139,123,255,0.16);
+  --accent2:   #38e1c4;
+  --green:     #2eea9b;
+  --green-dim: rgba(46,234,155,0.12);
+  --red:       #ff5468;
+  --red-dim:   rgba(255,84,104,0.12);
+  --amber:     #ffb454;
+  --amber-dim: rgba(255,180,84,0.12);
+  --radius:    14px;
+  --radius-sm: 9px;
 }
 
 /* ===== RESET ===== */
@@ -844,8 +784,11 @@ body::before {
   content: '';
   position: fixed; top: 0; left: 0; right: 0; bottom: 0;
   background:
-    radial-gradient(ellipse 80% 60% at 20% 10%, rgba(0,212,255,0.04), transparent),
-    radial-gradient(ellipse 60% 50% at 80% 80%, rgba(0,255,136,0.03), transparent);
+    radial-gradient(ellipse 70% 55% at 15% 0%, rgba(139,123,255,0.07), transparent),
+    radial-gradient(ellipse 55% 45% at 85% 90%, rgba(56,225,196,0.05), transparent),
+    linear-gradient(rgba(255,255,255,0.012) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255,255,255,0.012) 1px, transparent 1px);
+  background-size: auto, auto, 44px 44px, 44px 44px;
   pointer-events: none; z-index: 0;
 }
 
@@ -873,19 +816,19 @@ body::before {
   100% { background-position: 0% 50%; }
 }
 @keyframes flash-row {
-  0%   { background: rgba(0,212,255,0.28); }
-  40%  { background: rgba(0,255,136,0.18); }
+  0%   { background: rgba(139,123,255,0.28); }
+  40%  { background: rgba(46,234,155,0.18); }
   100% { background: transparent; }
 }
 @keyframes page-flash {
-  0%   { box-shadow: inset 0 0 0 0 rgba(0,255,136,0); }
-  15%  { box-shadow: inset 0 0 0 3px rgba(0,255,136,0.85), 0 0 40px rgba(0,255,136,0.25); }
-  100% { box-shadow: inset 0 0 0 0 rgba(0,255,136,0); }
+  0%   { box-shadow: inset 0 0 0 0 rgba(46,234,155,0); }
+  15%  { box-shadow: inset 0 0 0 3px rgba(46,234,155,0.85), 0 0 40px rgba(46,234,155,0.25); }
+  100% { box-shadow: inset 0 0 0 0 rgba(46,234,155,0); }
 }
 @keyframes page-flash-down {
-  0%   { box-shadow: inset 0 0 0 0 rgba(255,71,87,0); }
-  15%  { box-shadow: inset 0 0 0 3px rgba(255,71,87,0.85), 0 0 40px rgba(255,71,87,0.25); }
-  100% { box-shadow: inset 0 0 0 0 rgba(255,71,87,0); }
+  0%   { box-shadow: inset 0 0 0 0 rgba(255,84,104,0); }
+  15%  { box-shadow: inset 0 0 0 3px rgba(255,84,104,0.85), 0 0 40px rgba(255,84,104,0.25); }
+  100% { box-shadow: inset 0 0 0 0 rgba(255,84,104,0); }
 }
 @keyframes toast-in {
   0%   { opacity: 0; transform: translateY(12px) scale(0.96); }
@@ -943,7 +886,7 @@ body::before {
   background: var(--panel2);
   color: var(--dim);
 }
-.badge.mode { color: var(--accent); border-color: rgba(0,212,255,0.2); background: rgba(0,212,255,0.06); }
+.badge.mode { color: var(--accent); border-color: rgba(139,123,255,0.2); background: rgba(139,123,255,0.06); }
 .badge.conn-badge { }
 .badge.clk { color: var(--green); font-family: 'JetBrains Mono', monospace; font-size: 11px; }
 
@@ -959,7 +902,7 @@ body::before {
   content: '';
   position: absolute; top: -1px; left: -1px; right: -1px; bottom: -1px;
   border-radius: var(--radius);
-  background: linear-gradient(135deg, rgba(0,212,255,0.15), transparent 40%, transparent 60%, rgba(0,255,136,0.1));
+  background: linear-gradient(135deg, rgba(139,123,255,0.15), transparent 40%, transparent 60%, rgba(46,234,155,0.1));
   z-index: -1;
   pointer-events: none;
 }
@@ -983,7 +926,7 @@ body::before {
 }
 .ctl-input:focus, .ctl-select:focus {
   border-color: var(--accent);
-  box-shadow: 0 0 0 2px rgba(0,212,255,0.15);
+  box-shadow: 0 0 0 2px rgba(139,123,255,0.15);
 }
 .ctl-check {
   display: flex; flex-direction: row; align-items: center; gap: 6px;
@@ -1006,17 +949,17 @@ body::before {
 .btn:active { transform: scale(0.96); }
 .btn:disabled { opacity: 0.35; cursor: not-allowed; transform: none; }
 .btn-start {
-  background: linear-gradient(135deg, #00ff88, #00cc6a);
+  background: linear-gradient(135deg, #2eea9b, #1fc985);
   color: #042010;
-  box-shadow: 0 2px 12px rgba(0,255,136,0.25);
+  box-shadow: 0 2px 12px rgba(46,234,155,0.25);
 }
-.btn-start:hover:not(:disabled) { box-shadow: 0 4px 20px rgba(0,255,136,0.4); filter: brightness(1.1); }
+.btn-start:hover:not(:disabled) { box-shadow: 0 4px 20px rgba(46,234,155,0.4); filter: brightness(1.1); }
 .btn-stop {
-  background: linear-gradient(135deg, #ff4757, #e03040);
+  background: linear-gradient(135deg, #ff5468, #e03040);
   color: #fff;
-  box-shadow: 0 2px 12px rgba(255,71,87,0.25);
+  box-shadow: 0 2px 12px rgba(255,84,104,0.25);
 }
-.btn-stop:hover:not(:disabled) { box-shadow: 0 4px 20px rgba(255,71,87,0.4); filter: brightness(1.1); }
+.btn-stop:hover:not(:disabled) { box-shadow: 0 4px 20px rgba(255,84,104,0.4); filter: brightness(1.1); }
 .ctl-status {
   font-size: 11px; color: var(--dim);
   margin-left: auto; align-self: center;
@@ -1072,19 +1015,20 @@ body::before {
   font-size: 11px; font-weight: 700; letter-spacing: 0.6px;
   border: 1px solid var(--glass-border);
 }
-.ph-analyzing, .ph-idle   { color: var(--green); border-color: rgba(0,255,136,0.25); background: var(--green-dim); }
-.ph-holding                { color: var(--amber); border-color: rgba(255,165,2,0.25); background: var(--amber-dim); animation: pulse-dot 2s ease-in-out infinite; }
-.ph-resolved               { color: var(--green); border-color: rgba(0,255,136,0.25); background: var(--green-dim); }
+.ph-analyzing, .ph-idle   { color: var(--green); border-color: rgba(46,234,155,0.25); background: var(--green-dim); }
+.ph-holding                { color: var(--amber); border-color: rgba(255,180,84,0.25); background: var(--amber-dim); animation: pulse-dot 2s ease-in-out infinite; }
+.ph-resolved               { color: var(--green); border-color: rgba(46,234,155,0.25); background: var(--green-dim); }
 .ph-waiting, .ph-searching, .ph-starting, .ph-stopped { color: var(--dim); }
-.ph-halted, .ph-error      { color: var(--red);   border-color: rgba(255,71,87,0.25); background: var(--red-dim); }
+.ph-halted, .ph-error      { color: var(--red);   border-color: rgba(255,84,104,0.25); background: var(--red-dim); }
 
 .count-live { color: var(--amber); }
-.count-soon { color: var(--red); text-shadow: 0 0 8px rgba(255,71,87,0.5); }
+.count-soon { color: var(--red); text-shadow: 0 0 8px rgba(255,84,104,0.5); }
 
 /* ===== STAT TILES ===== */
+/* auto-fit: render() emits 7 tiles — the old fixed 6-col grid orphaned one */
 .tiles {
   display: grid;
-  grid-template-columns: repeat(6, 1fr);
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
   gap: 10px;
   margin-bottom: 14px;
 }
@@ -1158,12 +1102,12 @@ body::before {
 .console-panel { animation: fadeInUp 0.4s ease-out 0.25s both; margin-bottom: 14px; }
 .console-body {
   background: #040710;
-  border: 1px solid rgba(0,212,255,0.05);
+  border: 1px solid rgba(139,123,255,0.05);
   border-radius: var(--radius-sm);
   padding: 12px 14px;
   font-family: 'JetBrains Mono', monospace;
   font-size: 11px;
-  color: #00ff88;
+  color: #2eea9b;
   line-height: 1.5;
   height: 150px;
   overflow-y: auto;
@@ -1173,8 +1117,8 @@ body::before {
 }
 .console-body::-webkit-scrollbar { width: 6px; }
 .console-body::-webkit-scrollbar-track { background: rgba(255,255,255,0.01); }
-.console-body::-webkit-scrollbar-thumb { background: rgba(0,212,255,0.15); border-radius: 3px; }
-.console-body::-webkit-scrollbar-thumb:hover { background: rgba(0,212,255,0.3); }
+.console-body::-webkit-scrollbar-thumb { background: rgba(139,123,255,0.15); border-radius: 3px; }
+.console-body::-webkit-scrollbar-thumb:hover { background: rgba(139,123,255,0.3); }
 
 /* ===== TRADE BLOTTER ===== */
 .blotter { animation: fadeInUp 0.4s ease-out 0.3s both; }
@@ -1197,7 +1141,7 @@ tbody td {
 }
 tbody tr { transition: background 0.2s; }
 tbody tr:nth-child(even) { background: rgba(255,255,255,0.015); }
-tbody tr:hover { background: rgba(0,212,255,0.05); }
+tbody tr:hover { background: rgba(139,123,255,0.05); }
 .flash-new { animation: flash-row 2.2s ease-out; }
 body.trade-flash-up { animation: page-flash 1.4s ease-out; }
 body.trade-flash-down { animation: page-flash-down 1.4s ease-out; }
@@ -1211,8 +1155,8 @@ body.trade-flash-lose { animation: page-flash-down 1.6s ease-out; }
 .toast {
   pointer-events: auto;
   background: rgba(10, 16, 28, 0.94);
-  border: 1px solid rgba(0,212,255,0.35);
-  border-left: 4px solid #00d4ff;
+  border: 1px solid rgba(139,123,255,0.35);
+  border-left: 4px solid #8b7bff;
   border-radius: 10px;
   padding: 12px 14px;
   box-shadow: 0 12px 40px rgba(0,0,0,0.45);
@@ -1220,10 +1164,10 @@ body.trade-flash-lose { animation: page-flash-down 1.6s ease-out; }
   font-size: 13px;
   color: #e8eef9;
 }
-.toast.up { border-left-color: #00ff88; }
-.toast.down { border-left-color: #ff4757; }
-.toast.won { border-left-color: #00ff88; }
-.toast.lost { border-left-color: #ff4757; }
+.toast.up { border-left-color: #2eea9b; }
+.toast.down { border-left-color: #ff5468; }
+.toast.won { border-left-color: #2eea9b; }
+.toast.lost { border-left-color: #ff5468; }
 .toast .t-title { font-weight: 700; letter-spacing: 0.3px; margin-bottom: 4px; }
 .toast .t-body { color: #9aa8c0; font-size: 12px; line-height: 1.4; }
 .toast .t-body a { color: #6ea8fe; }
@@ -1233,8 +1177,8 @@ body.trade-flash-lose { animation: page-flash-down 1.6s ease-out; }
 
 /* ===== LIVE WALLET WIZARD ===== */
 .live-wizard {
-  margin-top: 12px; padding: 16px 18px; border: 1px solid rgba(255,71,87,0.25);
-  background: linear-gradient(180deg, rgba(255,71,87,0.06), rgba(14,20,35,0.4));
+  margin-top: 12px; padding: 16px 18px; border: 1px solid rgba(255,84,104,0.25);
+  background: linear-gradient(180deg, rgba(255,84,104,0.06), rgba(14,20,35,0.4));
 }
 .live-wizard .lw-head {
   display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap;
@@ -1248,8 +1192,8 @@ body.trade-flash-lose { animation: page-flash-down 1.6s ease-out; }
   font-size: 11px; font-weight: 700; padding: 4px 10px; border-radius: 999px;
   border: 1px solid var(--line);
 }
-.live-wizard .lw-badge.ready { color: var(--green); border-color: rgba(0,255,136,0.35); background: var(--green-dim); }
-.live-wizard .lw-badge.blocked { color: var(--amber); border-color: rgba(255,165,2,0.35); background: var(--amber-dim); }
+.live-wizard .lw-badge.ready { color: var(--green); border-color: rgba(46,234,155,0.35); background: var(--green-dim); }
+.live-wizard .lw-badge.blocked { color: var(--amber); border-color: rgba(255,180,84,0.35); background: var(--amber-dim); }
 .lw-grid {
   display: grid; grid-template-columns: 1.1fr 1fr; gap: 16px;
 }
@@ -1268,8 +1212,8 @@ body.trade-flash-lose { animation: page-flash-down 1.6s ease-out; }
   display: flex; align-items: center; justify-content: center; font-size: 10px; font-weight: 700;
   border: 1px solid var(--line); color: var(--dim);
 }
-.lw-steps .dot.ok { color: var(--green); border-color: rgba(0,255,136,0.4); background: var(--green-dim); }
-.lw-steps .dot.na { color: var(--amber); border-color: rgba(255,165,2,0.35); }
+.lw-steps .dot.ok { color: var(--green); border-color: rgba(46,234,155,0.4); background: var(--green-dim); }
+.lw-steps .dot.na { color: var(--amber); border-color: rgba(255,180,84,0.35); }
 .lw-field { margin-bottom: 10px; }
 .lw-field label { display: block; font-size: 11px; color: var(--dim); margin-bottom: 4px; font-weight: 600; }
 .lw-field input, .lw-field select, .lw-field textarea {
@@ -1277,22 +1221,22 @@ body.trade-flash-lose { animation: page-flash-down 1.6s ease-out; }
   color: var(--txt); border-radius: 8px; padding: 8px 10px; font-size: 13px;
   font-family: 'JetBrains Mono', monospace;
 }
-.lw-field input:focus, .lw-field select:focus { outline: none; border-color: rgba(0,212,255,0.45); }
+.lw-field input:focus, .lw-field select:focus { outline: none; border-color: rgba(139,123,255,0.45); }
 .lw-row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 .lw-help {
   font-size: 12px; color: var(--txt-soft); line-height: 1.45; margin-top: 8px;
-  padding: 10px; border-radius: 8px; background: rgba(0,212,255,0.05); border: 1px solid rgba(0,212,255,0.12);
+  padding: 10px; border-radius: 8px; background: rgba(139,123,255,0.05); border: 1px solid rgba(139,123,255,0.12);
 }
 .lw-help ol { margin: 6px 0 0 18px; }
 .lw-help li { margin: 3px 0; }
 .lw-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; align-items: center; }
 .btn-live {
-  background: linear-gradient(135deg, #ff4757, #c0392b); color: #fff; border: none;
+  background: linear-gradient(135deg, #ff5468, #c0392b); color: #fff; border: none;
   font-weight: 700; padding: 9px 14px; border-radius: 8px; cursor: pointer;
 }
 .btn-live:disabled { opacity: 0.45; cursor: not-allowed; }
 .btn-save {
-  background: var(--accent-dim); color: var(--accent); border: 1px solid rgba(0,212,255,0.35);
+  background: var(--accent-dim); color: var(--accent); border: 1px solid rgba(139,123,255,0.35);
   font-weight: 600; padding: 9px 14px; border-radius: 8px; cursor: pointer;
 }
 .btn-ghost {
@@ -1306,14 +1250,14 @@ body.trade-flash-lose { animation: page-flash-down 1.6s ease-out; }
 .lw-ack { display: flex; gap: 8px; align-items: flex-start; font-size: 12px; color: var(--txt-soft); margin-top: 8px; }
 .lw-ack input { margin-top: 3px; }
 .mode-live-opt { color: #ff8a95; }
-.live-gates { display: none; margin-top: 10px; padding-top: 10px; border-top: 1px dashed rgba(255,71,87,0.25); }
+.live-gates { display: none; margin-top: 10px; padding-top: 10px; border-top: 1px dashed rgba(255,84,104,0.25); }
 .live-gates.on { display: block; }
 
 /* ===== STRATEGY SETTINGS ===== */
 .settings-panel {
   margin-top: 12px; padding: 16px 18px;
-  border: 1px solid rgba(0,212,255,0.18);
-  background: linear-gradient(180deg, rgba(0,212,255,0.05), rgba(14,20,35,0.35));
+  border: 1px solid rgba(139,123,255,0.18);
+  background: linear-gradient(180deg, rgba(139,123,255,0.05), rgba(14,20,35,0.35));
 }
 .settings-panel .sp-head {
   display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap;
@@ -1326,7 +1270,7 @@ body.trade-flash-lose { animation: page-flash-down 1.6s ease-out; }
   background: rgba(0,0,0,0.3); border: 1px solid var(--line); color: var(--txt-soft);
   padding: 6px 12px; border-radius: 999px; cursor: pointer; font-size: 12px; font-weight: 600;
 }
-.sp-tab.on { color: var(--accent); border-color: rgba(0,212,255,0.45); background: var(--accent-dim); }
+.sp-tab.on { color: var(--accent); border-color: rgba(139,123,255,0.45); background: var(--accent-dim); }
 .sp-group { display: none; }
 .sp-group.on { display: block; }
 .sp-grid {
@@ -1341,7 +1285,7 @@ body.trade-flash-lose { animation: page-flash-down 1.6s ease-out; }
   color: var(--txt); border-radius: 8px; padding: 8px 10px; font-size: 13px;
   font-family: 'JetBrains Mono', monospace;
 }
-.sp-field input:focus, .sp-field select:focus { outline: none; border-color: rgba(0,212,255,0.45); }
+.sp-field input:focus, .sp-field select:focus { outline: none; border-color: rgba(139,123,255,0.45); }
 .sp-field .hint { font-size: 10.5px; color: var(--dim); margin-top: 3px; line-height: 1.3; min-height: 1.2em; }
 .sp-field.bool { display: flex; flex-direction: column; justify-content: flex-end; }
 .sp-field.bool .bool-row { display: flex; align-items: center; gap: 8px; padding: 8px 0; }
@@ -1354,6 +1298,7 @@ body.trade-flash-lose { animation: page-flash-down 1.6s ease-out; }
 
 .up    { color: var(--green); }
 .down  { color: var(--red); }
+.arb   { color: var(--accent2); font-weight: 600; }
 .won   { color: var(--green); }
 .lost  { color: var(--red); }
 .empty-msg { color: var(--dim); font-size: 12.5px; padding: 28px; text-align: center; font-family: 'Inter', sans-serif; }
@@ -1381,7 +1326,8 @@ body.trade-flash-lose { animation: page-flash-down 1.6s ease-out; }
   <div class="header glass-card">
     <div class="brand">
       <span class="brand-icon">&#9889;</span>
-      <span class="brand-text">POLYMARKET <span>BTC BOT</span></span>
+      <span class="brand-text">MOMENTUM <span>DESK</span></span>
+      <span class="badge" title="mid / late_scalp / late_every / hybrid retired 2026-07-17">late_momentum + arb</span>
     </div>
     <div class="header-right">
       <span class="badge mode" id="mode">MODE: —</span>
@@ -1413,11 +1359,7 @@ body.trade-flash-lose { animation: page-flash-down 1.6s ease-out; }
       <div class="ctl-field">
         <span class="ctl-label">Strategy</span>
         <select id="c-strategy" class="ctl-select">
-          <option value="mid">mid · edge / fair-value mid-slot</option>
-          <option value="late_scalp">late_scalp · selective favorites (~0.90+)</option>
-          <option value="late_every">late_every · bet almost every 5m slot</option>
-          <option value="late_momentum">late_momentum · breakout move in last minute</option>
-          <option value="hybrid">hybrid · late preferred, strict mid if exceptional</option>
+          <option value="late_momentum">late_momentum · move vs strike, last 40s (+ arb scanner)</option>
         </select>
       </div>
       <div class="ctl-field">
@@ -1460,10 +1402,8 @@ body.trade-flash-lose { animation: page-flash-down 1.6s ease-out; }
     </div>
     <div id="sp-body">
       <div class="sp-tabs" id="sp-tabs">
-        <button type="button" class="sp-tab on" data-g="late">Late scalp</button>
-        <button type="button" class="sp-tab" data-g="late_momentum">Late Momentum</button>
-        <button type="button" class="sp-tab" data-g="mid">Mid</button>
-        <button type="button" class="sp-tab" data-g="hybrid">Hybrid</button>
+        <button type="button" class="sp-tab on" data-g="late_momentum">Late Momentum</button>
+        <button type="button" class="sp-tab" data-g="arb">Arbitrage</button>
         <button type="button" class="sp-tab" data-g="risk">Risk</button>
         <button type="button" class="sp-tab" data-g="general">General</button>
       </div>
@@ -1471,10 +1411,7 @@ body.trade-flash-lose { animation: page-flash-down 1.6s ease-out; }
       <div class="sp-actions">
         <button type="button" class="btn-save" id="sp-save">Save settings to .env</button>
         <button type="button" class="btn-ghost" id="sp-reload">Reload from .env</button>
-        <button type="button" class="btn-ghost" id="sp-preset-late-every">Preset: late EVERY 5m slot</button>
-        <button type="button" class="btn-ghost" id="sp-preset-late90">Preset: late 0.90–0.95 profit</button>
-        <button type="button" class="btn-ghost" id="sp-preset-late-strict">Preset: late strict 0.93–0.96</button>
-        <button type="button" class="btn-ghost" id="sp-preset-mid-active">Preset: mid paper-active</button>
+        <button type="button" class="btn-ghost" id="sp-preset-momentum">Preset: momentum · archive-tuned</button>
       </div>
       <div class="sp-msg" id="sp-msg"></div>
       <p class="sp-note" id="sp-note">Changes apply after you <b>Stop</b> and <b>Start</b> the bot (child process reads .env on launch).</p>
@@ -1575,7 +1512,7 @@ body.trade-flash-lose { animation: page-flash-down 1.6s ease-out; }
       <span class="sb-v big mono" id="sb-count">--:--</span>
     </div>
     <div class="sb-item">
-      <span class="sb-k">BTC Spot</span>
+      <span class="sb-k">Spot Price</span>
       <span class="sb-v big mono" id="sb-btc">—</span>
     </div>
     <div class="sb-item">
@@ -1611,14 +1548,16 @@ body.trade-flash-lose { animation: page-flash-down 1.6s ease-out; }
       </div>
     </div>
     <div class="panel glass-card strat animate-in delay-4">
-      <div class="phead"><span>Strategy</span><span>Momentum · Kelly</span></div>
+      <div class="phead"><span>Strategy</span><span>Momentum + Arb</span></div>
       <div class="pbody">
-        <div class="lbl">Signal</div>
-        <p>Predict BTC <span class="up">UP</span>/<span class="down">DOWN</span> over the next 5 min from short-term momentum; trade only when model edge &gt; threshold.</p>
+        <div class="lbl">Late Momentum</div>
+        <p>In the last ~40s of each 5-min slot: if spot moved past the Chainlink strike by the min move, buy <span class="up">UP</span>/<span class="down">DOWN</span> in the 0.55–0.92 ask band. Edge floor <i>and</i> ceiling — a model far above the book usually means a stale strike.</p>
+        <div class="lbl">Sum-to-one Arb</div>
+        <p>Whenever <span class="arb">ask UP + ask DOWN &lt; $1</span>, buy both sides — one leg pays $1/share either way (paper-only execution; live logs signals).</p>
         <div class="lbl">Risk</div>
-        <p>Fractional Kelly sizing · exposure cap · daily-loss circuit breaker.</p>
+        <p>Edge-scaled sizing · exposure caps · loss cooldown · daily-loss circuit breaker. Background settlement keeps the loop watching every slot.</p>
         <div class="lbl">Data Source</div>
-        <p id="datanote">Real BTC spot + real Polymarket order-book midpoint. Fills simulated in paper-live mode.</p>
+        <p id="datanote">Chainlink Data Streams (Polymarket's oracle) + real order books. Paper fills pay ask + slippage.</p>
       </div>
     </div>
   </div>
@@ -1667,10 +1606,20 @@ function fmtUsd(n) {
   });
 }
 
-/* ===== CLIENT-SIDE BTC SPOT TICKER ===== */
+/* ===== CLIENT-SIDE SPOT TICKER (asset-aware — was hardcoded to BTC) ===== */
+const PYTH_FEEDS = {
+  btc: '0xe62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43',
+  eth: '0xff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0aec',
+  sol: '0xef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d',
+};
+function currentAsset() {
+  const el = document.getElementById('c-asset');
+  const a = el ? String(el.value).toLowerCase() : 'btc';
+  return PYTH_FEEDS[a] ? a : 'btc';
+}
 async function fetchClientBtcPrice() {
   try {
-    const r = await fetch('https://hermes.pyth.network/v2/updates/price/latest?ids[]=0xe62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43');
+    const r = await fetch('https://hermes.pyth.network/v2/updates/price/latest?ids[]=' + PYTH_FEEDS[currentAsset()]);
     if (r.ok) {
       const res = await r.json();
       const parsed = res.parsed[0].price;
@@ -1862,7 +1811,7 @@ function renderStatus(st) {
 
   const sig = document.getElementById('sb-signal');
   if (st.side) {
-    const cls = st.side === 'UP' ? 'up' : 'down';
+    const cls = st.side === 'ARB' ? 'arb' : (st.side === 'UP' ? 'up' : 'down');
     const edge = (st.edge != null) ? (' ' + (st.edge >= 0 ? '+' : '') + Number(st.edge).toFixed(2) + 'e') : '';
     sig.innerHTML = `<span class="${cls}">${st.side}</span>` +
       (st.mkt != null ? ` @ ${Number(st.mkt).toFixed(2)}` : '') +
@@ -1903,7 +1852,7 @@ function drawCurve(trades, start) {
   let eq = [start];
   trades.forEach(t => eq.push(t.bankroll_after));
   if (eq.length < 2) {
-    svg.innerHTML = `<text x="${W/2}" y="${H/2}" fill="#5a6478" font-family="Inter" font-size="13" text-anchor="middle">Equity data will appear here…</text>`;
+    svg.innerHTML = `<text x="${W/2}" y="${H/2}" fill="#667089" font-family="Inter" font-size="13" text-anchor="middle">Equity data will appear here…</text>`;
     return;
   }
   const min = Math.min(...eq), max = Math.max(...eq), span = (max - min) || 1;
@@ -1911,8 +1860,8 @@ function drawCurve(trades, start) {
   const y = v => pad + (1 - (v - min) / span) * (H - 2 * pad);
   const pts = eq.map((v, i) => x(i) + ',' + y(v)).join(' ');
   const last = eq[eq.length - 1], up = last >= start;
-  const col = up ? '#00ff88' : '#ff4757';
-  const colDim = up ? 'rgba(0,255,136,0.10)' : 'rgba(255,71,87,0.10)';
+  const col = up ? '#2eea9b' : '#ff5468';
+  const colDim = up ? 'rgba(46,234,155,0.10)' : 'rgba(255,84,104,0.10)';
   const area = `${pad},${H - pad} ${pts} ${W - pad},${H - pad}`;
   const baseY = y(start);
   const gradId = 'eq-grad';
@@ -1929,7 +1878,7 @@ function drawCurve(trades, start) {
     `<polyline points="${pts}" fill="none" stroke="${col}" stroke-width="2.5" ` +
     `stroke-linejoin="round" stroke-linecap="round"/>` +
     `<circle cx="${x(eq.length-1)}" cy="${y(last)}" r="4" fill="${col}" ` +
-    `stroke="#0a0e17" stroke-width="2">` +
+    `stroke="#07090f" stroke-width="2">` +
     `<animate attributeName="r" values="4;6;4" dur="2s" repeatCount="indefinite"/>` +
     `</circle>`;
 }
@@ -1997,7 +1946,7 @@ function render(stats, trades) {
     return;
   }
   tb.innerHTML = rows.map((t, i) => {
-    const sideCls = t.side === 'UP' ? 'up' : 'down';
+    const sideCls = t.side === 'ARB' ? 'arb' : (t.side === 'UP' ? 'up' : 'down');
     const outCls  = t.outcome === 'UP' ? 'up' : 'down';
     const wl      = t.won ? 'won' : 'lost';
     const flash   = (i === 0 && t.round_id !== lastTopRound) ? 'flash-new' : '';
@@ -2182,7 +2131,7 @@ function syncLiveGates() {
   const startBtn = document.getElementById('c-start');
   if (mode === 'live') {
     startBtn.textContent = '▶ Start LIVE';
-    startBtn.style.background = 'linear-gradient(135deg,#ff4757,#c0392b)';
+    startBtn.style.background = 'linear-gradient(135deg,#ff5468,#c0392b)';
   } else {
     startBtn.textContent = '▶ Start';
     startBtn.style.background = '';
@@ -2402,37 +2351,7 @@ document.getElementById('lw-toggle').onclick = () => {
 
 /* ===== STRATEGY SETTINGS UI ===== */
 let settingsSchema = null;
-let settingsActiveGroup = 'late';
-
-function updateTabsVisibility(strat) {
-  let allowed = [];
-  const s = String(strat || 'mid').toLowerCase();
-  if (s === 'mid') {
-    allowed = ['mid', 'risk', 'general'];
-  } else if (s === 'late_scalp' || s === 'late_every') {
-    allowed = ['late', 'risk', 'general'];
-  } else if (s === 'late_momentum') {
-    allowed = ['late_momentum', 'risk', 'general'];
-  } else if (s === 'hybrid') {
-    allowed = ['mid', 'late', 'hybrid', 'risk', 'general'];
-  } else {
-    allowed = ['mid', 'late', 'late_momentum', 'hybrid', 'risk', 'general'];
-  }
-
-  let firstVisible = null;
-  document.querySelectorAll('.sp-tab').forEach(btn => {
-    const g = btn.dataset.g;
-    const ok = allowed.includes(g);
-    btn.style.display = ok ? '' : 'none';
-    if (ok && !firstVisible) {
-      firstVisible = btn;
-    }
-  });
-
-  if (!allowed.includes(settingsActiveGroup) && firstVisible) {
-    firstVisible.click();
-  }
-}
+let settingsActiveGroup = 'late_momentum';
 
 function _spVal(field) {
   const el = document.getElementById('sf-' + field.key);
@@ -2465,14 +2384,18 @@ function renderSettings(data) {
           ${hint}</div>`;
       }
       if (f.key === 'STRATEGY') {
-        const v = f.value || 'mid';
         return `<div class="sp-field"><label>${f.label}</label>
           <select id="${id}">
-            <option value="mid" ${v==='mid'?'selected':''}>mid</option>
-            <option value="late_scalp" ${v==='late_scalp'?'selected':''}>late_scalp (selective)</option>
-            <option value="late_every" ${v==='late_every'?'selected':''}>late_every (every 5m)</option>
-            <option value="late_momentum" ${v==='late_momentum'?'selected':''}>late_momentum (last minute move)</option>
-            <option value="hybrid" ${v==='hybrid'?'selected':''}>hybrid</option>
+            <option value="late_momentum" selected>late_momentum (only strategy)</option>
+          </select>${hint}</div>`;
+      }
+      if (f.key === 'ASSET') {
+        const v = String(f.value || 'btc').toLowerCase();
+        return `<div class="sp-field"><label>${f.label}</label>
+          <select id="${id}">
+            <option value="btc" ${v==='btc'?'selected':''}>btc</option>
+            <option value="eth" ${v==='eth'?'selected':''}>eth</option>
+            <option value="sol" ${v==='sol'?'selected':''}>sol</option>
           </select>${hint}</div>`;
       }
       const step = f.type === 'int' ? '1' : 'any';
@@ -2486,16 +2409,6 @@ function renderSettings(data) {
     t.classList.toggle('on', t.dataset.g === settingsActiveGroup);
   });
   if (data.note) document.getElementById('sp-note').textContent = data.note;
-  // Sync Start panel strategy menu
-  const stratField = (data.fields || []).find(f => f.key === 'STRATEGY');
-  const everyField = (data.fields || []).find(f => f.key === 'LATE_SCALP_EVERY_SLOT');
-  let strat = stratField ? String(stratField.value || 'mid') : 'mid';
-  const everyOn = everyField && ['1','true','yes','on'].includes(String(everyField.value).toLowerCase());
-  if (strat === 'late_scalp' && everyOn) strat = 'late_every';
-  const cStrat = document.getElementById('c-strategy');
-  if (cStrat && [...cStrat.options].some(o => o.value === strat)) {
-    cStrat.value = strat;
-  }
   // Sync Start panel asset menu
   const assetField = (data.fields || []).find(f => f.key === 'ASSET');
   let asset = assetField ? String(assetField.value || 'btc').toLowerCase() : 'btc';
@@ -2503,7 +2416,6 @@ function renderSettings(data) {
   if (cAsset && [...cAsset.options].some(o => o.value === asset)) {
     cAsset.value = asset;
   }
-  updateTabsVisibility(strat);
 }
 
 async function loadSettings() {
@@ -2579,93 +2491,27 @@ document.getElementById('sp-toggle').onclick = () => {
   body.style.display = hide ? 'none' : '';
   btn.textContent = hide ? 'Show' : 'Hide';
 };
-document.getElementById('sp-preset-late-every').onclick = () => saveSettings({
-  STRATEGY: 'late_every',
-  LATE_SCALP_EVERY_SLOT: '1',
-  LATE_SCALP_MIN_ENTRY: '0.88',
-  LATE_SCALP_MAX_ENTRY: '0.95',
-  LATE_SCALP_PREFER_MAX: '0.95',
-  LATE_SCALP_MIN_REMAINING: '8',
-  LATE_SCALP_MAX_REMAINING: '20',
-  LATE_SCALP_MIN_FAVORITE_LEAD: '0.10',
-  LATE_SCALP_MAX_UNDERDOG_ASK: '0.42',
-  LATE_SCALP_REQUIRE_SPOT_ALIGN: '1',
-  LATE_SCALP_SPOT_ALIGN_EPS_USD: '10',
-  LATE_SCALP_REQUOTE: '1',
-  LATE_SCALP_PAUSE_SLOTS_AFTER_LOSS: '2',
-  LATE_SCALP_MAX_STAKE_USD: '5.0',
-  LATE_SCALP_MAX_SPREAD: '0.10',
-  LATE_SCALP_MIN_MOVE_USD: '8.0',
+// Values the trade-archive bucket analysis supported (2026-07-17):
+// entries <= 0.92 carried the profit; huge model edges were anti-predictive.
+document.getElementById('sp-preset-momentum').onclick = () => saveSettings({
+  STRATEGY: 'late_momentum',
+  LATE_MOMENTUM_MIN_MOVE: '10.0',
+  LATE_MOMENTUM_TIME_LIMIT: '40',
+  LATE_MOMENTUM_MIN_REMAINING: '8',
+  LATE_MOMENTUM_BIDIRECTIONAL: '1',
+  LATE_MOMENTUM_MIN_ENTRY: '0.55',
+  LATE_MOMENTUM_MAX_ENTRY: '0.92',
+  LATE_MOMENTUM_MIN_EDGE: '0.0',
+  LATE_MOMENTUM_MAX_EDGE: '0.10',
   LATE_SCALP_REQUIRE_CHAINLINK: '1',
-  LATE_SCALP_MIN_EDGE: '0.02',
-  LATE_SCALP_USE_EDGE_SIZING: '1',
-});
-document.getElementById('sp-preset-late90').onclick = () => saveSettings({
-  STRATEGY: 'late_scalp',
-  LATE_SCALP_EVERY_SLOT: '0',
-  LATE_SCALP_MIN_ENTRY: '0.88',
-  LATE_SCALP_MAX_ENTRY: '0.99',
-  LATE_SCALP_PREFER_MAX: '0.95',
-  LATE_SCALP_MIN_REMAINING: '10',
-  LATE_SCALP_MAX_REMAINING: '45',
-  LATE_SCALP_MIN_FAVORITE_LEAD: '0.50',
-  LATE_SCALP_MAX_UNDERDOG_ASK: '0.14',
-  LATE_SCALP_REQUIRE_SPOT_ALIGN: '1',
-  LATE_SCALP_SPOT_ALIGN_EPS_USD: '8',
-  LATE_SCALP_KEEP_FIRST_ASK: '1',
   LATE_SCALP_REQUOTE: '1',
+  LATE_SCALP_MAX_SPREAD: '0.10',
   LATE_SCALP_MAX_STAKE_USD: '5.0',
-});
-document.getElementById('sp-preset-late-strict').onclick = () => saveSettings({
-  STRATEGY: 'late_scalp',
-  LATE_SCALP_EVERY_SLOT: '0',
-  LATE_SCALP_MIN_ENTRY: '0.93',
-  LATE_SCALP_MAX_ENTRY: '0.96',
-  LATE_SCALP_PREFER_MAX: '0.96',
-  LATE_SCALP_MIN_FAVORITE_LEAD: '0.70',
-  LATE_SCALP_MAX_UNDERDOG_ASK: '0.08',
-  LATE_SCALP_MAX_REMAINING: '22',
-  LATE_SCALP_REQUIRE_SPOT_ALIGN: '1',
-  LATE_SCALP_REQUOTE: '1',
-});
-document.getElementById('sp-preset-mid-active').onclick = () => saveSettings({
-  STRATEGY: 'mid',
-  MIN_ENTRY_PRICE: '0.22',
-  MAX_ENTRY_PRICE: '0.72',
-  EDGE_THRESHOLD: '0.04',
-  MIN_EV: '0.02',
-  MIN_MOVE_USD: '5',
-  MID_NOISE_MOVE_CAP: '0',
-  MID_REQUIRE_CHAINLINK_STRIKE: '0',
-  MID_MIN_MODEL: '0.52',
-  MID_MAX_MODEL: '0.95',
-});
-
-// Save settings before start so bands always match UI
-const _origStart = document.getElementById('c-start').onclick;
-document.getElementById('c-start').addEventListener('click', async (ev) => {
-  // Auto-sync strategy menu → .env (late_every also flips EVERY_SLOT)
-  try {
-    const strat = document.getElementById('c-strategy').value;
-    const settings = { STRATEGY: strat };
-    if (strat === 'late_every') settings.LATE_SCALP_EVERY_SLOT = '1';
-    if (strat === 'late_scalp') settings.LATE_SCALP_EVERY_SLOT = '0';
-    await fetch('/api/settings', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ settings }),
-    });
-  } catch (e) {}
-}, true);
-
-// When user changes strategy dropdown, reflect late_every in settings form if open
-document.getElementById('c-strategy').addEventListener('change', () => {
-  const strat = document.getElementById('c-strategy').value;
-  const el = document.getElementById('sf-STRATEGY');
-  if (el) el.value = strat;
-  const every = document.getElementById('sf-LATE_SCALP_EVERY_SLOT');
-  if (every) every.checked = (strat === 'late_every');
-  updateTabsVisibility(strat);
+  LATE_SCALP_PAUSE_SLOTS_AFTER_LOSS: '2',
+  ARB_TRADE_ENABLED: '1',
+  ARB_MIN_EDGE: '0.02',
+  ARB_MAX_STAKE_USD: '10.0',
+  ARB_MIN_REMAINING: '20',
 });
 
 loadSettings();
