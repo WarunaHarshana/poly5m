@@ -326,6 +326,7 @@ def run_sim(rounds: int = 200, sleep_between: float = 0.0, seed: int = 42):
     trades: list[Trade] = []
     skips = {"no_edge": 0}
     write_status(phase="running", message="offline simulation")
+    persist(trades, risk, skips)  # clean slate visible immediately after --reset
 
     for rid in range(1, rounds + 1):
         if risk.halted:
@@ -669,6 +670,11 @@ async def run_realtime(rounds: int = 100, paper: bool = True):
     arb_done_end_ts = None      # arb: at most one attempt per slot
     early_seen_end_ts = None    # count slot_too_early once per slot
 
+    # Write fresh (empty) trades/stats immediately so a --reset start shows a
+    # clean dashboard right away — previously the files only appeared after
+    # the FIRST settled trade, and the UI kept showing the old session.
+    persist(trades, risk, skips)
+
     async def _settle_trade(trade, stake, shares, order_id, market, question,
                             end_ts, slot_start_time, slot_open_ref, strike_src,
                             price_before, was_late, mkt, edge):
@@ -892,6 +898,15 @@ async def run_realtime(rounds: int = 100, paper: bool = True):
         print(f"  [arb] sum-to-one edge={arb['edge']:+.3f} "
               f"UP@{arb['ask_up']:.3f}+DOWN@{arb['ask_down']:.3f}="
               f"{arb['sum']:.3f}")
+        # Too-good-to-be-true gate: a 15c+ "free" gap is makers pulling quotes
+        # (dust levels), not a real fill. R8-style +$5.87 outliers were paper
+        # fiction — a live taker would catch pennies of it.
+        max_edge = float(getattr(config, "ARB_MAX_EDGE", 0.15) or 0)
+        if max_edge > 0 and float(arb["edge"]) > max_edge:
+            print(f"  [arb] edge {arb['edge']:+.3f} > {max_edge:.2f} — "
+                  f"degenerate/emptying book, not a fillable arb; skip")
+            skips["arb_thin"] = skips.get("arb_thin", 0) + 1
+            return False
         try:
             _journal(
                 _ensure_session_id(),
@@ -911,23 +926,35 @@ async def run_realtime(rounds: int = 100, paper: bool = True):
             return False
 
         slip = float(getattr(config, "PAPER_FILL_SLIPPAGE", 0.01) or 0.0)
-        pair_cost = (float(arb["ask_up"]) + slip) + (float(arb["ask_down"]) + slip)
-        edge_after = 1.0 - pair_cost
-        # Require a meaningful LOCKED edge after slippage — razor-thin pairs
-        # (+$0.005) don't survive real-world fees/fills, and counting them
-        # in paper flatters the strategy.
+        leg_up = float(arb["ask_up"]) + slip
+        leg_dn = float(arb["ask_down"]) + slip
+        pair_cost = leg_up + leg_dn
+        # REAL taker fees (verified live: crypto_fees_v2, rate*min(p,1-p) per
+        # share, per leg). Near 0.5/0.5 books this is ~6.6c/pair — it kills
+        # thin arbs, so it must be inside the gate, not discovered live.
+        fee_rate = float(market.get("fee_rate")
+                         if market.get("fee_rate") is not None
+                         else getattr(config, "TAKER_FEE_RATE", 0.07))
+        fee_pair = (config.taker_fee_per_share(leg_up, fee_rate)
+                    + config.taker_fee_per_share(leg_dn, fee_rate))
+        edge_after = 1.0 - pair_cost - fee_pair
         min_locked = max(0.005, float(getattr(config, "ARB_MIN_LOCKED_EDGE", 0.02) or 0.0))
         if edge_after < min_locked:
             print(f"  [arb] locked edge {edge_after:+.3f} < {min_locked:.3f} "
-                  f"after slippage (pair=${pair_cost:.3f}); skip")
+                  f"after slippage+fees (pair=${pair_cost:.3f} "
+                  f"fees=${fee_pair:.3f}/pair rate={fee_rate:.2f}); skip")
             skips["arb_thin"] = skips.get("arb_thin", 0) + 1
             return False
 
         shares = arb_max_stake / pair_cost
-        # Depth: take at most half of the thinner visible ask level.
-        for sz in (arb.get("up_size"), arb.get("down_size")):
-            if sz is not None and sz > 0:
-                shares = min(shares, sz * 0.5)
+        up_sz, dn_sz = arb.get("up_size"), arb.get("down_size")
+        if up_sz is None or dn_sz is None:
+            # Can't verify depth on both legs — size at the venue minimum
+            # only, never full stake into an unverifiable book.
+            shares = min(shares, float(getattr(config, "MIN_ORDER_SHARES", 5) or 5))
+        else:
+            # Take at most half of each visible ask level.
+            shares = min(shares, float(up_sz) * 0.5, float(dn_sz) * 0.5)
         min_sh = float(getattr(config, "MIN_ORDER_SHARES", 5) or 5)
         if shares < min_sh:
             if getattr(config, "ENFORCE_MIN_SHARES", True):
@@ -956,7 +983,8 @@ async def run_realtime(rounds: int = 100, paper: bool = True):
             shares=shares,                    # PAIRS of contracts
             stake_usd=stake,
             model_prob=1.0,                   # pays whichever way it resolves
-            edge=round(edge_after, 4),
+            edge=round(edge_after, 4),        # locked edge net of slip + fees
+            fee_usd=round(shares * fee_pair, 4),
             slug=market.get("slug") or "",
             question=question,
             slot_start_ts=slot_start_time,
@@ -1170,9 +1198,9 @@ async def run_realtime(rounds: int = 100, paper: bool = True):
                     has_cl = bool(
                         cl_stream.ready and (
                             cl_stream.price_at_or_before(
-                                float(slot_start_time), max_age_s=30.0)
+                                float(slot_start_time), max_age_s=60.0)
                             or cl_stream.price_at(
-                                float(slot_start_time), max_skew_s=15.0)
+                                float(slot_start_time), max_skew_s=20.0)
                         )
                     )
                     strike_src = ("chainlink-data-stream" if has_cl
@@ -1329,12 +1357,20 @@ async def run_realtime(rounds: int = 100, paper: bool = True):
         )
         model_side_prob = fv.fair_prob_up if side == "UP" else (1.0 - fv.fair_prob_up)
         edge = model_side_prob - mkt
+        # Net edge after the REAL taker fee (rate*min(p,1-p)/share). At 0.85
+        # that's ~1c/share; at 0.60 it's ~2.8c — cheap entries pay the most.
+        fee_rate = float(market.get("fee_rate")
+                         if market.get("fee_rate") is not None
+                         else getattr(config, "TAKER_FEE_RATE", 0.07))
+        fee_ps = config.taker_fee_per_share(mkt, fee_rate)
+        edge_net = edge - fee_ps
 
-        if lm_min_edge != 0.0 and edge < lm_min_edge:
+        if lm_min_edge != 0.0 and edge_net < lm_min_edge:
             if await _late_skip(
                 "no_edge",
-                f"edge {edge:.3f} < floor {lm_min_edge:.3f} "
-                f"(model {model_side_prob:.3f} vs ask {mkt:.3f})",
+                f"net edge {edge_net:.3f} < floor {lm_min_edge:.3f} "
+                f"(model {model_side_prob:.3f} vs ask {mkt:.3f} "
+                f"+ fee {fee_ps:.3f}/sh)",
                 retry=True,
             ) == "retry":
                 continue
@@ -1353,12 +1389,13 @@ async def run_realtime(rounds: int = 100, paper: bool = True):
                 continue
             continue
 
-        stake = risk.size_late_scalp(mkt, edge=max(edge, 0.0))
+        stake = risk.size_late_scalp(mkt, edge=max(edge_net, 0.0))
 
         ask_sz = q.get("ask_size")
         print(f"  [late_momentum] side={side} strike=${slot_open_ref:.2f} "
               f"spot=${price_now:.2f} price_60s_ago=${price_60s_ago:.2f} "
-              f"gap=${diff:+.2f} ask={mkt:.3f} edge={edge:.3f} stake=${stake:.2f}")
+              f"gap=${diff:+.2f} ask={mkt:.3f} edge={edge:.3f} "
+              f"(net {edge_net:.3f} after fee {fee_ps:.3f}/sh) stake=${stake:.2f}")
         write_status(
             phase="analyzing", btc_price=round(price_now, 2),
             side=side, model=round(model_side_prob, 4),
@@ -1429,6 +1466,7 @@ async def run_realtime(rounds: int = 100, paper: bool = True):
             stake_usd=stake,
             model_prob=round(model_side_prob, 4),
             edge=round(edge, 4),
+            fee_usd=round(shares * config.taker_fee_per_share(fill_px, fee_rate), 4),
             slug=market.get("slug") or "",
             question=question,
             slot_start_ts=slot_start_time,

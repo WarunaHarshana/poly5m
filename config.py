@@ -237,9 +237,12 @@ LATE_MOMENTUM_MAX_CHOP = int(os.getenv("LATE_MOMENTUM_MAX_CHOP", "3"))
 # Execution is PAPER-ONLY: live needs both legs to fill (leg risk unhandled).
 ARB_TRADE_ENABLED = _env_bool("ARB_TRADE_ENABLED", True)
 ARB_MAX_STAKE_USD = float(os.getenv("ARB_MAX_STAKE_USD", "10.0"))
-# Minimum LOCKED profit per pair after simulated slippage (real fees/fills
-# would eat razor-thin pairs; don't let paper count them).
+# Minimum LOCKED profit per pair after simulated slippage AND taker fees
+# (real fees eat razor-thin pairs; don't let paper count them).
 ARB_MIN_LOCKED_EDGE = float(os.getenv("ARB_MIN_LOCKED_EDGE", "0.02"))
+# Raw edges above this are makers pulling quotes (dust levels), not fillable
+# arbs — skip as too-good-to-be-true. 0 = off.
+ARB_MAX_EDGE = float(os.getenv("ARB_MAX_EDGE", "0.15"))
 # Only scan when at least this many seconds remain (books settle, time to fill).
 ARB_MIN_REMAINING = int(os.getenv("ARB_MIN_REMAINING", "20"))
 
@@ -274,6 +277,19 @@ FIXED_STAKE_USD = float(os.getenv("FIXED_STAKE_USD", "0"))
 
 MIN_QUOTE = float(os.getenv("MIN_QUOTE", "0.02"))
 MAX_QUOTE = float(os.getenv("MAX_QUOTE", "0.98"))
+
+# --- Trading fees (verified live 2026-07-18 via Gamma feeSchedule) ---
+# Polymarket 5m crypto markets charge TAKERS: rate * min(p, 1-p) per share.
+# rate=0.07 → ~3.5c/share at p=0.5, ~1c/share at p=0.85. Makers get rebates.
+# The per-market rate from Gamma overrides this fallback when available.
+TAKER_FEE_RATE = float(os.getenv("TAKER_FEE_RATE", "0.07"))
+
+
+def taker_fee_per_share(price: float, rate: float | None = None) -> float:
+    """Fee in $ per share for a taker fill at `price` (crypto_fees_v2)."""
+    r = TAKER_FEE_RATE if rate is None else float(rate)
+    p = min(max(float(price), 0.0), 1.0)
+    return r * min(p, 1.0 - p)
 
 VOLATILITY_DAILY = float(os.getenv("VOLATILITY_DAILY", "0.045"))
 

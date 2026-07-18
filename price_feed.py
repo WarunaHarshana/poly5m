@@ -205,10 +205,29 @@ class ChainlinkDataStream:
                     }
                     await ws.send(json.dumps(sub))
                     is_first_tick = True  # reset on reconnect to drop stale cached snapshot
+                    # Log how big the data hole was when we reconnect — this
+                    # is the diagnostic for proxy_strike (missed slot opens).
+                    with self._lock:
+                        last_local = self._local_latest_ts
+                    if last_local is not None:
+                        gap = time.time() - last_local
+                        if gap > 5.0:
+                            print(f"  [price_feed] stream reconnected after "
+                                  f"{gap:.0f}s data gap")
+                    silent = 0
                     while not self._stop_requested:
                         try:
-                            raw = await asyncio.wait_for(ws.recv(), timeout=5.0)
+                            raw = await asyncio.wait_for(ws.recv(), timeout=3.0)
+                            silent = 0
                         except asyncio.TimeoutError:
+                            silent += 1
+                            # 12s of silence = connection is a zombie (ticks
+                            # normally arrive ~1/s). Force a fresh socket
+                            # instead of trusting app-level PING forever.
+                            if silent >= 4:
+                                print("  [price_feed] no ticks for ~12s; "
+                                      "forcing reconnect")
+                                break
                             try:
                                 await ws.send("PING")
                             except Exception:
@@ -263,9 +282,10 @@ class ChainlinkDataStream:
                 break
             except Exception as e:
                 self._err = str(e)
-                # brief backoff then reconnect
+                # brief backoff then reconnect (0.5s: every second of hole at
+                # a slot boundary is a potentially lost strike)
                 try:
-                    await asyncio.sleep(2.0)
+                    await asyncio.sleep(0.5)
                 except Exception:
                     time.sleep(2.0)
 
@@ -431,9 +451,9 @@ class LivePriceFeed:
         # 1) Official: Chainlink Data Streams via RTDS buffer
         # Wider windows help mid-slot restarts still latch a near-open tick.
         if self.stream is not None:
-            hit = self.stream.price_at_or_before(float(slot_start_ts), max_age_s=30.0)
+            hit = self.stream.price_at_or_before(float(slot_start_ts), max_age_s=60.0)
             if hit is None:
-                hit2 = self.stream.price_at(float(slot_start_ts), max_skew_s=15.0)
+                hit2 = self.stream.price_at(float(slot_start_ts), max_skew_s=20.0)
                 hit = (hit2[0], hit2[1]) if hit2 else None
             if hit is not None:
                 price, skew = hit

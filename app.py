@@ -111,7 +111,13 @@ STRATEGY_FIELDS = [
      "hint": "Required 1 − (ask_UP + ask_DOWN) before slippage"},
     {"key": "ARB_MIN_LOCKED_EDGE", "label": "Min locked edge / pair", "type": "float",
      "default": "0.02", "group": "arb",
-     "hint": "Required profit per pair AFTER slippage — thin pairs don't survive real fees"},
+     "hint": "Required profit per pair AFTER slippage + taker fees"},
+    {"key": "ARB_MAX_EDGE", "label": "Max believable edge (0=off)", "type": "float",
+     "default": "0.15", "group": "arb",
+     "hint": "Bigger gaps = makers pulling quotes, not fillable arbs — skip"},
+    {"key": "TAKER_FEE_RATE", "label": "Taker fee rate", "type": "float",
+     "default": "0.07", "group": "risk",
+     "hint": "Verified live: rate × min(p,1−p)/share; Gamma per-market rate overrides"},
     {"key": "ARB_MAX_STAKE_USD", "label": "Max arb stake $", "type": "float",
      "default": "10.0", "group": "arb",
      "hint": "Total for both legs of one pair"},
@@ -2184,6 +2190,21 @@ document.getElementById('c-start').onclick = async () => {
       msg.textContent = '⚠ ' + r.error;
       msg.className = 'ctl-msg err';
     } else {
+      if (body.reset) {
+        // Reset-start: drop cached renders of the OLD session immediately —
+        // otherwise stale trades/bankroll linger until the first new trade
+        // writes fresh state files (looked like the reset was broken).
+        try {
+          localStorage.removeItem('cache_status');
+          localStorage.removeItem('cache_stats');
+          localStorage.removeItem('cache_trades');
+        } catch (e) {}
+        slotEndTs = null;
+        lastTopRound = null;
+        document.getElementById('rows').innerHTML =
+          '<tr><td class="empty-msg" colspan="11">Fresh session — waiting for the first trade…</td></tr>';
+        render({}, []);
+      }
       msg.textContent = (mode === 'live' ? '🔴 LIVE started: ' : '▶ started: ')
         + 'bot.py ' + r.cmd.slice(2).join(' ');
       msg.className = 'ctl-msg ok';

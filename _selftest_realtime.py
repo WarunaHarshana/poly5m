@@ -104,7 +104,8 @@ class FakePubMomentum:
 
 
 class FakePubArb(FakePubMomentum):
-    """Both sides ask 0.46 -> pair costs 0.92 < $1 payout (arb)."""
+    """Both sides ask 0.44 -> pair 0.88; must clear slippage (0.02/pair) AND
+    real taker fees (2 x 0.07 x 0.45 = 0.063/pair): locked = 0.037/pair."""
     def find_btc_5min_market(self, *args, **kwargs):
         m = super().find_btc_5min_market()
         m["tokens"] = {"UP": "AUP_%d" % self.n, "DOWN": "ADN_%d" % self.n}
@@ -112,7 +113,7 @@ class FakePubArb(FakePubMomentum):
         m["question"] = "arb test slot %d" % self.n
         return m
     def midpoint(self, token_id):
-        return 0.46
+        return 0.44
 
 
 bot.LivePriceFeed = FakeFeed
@@ -128,20 +129,23 @@ assert abs(stats_a["avg_entry"] - 0.71) < 1e-6, stats_a["avg_entry"]
 print("\nPHASE_A_OK (late_momentum) trades=", stats_a["trades"],
       "wr=", stats_a["win_rate"], "avg_entry=", stats_a["avg_entry"])
 
-# ---- Phase B: sum-to-one arb ----
+# ---- Phase B: sum-to-one arb (fee-aware) ----
 config.ARB_TRADE_ENABLED = True
 config.ARB_MIN_EDGE = 0.02
+config.ARB_MIN_LOCKED_EDGE = 0.02
+config.ARB_MAX_EDGE = 0.15
 config.ARB_MIN_REMAINING = 20
 config.ARB_MAX_STAKE_USD = 10.0
 config.ARB_SCAN_ENABLED = True
+config.TAKER_FEE_RATE = 0.07          # real crypto_fees_v2 rate
 config.LATE_MOMENTUM_MIN_MOVE = 1e9   # momentum can never fire
 polymarket_client.PolymarketPublic = FakePubArb
 stats_b = asyncio.run(bot.run_realtime(rounds=10, paper=True))
 assert stats_b["trades"] == 10, f"arb: expected 10 trades, got {stats_b['trades']}"
 assert stats_b["wins"] == 10, f"arb: expected all wins, got {stats_b['wins']}"
 assert stats_b["realized_pnl"] > 0, stats_b["realized_pnl"]
-# pair cost = 2 * (0.46 + 0.01 slip) = 0.94 -> locked edge 0.06/pair
-assert abs(stats_b["avg_entry"] - 0.94) < 1e-6, stats_b["avg_entry"]
+# pair cost = 2 * (0.44 + 0.01 slip) = 0.90; fees 0.063/pair -> locked 0.037
+assert abs(stats_b["avg_entry"] - 0.90) < 1e-6, stats_b["avg_entry"]
 print("PHASE_B_OK (arb) trades=", stats_b["trades"],
       "pnl=", stats_b["realized_pnl"], "avg_entry=", stats_b["avg_entry"])
 

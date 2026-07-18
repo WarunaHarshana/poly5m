@@ -85,6 +85,7 @@ class Trade:
     end_ts: float | None = None
     event_url: str = ""
     resolve_source: str = ""     # polymarket-official / chainlink-stream / ...
+    fee_usd: float = 0.0         # taker fee (crypto_fees_v2); deducted from pnl
 
     def to_dict(self):
         # Ensure times are populated even if older code paths skipped stamping.
@@ -109,13 +110,14 @@ class PaperExecutor:
 
     def open_and_resolve(self, trade: Trade, resolved_up: bool) -> Trade:
         trade.outcome = "UP" if resolved_up else "DOWN"
+        fee = float(trade.fee_usd or 0.0)
         if trade.side == "ARB":
             payout = trade.shares  # winning leg pays $1/share, other pays $0
-            trade.pnl = round(payout - trade.stake_usd, 4)
+            trade.pnl = round(payout - trade.stake_usd - fee, 4)
             trade.won = trade.pnl > 0
         else:
             trade.won = (trade.side == trade.outcome)
             payout = trade.shares * (1.0 if trade.won else 0.0)
-            trade.pnl = round(payout - trade.stake_usd, 4)
+            trade.pnl = round(payout - trade.stake_usd - fee, 4)
         stamp_resolved_times(trade)
         return trade

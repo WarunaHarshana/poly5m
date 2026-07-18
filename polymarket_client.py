@@ -121,6 +121,20 @@ class PolymarketPublic:
         if not tokens:
             return None
         end_ts = (slot_start + config.SLOT_SECONDS) if slot_start else None
+        # Taker fee rate from Gamma (crypto 5m markets charge
+        # rate * min(p, 1-p) per share, taker-only). Fallback to config.
+        fee_rate = None
+        try:
+            fs = m.get("feeSchedule")
+            if isinstance(fs, str):
+                fs = json.loads(fs)
+            if m.get("feesEnabled") and isinstance(fs, dict):
+                fee_rate = float(fs.get("rate"))
+        except Exception:
+            fee_rate = None
+        if fee_rate is None:
+            fee_rate = (float(getattr(config, "TAKER_FEE_RATE", 0.07))
+                        if m.get("feesEnabled") in (True, None) else 0.0)
         return {
             "question": m.get("question") or "BTC 5-minute Up/Down",
             "tokens": tokens,
@@ -129,6 +143,7 @@ class PolymarketPublic:
             "conditionId": m.get("conditionId") or "",
             "end_ts": end_ts,
             "slug": slug,
+            "fee_rate": fee_rate,
         }
 
     def _open_market_from_event(self, ev: dict, slug: str, slot_start):
