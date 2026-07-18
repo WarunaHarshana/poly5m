@@ -149,4 +149,54 @@ assert abs(stats_b["avg_entry"] - 0.90) < 1e-6, stats_b["avg_entry"]
 print("PHASE_B_OK (arb) trades=", stats_b["trades"],
       "pnl=", stats_b["realized_pnl"], "avg_entry=", stats_b["avg_entry"])
 
-print("\nSELFTEST_OK momentum+arb")
+# ---- Phase C: LIVE order path (stubbed CLOB — no real orders) ----
+# Exercises the paper=False branch: safety profile, order placement,
+# cancel + fill matching, live PnL accounting. This is the code that
+# touches real money, so it must be covered by tests.
+class FakeClobInner:
+    def get_trades(self):
+        return [{"taker_order_id": "ord-1", "size": 5.0}]
+
+
+class FakeLiveClient:
+    calls = []
+    def __init__(self, *a, **k):
+        pass
+    def buy(self, token_id, price, size, condition_id):
+        FakeLiveClient.calls.append(("buy", token_id, price, size))
+        return {"orderID": "ord-1"}
+    def cancel_order(self, order_id):
+        FakeLiveClient.calls.append(("cancel", order_id))
+        return {"canceled": [order_id]}
+    def cancel_all(self):
+        return {}
+    def get_usdc_balance(self, refresh=True):
+        return {"ok": True, "balance_usd": 25.0, "funder": "0xtest"}
+    def _client(self):
+        return FakeClobInner()
+
+
+polymarket_client.PolymarketClient = FakeLiveClient
+polymarket_client.PolymarketPublic = FakePubMomentum
+config.MODE = "live"
+config.PRIVATE_KEY = "0x" + "1" * 64
+config.FUNDER_ADDRESS = "0x" + "2" * 40
+config.LIVE_CONFIRM = "yes"
+config.LIVE_AGGRESSIVE = False
+config.LATE_MOMENTUM_MIN_MOVE = 10.0  # momentum active again
+config.ARB_TRADE_ENABLED = False
+stats_c = asyncio.run(bot.run_realtime(rounds=3, paper=False))
+assert stats_c["trades"] == 3, f"live: expected 3 trades, got {stats_c['trades']}"
+assert stats_c["wins"] == 3, f"live: expected 3 wins, got {stats_c['wins']}"
+buys = [c for c in FakeLiveClient.calls if c[0] == "buy"]
+cancels = [c for c in FakeLiveClient.calls if c[0] == "cancel"]
+assert len(buys) == 3, f"live: expected 3 orders, got {len(buys)}"
+assert len(cancels) == 3, f"live: expected 3 cancels, got {len(cancels)}"
+# Fill check matched 5.0 shares -> stake rebooked at 5 * entry(0.70) = 3.50
+assert abs(stats_c["avg_stake"] - 3.50) < 1e-6, stats_c["avg_stake"]
+config.MODE = "paper_live"
+print("PHASE_C_OK (live order path) trades=", stats_c["trades"],
+      "orders=", len(buys), "cancels=", len(cancels),
+      "avg_stake=", stats_c["avg_stake"])
+
+print("\nSELFTEST_OK momentum+arb+live")
