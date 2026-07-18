@@ -5,8 +5,11 @@ Usage:
     python analyze.py --hours 12    # only the last N hours
     python analyze.py --session 20260717T192051Z
 
+Also powers the dashboard's Performance Analysis panel via
+`compute_report()` (imported by app.py -> GET /api/analyze).
+
 Reads state/archive/trades_history.jsonl (permanent, survives --reset).
-No dependencies. Interpret with the two rules that keep you honest:
+Interpret with the two rules that keep you honest:
   1) win rate means nothing without the entry price (breakeven = avg entry);
   2) one outlier can carry a whole session — always check trimmed PnL.
 """
@@ -19,6 +22,8 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 HISTORY = os.path.join(HERE, "state", "archive", "trades_history.jsonl")
 STATS = os.path.join(HERE, "state", "stats.json")
+
+MOMENTUM_TARGET_N = 100  # sample size where the verdict starts to mean something
 
 
 def load_rows(hours: float | None, session: str | None) -> list[dict]:
@@ -50,23 +55,117 @@ def fnum(row, key, default=0.0):
         return default
 
 
-def block(title):
-    print(f"\n=== {title} " + "=" * max(1, 60 - len(title)))
-
-
-def summarize(label, rows):
-    if not rows:
-        print(f"{label:<22} n=0")
-        return
+def _agg(label: str, rows: list[dict]) -> dict:
     n = len(rows)
+    if not n:
+        return {"label": label, "n": 0}
     wins = sum(1 for r in rows if r.get("won"))
     pnl = sum(fnum(r, "pnl") for r in rows)
     stake = sum(fnum(r, "stake_usd") for r in rows)
-    entry = sum(fnum(r, "entry_price") for r in rows) / n
-    fees = sum(fnum(r, "fee_usd") for r in rows)
-    print(f"{label:<22} n={n:<4} wr={100*wins/n:5.1f}%  pnl={pnl:+8.2f}  "
-          f"exp={pnl/n:+.3f}/trade  avg_entry={entry:.3f}  "
-          f"avg_stake={stake/n:.2f}  fees={fees:.2f}")
+    return {
+        "label": label,
+        "n": n,
+        "wins": wins,
+        "win_rate": round(100.0 * wins / n, 1),
+        "pnl": round(pnl, 2),
+        "expectancy": round(pnl / n, 3),
+        "avg_entry": round(sum(fnum(r, "entry_price") for r in rows) / n, 3),
+        "avg_stake": round(stake / n, 2),
+        "fees": round(sum(fnum(r, "fee_usd") for r in rows), 2),
+    }
+
+
+def compute_report(hours: float | None = None,
+                   session: str | None = None) -> dict:
+    """Structured report used by both the CLI and the dashboard."""
+    rows = load_rows(hours, session)
+    scope = (f"last {hours:g}h" if hours
+             else (f"session {session}" if session else "all history"))
+    out: dict = {"ok": True, "scope": scope, "n": len(rows),
+                 "generated_at": time.time()}
+    if not rows:
+        out["ok"] = False
+        out["error"] = f"No settled trades found for {scope}"
+        return out
+
+    arb = [r for r in rows if r.get("side") == "ARB"]
+    mom = [r for r in rows if r.get("side") in ("UP", "DOWN")]
+    out["groups"] = [
+        _agg("ALL", rows),
+        _agg("ARB (paired)", arb),
+        _agg("MOMENTUM", mom),
+        _agg("momentum UP", [r for r in mom if r.get("side") == "UP"]),
+        _agg("momentum DOWN", [r for r in mom if r.get("side") == "DOWN"]),
+    ]
+
+    if mom:
+        n = len(mom)
+        wins = sum(1 for r in mom if r.get("won"))
+        avg_entry = sum(fnum(r, "entry_price") for r in mom) / n
+        fees = sum(fnum(r, "fee_usd") for r in mom)
+        stake = sum(fnum(r, "stake_usd") for r in mom) or 1.0
+        breakeven = avg_entry + fees / stake * avg_entry
+        achieved = wins / n
+        out["momentum"] = {
+            "n": n,
+            "achieved_wr": round(100 * achieved, 1),
+            "breakeven_wr": round(100 * breakeven, 1),
+            "above_breakeven": achieved > breakeven,
+            "sample_ok": n >= MOMENTUM_TARGET_N,
+            "target_n": MOMENTUM_TARGET_N,
+            "buckets": [
+                _agg(f"{lo:.2f}-{hi:.2f}",
+                     [r for r in mom if lo <= fnum(r, "entry_price") < hi])
+                for lo, hi in ((0.0, 0.70), (0.70, 0.80), (0.80, 0.85),
+                               (0.85, 0.90), (0.90, 0.95), (0.95, 1.01))
+                if any(lo <= fnum(r, "entry_price") < hi for r in mom)
+            ],
+        }
+
+    ordered = sorted(rows, key=lambda r: abs(fnum(r, "pnl")), reverse=True)
+    top = ordered[0]
+    total = sum(fnum(r, "pnl") for r in rows)
+    top_pnl = fnum(top, "pnl")
+    out["outlier"] = {
+        "side": top.get("side"),
+        "pnl": round(top_pnl, 2),
+        "time_utc": top.get("time_utc", ""),
+        "pct_of_total": round(100 * abs(top_pnl) / max(0.01, abs(total))),
+        "total": round(total, 2),
+        "total_without": round(total - top_pnl, 2),
+        "dominates": abs(top_pnl) > 0.5 * abs(total) and len(rows) > 5,
+    }
+
+    src: dict = {}
+    for r in rows:
+        k = r.get("resolve_source") or "?"
+        src[k] = src.get(k, 0) + 1
+    out["sources"] = src
+
+    if os.path.isfile(STATS):
+        try:
+            s = json.load(open(STATS, encoding="utf-8"))
+            out["session_id"] = s.get("session_id")
+            out["skips"] = {k: v for k, v in (s.get("skips") or {}).items() if v}
+            out["stream_warning"] = (
+                (s.get("skips") or {}).get("proxy_strike", 0) > 10)
+        except Exception:
+            pass
+    return out
+
+
+def _print_group(g: dict) -> None:
+    if not g.get("n"):
+        print(f"{g['label']:<22} n=0")
+        return
+    print(f"{g['label']:<22} n={g['n']:<4} wr={g['win_rate']:5.1f}%  "
+          f"pnl={g['pnl']:+8.2f}  exp={g['expectancy']:+.3f}/trade  "
+          f"avg_entry={g['avg_entry']:.3f}  avg_stake={g['avg_stake']:.2f}  "
+          f"fees={g['fees']:.2f}")
+
+
+def _block(title):
+    print(f"\n=== {title} " + "=" * max(1, 60 - len(title)))
 
 
 def main():
@@ -74,82 +173,51 @@ def main():
     ap.add_argument("--hours", type=float, default=None)
     ap.add_argument("--session", type=str, default=None)
     args = ap.parse_args()
-
-    rows = load_rows(args.hours, args.session)
-    scope = (f"last {args.hours:g}h" if args.hours
-             else (f"session {args.session}" if args.session else "all history"))
-    if not rows:
-        print(f"No settled trades found for {scope} in {HISTORY}")
+    rep = compute_report(args.hours, args.session)
+    if not rep.get("ok"):
+        print(rep.get("error"))
         return
 
-    block(f"TOTALS ({scope}, {len(rows)} trades)")
-    summarize("ALL", rows)
-    arb = [r for r in rows if r.get("side") == "ARB"]
-    mom = [r for r in rows if r.get("side") in ("UP", "DOWN")]
-    summarize("ARB (paired)", arb)
-    summarize("MOMENTUM (UP+DOWN)", mom)
-    summarize("  momentum UP", [r for r in mom if r.get("side") == "UP"])
-    summarize("  momentum DOWN", [r for r in mom if r.get("side") == "DOWN"])
+    _block(f"TOTALS ({rep['scope']}, {rep['n']} trades)")
+    for g in rep["groups"]:
+        _print_group(g)
 
-    if mom:
-        block("MOMENTUM REALITY CHECK")
-        n = len(mom)
-        wins = sum(1 for r in mom if r.get("won"))
-        avg_entry = sum(fnum(r, "entry_price") for r in mom) / n
-        # Breakeven win rate for buying at avg entry (fee-adjusted approx.)
-        fees = sum(fnum(r, "fee_usd") for r in mom)
-        stake = sum(fnum(r, "stake_usd") for r in mom) or 1.0
-        be = avg_entry + fees / stake * avg_entry
-        print(f"achieved win rate : {100*wins/n:.1f}%  over n={n}")
-        print(f"breakeven win rate: ~{100*be:.1f}%  (avg entry {avg_entry:.3f} "
-              f"+ fees)")
-        verdict = ("ABOVE breakeven" if wins / n > be else "BELOW breakeven")
-        conf = ("(n>=100: take it seriously)" if n >= 100 else
-                f"(n={n}: still small-sample noise — target 100+)")
+    m = rep.get("momentum")
+    if m:
+        _block("MOMENTUM REALITY CHECK")
+        print(f"achieved win rate : {m['achieved_wr']:.1f}%  over n={m['n']}")
+        print(f"breakeven win rate: ~{m['breakeven_wr']:.1f}%  "
+              f"(avg entry + fees)")
+        verdict = "ABOVE breakeven" if m["above_breakeven"] else "BELOW breakeven"
+        conf = ("(n>=%d: take it seriously)" % m["target_n"] if m["sample_ok"]
+                else f"(n={m['n']}: small-sample noise — target {m['target_n']}+)")
         print(f"verdict           : {verdict} {conf}")
+        _block("MOMENTUM BY ENTRY BUCKET")
+        for b in m["buckets"]:
+            _print_group({**b, "label": "  entry " + b["label"]})
 
-        block("MOMENTUM BY ENTRY BUCKET")
-        for lo, hi in ((0.0, 0.70), (0.70, 0.80), (0.80, 0.85),
-                       (0.85, 0.90), (0.90, 0.95), (0.95, 1.01)):
-            b = [r for r in mom if lo <= fnum(r, "entry_price") < hi]
-            if b:
-                summarize(f"  entry {lo:.2f}-{hi:.2f}", b)
-
-    block("OUTLIER SENSITIVITY")
-    ordered = sorted(rows, key=lambda r: abs(fnum(r, "pnl")), reverse=True)
-    top = ordered[0]
-    total = sum(fnum(r, "pnl") for r in rows)
-    rest = total - fnum(top, "pnl")
-    print(f"biggest single trade: {top.get('side')} pnl={fnum(top,'pnl'):+.2f} "
-          f"({top.get('time_utc','')}) — "
-          f"{100*abs(fnum(top,'pnl'))/max(0.01,abs(total)):.0f}% of |total|")
-    print(f"total without it    : {rest:+.2f}  (vs {total:+.2f} with)")
-    if abs(fnum(top, "pnl")) > 0.5 * abs(total) and len(rows) > 5:
+    o = rep["outlier"]
+    _block("OUTLIER SENSITIVITY")
+    print(f"biggest single trade: {o['side']} pnl={o['pnl']:+.2f} "
+          f"({o['time_utc']}) — {o['pct_of_total']}% of |total|")
+    print(f"total without it    : {o['total_without']:+.2f}  "
+          f"(vs {o['total']:+.2f} with)")
+    if o["dominates"]:
         print("WARNING: one trade dominates the result — treat the headline "
               "number as unproven.")
 
-    block("RESOLUTION SOURCES")
-    src: dict = {}
-    for r in rows:
-        k = r.get("resolve_source") or "?"
-        src[k] = src.get(k, 0) + 1
-    for k, v in sorted(src.items(), key=lambda x: -x[1]):
+    _block("RESOLUTION SOURCES")
+    for k, v in sorted(rep["sources"].items(), key=lambda x: -x[1]):
         flag = "  <-- unreliable" if "UNRELIABLE" in k else ""
         print(f"  {k}: {v}{flag}")
 
-    if os.path.isfile(STATS):
-        try:
-            s = json.load(open(STATS, encoding="utf-8"))
-            block(f"CURRENT SESSION SKIPS ({s.get('session_id')})")
-            for k, v in (s.get("skips") or {}).items():
-                if v:
-                    print(f"  {k}: {v}")
-            if (s.get("skips") or {}).get("proxy_strike", 0) > 10:
-                print("  NOTE: high proxy_strike = stream missing slot opens "
-                      "-> momentum starved. Check bot.log for reconnect gaps.")
-        except Exception:
-            pass
-
+    if rep.get("skips"):
+        _block(f"CURRENT SESSION SKIPS ({rep.get('session_id')})")
+        for k, v in rep["skips"].items():
+            print(f"  {k}: {v}")
+        if rep.get("stream_warning"):
+            print("  NOTE: high proxy_strike = stream missing slot opens "
+                  "-> momentum starved. Check bot.log for reconnect gaps.")
     print()
 
 

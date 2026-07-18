@@ -1307,6 +1307,17 @@ body.trade-flash-lose { animation: page-flash-down 1.6s ease-out; }
 .arb   { color: var(--accent2); font-weight: 600; }
 .won   { color: var(--green); }
 .lost  { color: var(--red); }
+
+/* analysis panel */
+.an-verdict {
+  padding: 10px 14px; border-radius: var(--radius-sm); margin-bottom: 12px;
+  font-size: 13px; font-weight: 600; border: 1px solid var(--line);
+  background: rgba(0,0,0,0.25); color: var(--txt-soft);
+}
+.an-verdict.good { color: var(--green); border-color: rgba(46,234,155,0.35); background: var(--green-dim); }
+.an-verdict.bad  { color: var(--red);   border-color: rgba(255,84,104,0.35); background: var(--red-dim); }
+.an-verdict.warn { color: var(--amber); border-color: rgba(255,180,84,0.35); background: var(--amber-dim); }
+.an-verdict small { display: block; font-weight: 400; font-size: 11px; margin-top: 3px; color: var(--txt-soft); }
 .empty-msg { color: var(--dim); font-size: 12.5px; padding: 28px; text-align: center; font-family: 'Inter', sans-serif; }
 .err-line { color: var(--red); font-size: 11px; margin-top: 8px; }
 
@@ -1586,6 +1597,31 @@ body.trade-flash-lose { animation: page-flash-down 1.6s ease-out; }
       </tr></thead>
       <tbody id="rows"><tr><td class="empty-msg" colspan="11">Waiting for the first trade… start the bot above.</td></tr></tbody>
     </table>
+  </div>
+
+  <!-- ===== PERFORMANCE ANALYSIS (archive) ===== -->
+  <div class="panel glass-card" id="analysis-panel" style="margin-top:14px">
+    <div class="phead">
+      <span>Performance Analysis · archive</span>
+      <span style="display:flex;gap:8px;align-items:center">
+        <select id="an-range" class="ctl-select" style="min-width:0;padding:4px 8px;font-size:11px">
+          <option value="">All history</option>
+          <option value="24" selected>Last 24h</option>
+          <option value="12">Last 12h</option>
+          <option value="6">Last 6h</option>
+        </select>
+        <button type="button" class="btn-ghost" id="an-refresh" style="padding:4px 10px;font-size:11px">Refresh</button>
+      </span>
+    </div>
+    <div class="pbody">
+      <div id="an-verdict" class="an-verdict">Loading analysis…</div>
+      <div style="overflow-x:auto"><table id="an-groups"></table></div>
+      <div id="an-buckets-wrap" style="display:none;margin-top:12px">
+        <div class="lbl" style="font-size:9.5px;font-weight:600;color:var(--dim);letter-spacing:0.8px;text-transform:uppercase;margin-bottom:6px">Momentum by entry price</div>
+        <div style="overflow-x:auto"><table id="an-buckets"></table></div>
+      </div>
+      <p id="an-notes" style="margin-top:10px;font-size:11.5px;color:var(--txt-soft);line-height:1.5"></p>
+    </div>
   </div>
 
   <div id="err" class="err-line"></div>
@@ -2535,6 +2571,93 @@ document.getElementById('sp-preset-momentum').onclick = () => saveSettings({
   ARB_MIN_REMAINING: '20',
 });
 
+/* ===== PERFORMANCE ANALYSIS PANEL ===== */
+function anCls(v) { return v > 0 ? 'won' : (v < 0 ? 'lost' : ''); }
+
+function renderAnalysis(rep) {
+  const verdict = document.getElementById('an-verdict');
+  const groups = document.getElementById('an-groups');
+  const bwrap = document.getElementById('an-buckets-wrap');
+  const notes = document.getElementById('an-notes');
+  if (!rep || !rep.ok) {
+    verdict.className = 'an-verdict';
+    verdict.textContent = (rep && rep.error) || 'No trades in this range yet.';
+    groups.innerHTML = ''; bwrap.style.display = 'none'; notes.textContent = '';
+    return;
+  }
+  // Verdict banner (momentum vs breakeven — the number that decides live)
+  const m = rep.momentum;
+  if (m) {
+    const above = m.above_breakeven;
+    verdict.className = 'an-verdict ' + (above ? (m.sample_ok ? 'good' : 'warn')
+                                               : 'bad');
+    verdict.innerHTML =
+      `Momentum: ${m.achieved_wr}% win rate vs ~${m.breakeven_wr}% breakeven ` +
+      `→ <b>${above ? 'ABOVE' : 'BELOW'} breakeven</b> (n=${m.n})` +
+      `<small>${m.sample_ok
+        ? 'Sample size OK — this verdict is meaningful.'
+        : 'Small sample — target ' + m.target_n + '+ momentum trades before trusting this (or going live).'}</small>`;
+  } else {
+    verdict.className = 'an-verdict';
+    verdict.textContent = 'No momentum trades in this range (arb only).';
+  }
+  // Groups table
+  const rows = (rep.groups || []).filter(g => g.n > 0);
+  groups.innerHTML =
+    '<thead><tr><th>Group</th><th>N</th><th>Win %</th><th>PnL $</th>' +
+    '<th>Per trade</th><th>Avg entry</th><th>Fees $</th></tr></thead><tbody>' +
+    rows.map(g =>
+      `<tr><td>${g.label}</td><td>${g.n}</td><td>${g.win_rate}%</td>` +
+      `<td class="${anCls(g.pnl)}">${g.pnl >= 0 ? '+' : ''}${g.pnl.toFixed(2)}</td>` +
+      `<td class="${anCls(g.expectancy)}">${g.expectancy >= 0 ? '+' : ''}${g.expectancy.toFixed(3)}</td>` +
+      `<td>${g.avg_entry.toFixed(3)}</td><td>${(g.fees || 0).toFixed(2)}</td></tr>`
+    ).join('') + '</tbody>';
+  // Buckets
+  const buckets = (m && m.buckets || []).filter(b => b.n > 0);
+  if (buckets.length) {
+    bwrap.style.display = '';
+    document.getElementById('an-buckets').innerHTML =
+      '<thead><tr><th>Entry range</th><th>N</th><th>Win %</th><th>PnL $</th>' +
+      '<th>Per trade</th></tr></thead><tbody>' +
+      buckets.map(b =>
+        `<tr><td>${b.label}</td><td>${b.n}</td><td>${b.win_rate}%</td>` +
+        `<td class="${anCls(b.pnl)}">${b.pnl >= 0 ? '+' : ''}${b.pnl.toFixed(2)}</td>` +
+        `<td class="${anCls(b.expectancy)}">${b.expectancy >= 0 ? '+' : ''}${b.expectancy.toFixed(3)}</td></tr>`
+      ).join('') + '</tbody>';
+  } else {
+    bwrap.style.display = 'none';
+  }
+  // Notes: outlier + stream health
+  const o = rep.outlier;
+  let txt = '';
+  if (o) {
+    txt += `Biggest trade: ${o.side} ${o.pnl >= 0 ? '+' : ''}${o.pnl} ` +
+      `(${o.pct_of_total}% of total). Without it: ` +
+      `${o.total_without >= 0 ? '+' : ''}${o.total_without} vs ` +
+      `${o.total >= 0 ? '+' : ''}${o.total}.`;
+    if (o.dominates) txt += ' ⚠ One trade dominates — headline unproven.';
+  }
+  if (rep.stream_warning) {
+    txt += ' ⚠ High proxy_strike skips — Chainlink stream missing slot opens (momentum starved).';
+  }
+  notes.textContent = txt;
+}
+
+async function loadAnalysis() {
+  const hrs = document.getElementById('an-range').value;
+  try {
+    const rep = await fetch('/api/analyze' + (hrs ? ('?hours=' + hrs) : ''),
+                            { cache: 'no-store' }).then(r => r.json());
+    renderAnalysis(rep);
+  } catch (e) {
+    renderAnalysis({ ok: false, error: 'Analysis unavailable: ' + e });
+  }
+}
+document.getElementById('an-refresh').onclick = loadAnalysis;
+document.getElementById('an-range').addEventListener('change', loadAnalysis);
+setInterval(loadAnalysis, 60000);
+loadAnalysis();
+
 loadSettings();
 loadWallet();
 ctlState();
@@ -2598,6 +2721,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # Dashboard
         if path in ("/", "/dashboard"):
             return self._html(DASHBOARD_HTML)
+
+        # Performance analysis (archive report; same engine as analyze.py)
+        if path == "/api/analyze":
+            from urllib.parse import urlparse, parse_qs
+            import analyze
+            q = parse_qs(urlparse(self.path).query)
+            hours = None
+            try:
+                if q.get("hours") and float(q["hours"][0]) > 0:
+                    hours = float(q["hours"][0])
+            except (TypeError, ValueError):
+                hours = None
+            session = (q.get("session") or [None])[0]
+            try:
+                return self._json(analyze.compute_report(hours, session))
+            except Exception as e:
+                return self._json({"ok": False, "error": str(e)}, 500)
 
         # Control API
         if path == "/api/control":
