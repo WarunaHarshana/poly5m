@@ -162,6 +162,41 @@ class ChainlinkDataStream:
                 return None
             return float(best), float(age)
 
+    def ticks_since(self, unix_ts: float) -> list[tuple[float, float]]:
+        """All (stream_ts, price) ticks at/after unix_ts, oldest first.
+
+        The stream buffers ~1 tick/sec with real timestamps — far better than
+        the sparse, irregularly-spaced polled history for realized vol and
+        chop detection, and it can be scoped to the CURRENT slot.
+        """
+        with self._lock:
+            return [(ts, px) for ts, px in self._ticks if ts >= unix_ts]
+
+    def realized_vol_daily_since(self, unix_ts: float) -> float | None:
+        """Realized daily vol from real tick spacing since unix_ts.
+
+        Uses each tick's own dt instead of assuming a fixed sample interval
+        (the polled history assumed 5s while really being 15s+ apart, which
+        overstated vol ~1.7x and pulled model probabilities toward 0.5).
+        """
+        ticks = self.ticks_since(unix_ts)
+        if len(ticks) < 4:
+            return None
+        var_sum = 0.0
+        n = 0
+        for (t0, p0), (t1, p1) in zip(ticks, ticks[1:]):
+            dt = t1 - t0
+            if dt <= 0 or p0 <= 0 or p1 <= 0:
+                continue
+            r = math.log(p1 / p0)
+            var_sum += (r * r) / dt      # per-second variance contribution
+            n += 1
+        if n < 3:
+            return None
+        var_per_sec = var_sum / n
+        daily = math.sqrt(max(var_per_sec, 0.0) * 86400.0)
+        return max(0.01, min(0.15, daily))
+
     def _record(self, ts_s: float, value: float) -> None:
         local = time.time()
         sample_off = ts_s - local

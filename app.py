@@ -1962,8 +1962,20 @@ function render(stats, trades) {
       s: pmSub, cls: pmBal != null ? 'pos' : '' },
     { k: 'Local Bankroll',  v: fmtUsd(stats.bankroll || start), s: 'bot tracker · start ' + fmtUsd(start) },
     { k: 'Realized P&L',    v: fmtUsd(pnl),                    s: pnlPct.toFixed(1) + '% vs start', cls: pnl >= 0 ? 'pos' : 'neg' },
-    { k: 'Win Rate',        v: (stats.win_rate || 0) + '%',     s: (stats.wins || 0) + 'W / ' + (stats.losses || 0) + 'L' },
-    { k: 'Trades',          v: stats.trades || 0,               s: '5-min rounds' },
+    // Momentum-only win rate vs its breakeven — the blended number counted
+    // structural ARB wins as skill and read ~10pp too good.
+    { k: 'Momentum WR',
+      v: (stats.momentum_trades ? (stats.momentum_win_rate || 0) + '%' : '—'),
+      s: (stats.momentum_trades
+          ? ('needs ' + (stats.momentum_breakeven_wr || 0) + '% · n=' + stats.momentum_trades)
+          : 'no directional trades yet'),
+      cls: (stats.momentum_trades &&
+            stats.momentum_win_rate > stats.momentum_breakeven_wr) ? 'pos' : 'neg' },
+    { k: 'Momentum / Arb P&L',
+      v: fmtUsd(stats.momentum_pnl || 0),
+      s: 'arb ' + fmtUsd(stats.arb_pnl || 0) + ' · fees ' + fmtUsd(stats.fees_paid || 0),
+      cls: (stats.momentum_pnl || 0) >= 0 ? 'pos' : 'neg' },
+    { k: 'Trades',          v: stats.trades || 0,               s: (stats.wins || 0) + 'W / ' + (stats.losses || 0) + 'L total' },
     { k: 'Max Drawdown',    v: fmtUsd(mdd),                     s: 'peak-to-trough', cls: 'neg' },
     { k: 'Circuit Breaker', v: stats.halted ? 'TRIPPED' : 'ARMED',
       s: stats.halted ? (stats.halt_reason || 'halted') : 'daily loss stop',

@@ -278,6 +278,15 @@ def persist(trades, risk, skip_counts: dict | None = None):
         json.dump([t.to_dict() for t in trades], f, indent=2)
     settled = [t for t in trades if t.won is not None]
     wins = sum(1 for t in settled if t.won)
+    # Split the headline: ARB wins are structural (a paired position pays
+    # either way), so blending them with directional momentum trades makes
+    # the win rate look like skill it is not.
+    mom = [t for t in settled if t.side in ("UP", "DOWN")]
+    arb_t = [t for t in settled if t.side == "ARB"]
+    mom_wins = sum(1 for t in mom if t.won)
+    mom_pnl = sum(t.pnl for t in mom)
+    arb_pnl = sum(t.pnl for t in arb_t)
+    total_fees = sum(getattr(t, "fee_usd", 0.0) or 0.0 for t in settled)
     avg_edge = (sum(t.edge for t in settled) / len(settled)) if settled else 0.0
     avg_entry = (sum(t.entry_price for t in settled) / len(settled)) if settled else 0.0
     avg_stake = (sum(t.stake_usd for t in settled) / len(settled)) if settled else 0.0
@@ -299,6 +308,17 @@ def persist(trades, risk, skip_counts: dict | None = None):
         "wins": wins,
         "losses": len(settled) - wins,
         "win_rate": round(100 * wins / len(settled), 1) if settled else 0.0,
+        # Momentum-only view (the actual skill question) + arb split
+        "momentum_trades": len(mom),
+        "momentum_wins": mom_wins,
+        "momentum_win_rate": round(100 * mom_wins / len(mom), 1) if mom else 0.0,
+        "momentum_pnl": round(mom_pnl, 2),
+        "momentum_breakeven_wr": (
+            round(100 * (sum(t.entry_price for t in mom) / len(mom)), 1)
+            if mom else 0.0),
+        "arb_trades": len(arb_t),
+        "arb_pnl": round(arb_pnl, 2),
+        "fees_paid": round(total_fees, 2),
         "avg_edge": round(avg_edge, 4),
         "avg_entry": round(avg_entry, 4),
         "avg_stake": round(avg_stake, 2),
@@ -1231,20 +1251,32 @@ async def run_realtime(rounds: int = 100, paper: bool = True):
                 continue
             continue
 
-        prices_recent = feed.recent(int(getattr(config, "MOMENTUM_LOOKBACK", 12)))
+        # Realized vol + chop from the Chainlink tick buffer, scoped to THIS
+        # slot. The polled `feed.recent()` history is sampled irregularly
+        # (~15s+ apart, spanning several slots) while _realized_vol_daily
+        # assumed a fixed 5s spacing — that overstated vol ~1.7x and made the
+        # chop filter compare previous-slot prices to the current strike.
+        slot_ticks = []
         rv = None
-        if prices_recent:
-            from signal_engine import _realized_vol_daily
-            rv = _realized_vol_daily(
-                prices_recent, float(getattr(config, "SAMPLE_SECONDS", 5.0)))
-        price_60s_ago = prices_recent[0] if prices_recent else price_before
+        if slot_start_time and cl_stream.ready:
+            slot_ticks = cl_stream.ticks_since(float(slot_start_time))
+            rv = cl_stream.realized_vol_daily_since(float(slot_start_time))
+        if rv is None:
+            # Fallback: polled history, but with the spacing it really has.
+            prices_poll = feed.recent(int(getattr(config, "MOMENTUM_LOOKBACK", 12)))
+            if len(prices_poll) >= 4:
+                from signal_engine import _realized_vol_daily
+                rv = _realized_vol_daily(
+                    prices_poll, float(getattr(config, "ARB_MIN_REMAINING", 15)))
+        slot_prices = [px for _ts, px in slot_ticks]
+        price_at_slot_open = slot_prices[0] if slot_prices else price_before
         price_now = price_before
 
-        # Chop filter: if price has been flip-flopping across the strike in
-        # the recent samples, a "lead" is noise, not momentum — skip the slot.
+        # Chop filter: if price flip-flopped across the strike WITHIN this
+        # slot, a "lead" is noise, not momentum — skip.
         max_chop = int(getattr(config, "LATE_MOMENTUM_MAX_CHOP", 3) or 0)
-        if max_chop > 0 and slot_open_ref:
-            crossings = count_strike_crossings(prices_recent, float(slot_open_ref))
+        if max_chop > 0 and slot_open_ref and len(slot_prices) >= 4:
+            crossings = count_strike_crossings(slot_prices, float(slot_open_ref))
             if crossings > max_chop:
                 if await _late_skip(
                     "thin_move",
@@ -1393,7 +1425,7 @@ async def run_realtime(rounds: int = 100, paper: bool = True):
 
         ask_sz = q.get("ask_size")
         print(f"  [late_momentum] side={side} strike=${slot_open_ref:.2f} "
-              f"spot=${price_now:.2f} price_60s_ago=${price_60s_ago:.2f} "
+              f"spot=${price_now:.2f} slot_open=${price_at_slot_open:.2f} "
               f"gap=${diff:+.2f} ask={mkt:.3f} edge={edge:.3f} "
               f"(net {edge_net:.3f} after fee {fee_ps:.3f}/sh) stake=${stake:.2f}")
         write_status(
