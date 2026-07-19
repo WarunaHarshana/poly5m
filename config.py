@@ -239,14 +239,20 @@ LATE_MOMENTUM_BIDIRECTIONAL = _env_bool("LATE_MOMENTUM_BIDIRECTIONAL", True)
 # momentum gates mutually unsatisfiable: a modest move + edge>=0 requires an
 # ask well below where the book prices favorites late in the slot.
 LATE_MOMENTUM_MIN_ENTRY = float(os.getenv("LATE_MOMENTUM_MIN_ENTRY", "0.55"))
-# 0.80 cap set 2026-07-19 from 203 fee-adjusted late_momentum trades. Edge
-# declines monotonically with entry price because the breakeven win rate
-# (= the price) rises faster than the model's directional accuracy:
+# Edge declines monotonically with entry price because the breakeven win
+# rate (= the price) rises faster than the model's directional accuracy:
 #   <0.70 +$1.67/trade | 0.70-0.80 +$0.35 | 0.80-0.90 ~$0.00 | 0.90+ -$0.12
 # Mechanism: a cheap favorite means the book is UNDER-reacting to a move the
-# Chainlink feed already sees. Above ~0.90 the book has fully priced it and
-# there is nothing left to buy.
-LATE_MOMENTUM_MAX_ENTRY = float(os.getenv("LATE_MOMENTUM_MAX_ENTRY", "0.80"))
+# Chainlink feed already sees. Above ~0.90 the book has fully priced it.
+#
+# 0.88 (raised from 0.80 on 2026-07-19): at 0.80 the bot found ZERO
+# qualifying momentum trades in 4h on 5m, and 15m rejected everything on
+# price — no trades means no data, ever. The re-admitted 0.80-0.90 band is
+# n=92, -$0.001/trade fee-adjusted: breakeven, NOT a loser, and +$0.051 if
+# filled as a maker (which is why maker-first matters here). 0.90+ stays
+# excluded at -$0.117/trade. This buys trade flow at ~zero expected cost —
+# it is a data-collection decision, not a claim that 0.88 earns more.
+LATE_MOMENTUM_MAX_ENTRY = float(os.getenv("LATE_MOMENTUM_MAX_ENTRY", "0.88"))
 # Edge floor AND ceiling (model_prob − ask). Archive buckets: edge 0–0.05 was
 # the best performer; edge ≥ 0.15 was the WORST (75% WR, −$0.15/trade) — a
 # huge "model edge" in the last minute usually means stale strike / vol
