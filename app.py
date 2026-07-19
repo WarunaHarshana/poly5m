@@ -1734,6 +1734,10 @@ let serverTimeOffset = 0;
 let lastPollTime = 0;
 let lastTradeEventId = null;
 try { lastTradeEventId = localStorage.getItem('last_trade_event_id'); } catch (e) {}
+// MUST be declared here, before everySecond() first runs: it calls
+// renderOpenPositions(), and a `let` read before its declaration throws a
+// ReferenceError that kills the rest of the script (whole UI dead).
+let openPositions = [];
 
 /* ===== HELPERS ===== */
 function curTf() {
@@ -1938,8 +1942,6 @@ function handleTradeEvent(st) {
 }
 
 /* ===== OPEN POSITIONS (placed but not yet settled) ===== */
-let openPositions = [];
-
 function renderOpenPositions() {
   const panel = document.getElementById('open-panel');
   const tbl = document.getElementById('open-rows');
@@ -2190,8 +2192,12 @@ async function poll() {
   } catch (e) { /* optional file */ }
   if (st) {
     lastPollTime = Date.now() / 1000; // update connection freshness
+    // Only trust the server clock when the snapshot is FRESH. A stale
+    // status.json (bot mid-sleep) made this offset equal the staleness
+    // itself, which then corrupted every countdown on the page.
     if (st.updated_at && parseFloat(st.updated_at) !== parseFloat(lastStatusTs)) {
-      serverTimeOffset = parseFloat(st.updated_at) - (Date.now() / 1000);
+      const skew = parseFloat(st.updated_at) - (Date.now() / 1000);
+      if (Math.abs(skew) < 15) serverTimeOffset = skew;
     }
     try { localStorage.setItem(ck('status'), JSON.stringify(st)); } catch(e){}
     renderStatus(st);

@@ -447,6 +447,26 @@ def _now(cl_stream: ChainlinkDataStream | None = None) -> float:
     return time.time()
 
 
+async def _heartbeat_sleep(seconds: float, chunk: float = 5.0):
+    """Sleep, refreshing status.json every few seconds.
+
+    A plain sleep here left status.json untouched for up to ~300s while the
+    bot waited out a slot. The dashboard then showed STALE during completely
+    normal operation, and its server-clock offset — derived from
+    status.updated_at — drifted by the full staleness, throwing off every
+    countdown on the page.
+    """
+    if seconds <= 0:
+        return
+    remaining = float(seconds)
+    while remaining > 0:
+        step = min(chunk, remaining)
+        await asyncio.sleep(step)
+        remaining -= step
+        if remaining > 0:
+            write_status()  # touch updated_at only
+
+
 async def _sleep_until_slot_end(end_ts, cl_stream: ChainlinkDataStream | None = None):
     """Wait out the current slot so the next fetch returns a fresh one.
 
@@ -462,7 +482,7 @@ async def _sleep_until_slot_end(end_ts, cl_stream: ChainlinkDataStream | None = 
         wait = end_ts - _now(cl_stream)
         if wait > 0:
             cap = config.ROUND_SECONDS + 1
-            await asyncio.sleep(min(wait + 1.0, cap))
+            await _heartbeat_sleep(min(wait + 1.0, cap))
         else:
             # Past end already — don't tight-loop; give Gamma/discovery a moment
             # to roll to the next slug (and let stream clock advance).
@@ -888,6 +908,7 @@ async def run_realtime(rounds: int = 100, paper: bool = True):
                         print(f"  [resolve] still waiting for Gamma "
                               f"({attempt * 3}s)...")
                     await asyncio.sleep(3.0)
+                    write_status()  # keep the dashboard alive while polling
 
             if official in ("UP", "DOWN"):
                 resolved_up = official == "UP"
@@ -1244,9 +1265,9 @@ async def run_realtime(rounds: int = 100, paper: bool = True):
                 pass
             if config.ROUND_SECONDS > 0 and wait > 0:
                 if arb_on and wait > 20:
-                    await asyncio.sleep(15.0)   # re-scan arb roughly every 15s
+                    await _heartbeat_sleep(15.0)  # re-scan arb roughly every 15s
                 else:
-                    await asyncio.sleep(min(wait, max(1.0, wait - 1.5)))
+                    await _heartbeat_sleep(min(wait, max(1.0, wait - 1.5)))
             continue
 
         remaining = (end_ts - _now(cl_stream)) if end_ts else remaining
