@@ -27,7 +27,13 @@ import webbrowser
 
 PORT = int(os.getenv("DASH_PORT", "8000"))
 HERE = os.path.dirname(os.path.abspath(__file__))
-STATE_DIR = os.path.join(HERE, "state")
+# Mirror bot.py: a non-5m instance keeps its state in state/<timeframe>/, so
+# a second dashboard can watch it on another port. Example (15m on :8015):
+#   $env:TIMEFRAME='15m'; $env:DASH_PORT='8015'; python app.py
+_TF = (os.getenv("TIMEFRAME") or "5m").strip().lower()
+_STATE_SUB = (os.getenv("STATE_SUBDIR") or ("" if _TF == "5m" else _TF)).strip()
+STATE_DIR = os.path.join(HERE, "state", _STATE_SUB) if _STATE_SUB \
+    else os.path.join(HERE, "state")
 ENV_PATH = os.path.join(HERE, ".env")
 os.chdir(HERE)
 

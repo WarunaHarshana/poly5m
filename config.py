@@ -128,7 +128,15 @@ MARKET_ADVANCE_REMAINING = int(os.getenv("MARKET_ADVANCE_REMAINING", "5"))
 
 
 # --- Strategy (stricter mid defaults — fewer, higher-conviction mid entries) ---
-ROUND_SECONDS = int(os.getenv("ROUND_SECONDS", "300"))
+# Must follow the series length: it caps how long the loop may sleep waiting
+# for a slot to end. Hardcoded 300 made a 15m instance wake ~600s early every
+# slot and re-poll discovery pointlessly.
+ROUND_SECONDS = int(os.getenv("ROUND_SECONDS", str(SLOT_SECONDS)))
+# Chop is measured over a FIXED recent window, not the whole slot: crossing
+# counts grow with elapsed time, so a 15m slot would show far more crossings
+# than a 5m one and the same MAX_CHOP threshold would mean something
+# different on each series. 300s = identical behaviour on 5m (no regression).
+CHOP_LOOKBACK_S = float(os.getenv("CHOP_LOOKBACK_S", "300"))
 MOMENTUM_LOOKBACK = int(os.getenv("MOMENTUM_LOOKBACK", "12"))
 SAMPLE_SECONDS = float(os.getenv("SAMPLE_SECONDS", "5"))
 EDGE_THRESHOLD = float(os.getenv("EDGE_THRESHOLD", "0.04"))

@@ -104,12 +104,23 @@ $env:TIMEFRAME='15m'; python bot.py --mode paper_live --rounds 100
 TIMEFRAME must be set in the environment, not via `--timeframe`: the slug
 prefix and state paths are resolved at import time.
 
-Analyse each series separately (they are different strategies statistically):
+Each series gets its own dashboard and its own analysis — set TIMEFRAME
+and everything (bot, UI, analyzer) follows the same state directory:
 
 ```powershell
-python analyze.py                                    # 5m
-# for 15m, point HISTORY at state/15m/archive/trades_history.jsonl
+# 5m dashboard (default, port 8000)
+python app.py
+
+# 15m dashboard on its own port
+$env:TIMEFRAME='15m'; $env:DASH_PORT='8015'; python app.py
+
+# analysis per series
+python analyze.py                          # 5m
+$env:TIMEFRAME='15m'; python analyze.py    # 15m
 ```
+
+The Start button in each dashboard launches a bot for THAT series (the
+child process inherits TIMEFRAME).
 
 ### Honest trade-offs before you do this
 

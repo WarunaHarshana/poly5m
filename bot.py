@@ -1312,8 +1312,14 @@ async def run_realtime(rounds: int = 100, paper: bool = True):
         slot_ticks = []
         rv = None
         if slot_start_time and cl_stream.ready:
-            slot_ticks = cl_stream.ticks_since(float(slot_start_time))
-            rv = cl_stream.realized_vol_daily_since(float(slot_start_time))
+            # Fixed recent window so chop/vol mean the same thing on 5m and
+            # 15m (crossing counts grow with elapsed time). On 5m this is the
+            # whole slot, so behaviour there is unchanged.
+            lookback = float(getattr(config, "CHOP_LOOKBACK_S", 300) or 300)
+            window_start = max(float(slot_start_time),
+                               _now(cl_stream) - lookback)
+            slot_ticks = cl_stream.ticks_since(window_start)
+            rv = cl_stream.realized_vol_daily_since(window_start)
         if rv is None:
             # Fallback: polled history, but with the spacing it really has.
             prices_poll = feed.recent(int(getattr(config, "MOMENTUM_LOOKBACK", 12)))
@@ -1322,7 +1328,7 @@ async def run_realtime(rounds: int = 100, paper: bool = True):
                 rv = _realized_vol_daily(
                     prices_poll, float(getattr(config, "ARB_MIN_REMAINING", 15)))
         slot_prices = [px for _ts, px in slot_ticks]
-        price_at_slot_open = slot_prices[0] if slot_prices else price_before
+        price_window_start = slot_prices[0] if slot_prices else price_before
         price_now = price_before
 
         # Chop filter: if price flip-flopped across the strike WITHIN this
@@ -1478,7 +1484,7 @@ async def run_realtime(rounds: int = 100, paper: bool = True):
 
         ask_sz = q.get("ask_size")
         print(f"  [late_momentum] side={side} strike=${slot_open_ref:.2f} "
-              f"spot=${price_now:.2f} slot_open=${price_at_slot_open:.2f} "
+              f"spot=${price_now:.2f} win_start=${price_window_start:.2f} "
               f"gap=${diff:+.2f} ask={mkt:.3f} edge={edge:.3f} "
               f"(net {edge_net:.3f} after fee {fee_ps:.3f}/sh) stake=${stake:.2f}")
         write_status(
