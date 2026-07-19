@@ -38,9 +38,21 @@ ENV_PATH = os.path.join(HERE, ".env")
 os.chdir(HERE)
 
 ALLOWED_MODES = {"paper", "paper_live", "live"}
+# Only these recurring series exist (verified live 2026-07-19).
+ALLOWED_TIMEFRAMES = {"5m", "15m"}
+
+
+def _state_dir_for(tf: str | None) -> str:
+    """State directory for a timeframe. 5m keeps the original paths."""
+    tf = (tf or "5m").strip().lower()
+    if tf not in ALLOWED_TIMEFRAMES:
+        tf = "5m"
+    return os.path.join(HERE, "state") if tf == "5m" \
+        else os.path.join(HERE, "state", tf)
 
 _lock = threading.Lock()
-_bot = {"proc": None, "cmd": None, "mode": None, "log_file": None}
+_bot = {"proc": None, "cmd": None, "mode": None, "log_file": None,
+        "timeframe": "5m"}
 
 
 # ---------------------------------------------------------------------------
@@ -618,8 +630,8 @@ def _running() -> bool:
     return p is not None and p.poll() is None
 
 
-def _get_logs() -> str:
-    log_path = os.path.join(STATE_DIR, "bot.log")
+def _get_logs(tf: str | None = None) -> str:
+    log_path = os.path.join(_state_dir_for(tf) if tf else STATE_DIR, "bot.log")
     if not os.path.exists(log_path):
         return "No logs found. Click 'Start' above to begin trading and generate logs."
     try:
@@ -665,6 +677,11 @@ def _start(opts: dict) -> dict:
 
         # Use python -u for unbuffered output to make logs real-time
         cmd = [sys.executable, "-u", "bot.py", "--mode", mode]
+        # TIMEFRAME must reach the child through the ENVIRONMENT: bot.py
+        # resolves the slug prefix and its state paths at import time.
+        timeframe = str(opts.get("timeframe") or "5m").strip().lower()
+        if timeframe not in ALLOWED_TIMEFRAMES:
+            timeframe = "5m"
         strategy = "late_momentum"  # only strategy (others retired)
         asset = str(opts.get("asset") or "btc").strip().lower()
         if asset not in ("btc", "eth", "sol"):
@@ -695,8 +712,10 @@ def _start(opts: dict) -> dict:
         if opts.get("reset"):
             cmd += ["--reset"]
 
-        # Clear/initialize log file
-        log_path = os.path.join(STATE_DIR, "bot.log")
+        # Clear/initialize log file (per timeframe)
+        run_state_dir = _state_dir_for(timeframe)
+        os.makedirs(run_state_dir, exist_ok=True)
+        log_path = os.path.join(run_state_dir, "bot.log")
         try:
             if _bot["log_file"]:
                 _bot["log_file"].close()
@@ -710,17 +729,20 @@ def _start(opts: dict) -> dict:
 
         try:
             # Fresh env for child so .env reloads with python-dotenv in config
+            child_env = os.environ.copy()
+            child_env["TIMEFRAME"] = timeframe
             proc = subprocess.Popen(
                 cmd, cwd=HERE, stdout=log_file, stderr=subprocess.STDOUT,
-                env=os.environ.copy(),
+                env=child_env,
             )
         except Exception as e:
             log_file.close()
             return {"ok": False, "error": f"Failed to launch bot: {e}"}
 
-        _bot.update(proc=proc, cmd=cmd, mode=mode, log_file=log_file)
+        _bot.update(proc=proc, cmd=cmd, mode=mode, log_file=log_file,
+                    timeframe=timeframe)
         return {"ok": True, "running": True, "pid": proc.pid, "cmd": cmd,
-                "mode": mode}
+                "mode": mode, "timeframe": timeframe}
 
 
 def _stop() -> dict:
@@ -751,6 +773,7 @@ def _state() -> dict:
         "running": _running(),
         "pid": p.pid if p else None,
         "mode": _bot["mode"],
+        "timeframe": _bot.get("timeframe") or "5m",
         "cmd": _bot["cmd"],
         "exit_code": (p.poll() if p else None),
     }
@@ -1393,6 +1416,13 @@ body.trade-flash-lose { animation: page-flash-down 1.6s ease-out; }
         </select>
       </div>
       <div class="ctl-field">
+        <span class="ctl-label">Timeframe</span>
+        <select id="c-timeframe" class="ctl-select">
+          <option value="5m">5m · 12 slots/hr · deepest book</option>
+          <option value="15m">15m · 4 slots/hr · ~4x thinner</option>
+        </select>
+      </div>
+      <div class="ctl-field">
         <span class="ctl-label">Strategy</span>
         <select id="c-strategy" class="ctl-select">
           <option value="late_momentum">late_momentum · move vs strike, last 40s (+ arb scanner)</option>
@@ -1660,6 +1690,12 @@ let lastTradeEventId = null;
 try { lastTradeEventId = localStorage.getItem('last_trade_event_id'); } catch (e) {}
 
 /* ===== HELPERS ===== */
+function curTf() {
+  const el = document.getElementById('c-timeframe');
+  return el ? el.value : '5m';
+}
+function tfq(sep) { return (sep || '?') + 'tf=' + curTf(); }
+function ck(name) { return 'cache_' + name + '_' + curTf(); }
 function fmtUsd(n) {
   const sign = n < 0 ? '-' : '';
   return sign + '$' + Math.abs(n).toLocaleString(undefined, {
@@ -2057,26 +2093,26 @@ function render(stats, trades) {
 async function poll() {
   let st = null;
   try {
-    st = await fetch('state/status.json', { cache: 'no-store' }).then(r => r.ok ? r.json() : null);
+    st = await fetch('state/status.json' + tfq(), { cache: 'no-store' }).then(r => r.ok ? r.json() : null);
   } catch (e) { /* optional file */ }
   if (st) {
     lastPollTime = Date.now() / 1000; // update connection freshness
     if (st.updated_at && parseFloat(st.updated_at) !== parseFloat(lastStatusTs)) {
       serverTimeOffset = parseFloat(st.updated_at) - (Date.now() / 1000);
     }
-    try { localStorage.setItem('cache_status', JSON.stringify(st)); } catch(e){}
+    try { localStorage.setItem(ck('status'), JSON.stringify(st)); } catch(e){}
     renderStatus(st);
   }
 
   try {
     const [s, t] = await Promise.all([
-      fetch('state/stats.json',  { cache: 'no-store' }).then(r => r.json()),
-      fetch('state/trades.json', { cache: 'no-store' }).then(r => r.json()),
+      fetch('state/stats.json' + tfq(),  { cache: 'no-store' }).then(r => r.json()),
+      fetch('state/trades.json' + tfq(), { cache: 'no-store' }).then(r => r.json()),
     ]);
     lastPollTime = Date.now() / 1000; // update connection freshness
     try {
-      localStorage.setItem('cache_stats', JSON.stringify(s));
-      localStorage.setItem('cache_trades', JSON.stringify(t));
+      localStorage.setItem(ck('stats'), JSON.stringify(s));
+      localStorage.setItem(ck('trades'), JSON.stringify(t));
     } catch(e){}
     document.getElementById('err').textContent = '';
     render(s, t);
@@ -2087,7 +2123,7 @@ async function poll() {
 
   // Poll real-time logs from server
   try {
-    const logs = await fetch('/api/logs', { cache: 'no-store' }).then(r => r.ok ? r.text() : '');
+    const logs = await fetch('/api/logs' + tfq(), { cache: 'no-store' }).then(r => r.ok ? r.text() : '');
     const logEl = document.getElementById('console-logs');
     if (logEl) {
       // Check if user is scrolled to bottom (with 25px threshold)
@@ -2108,9 +2144,9 @@ async function poll() {
 }
 // Load cached values immediately on page load to prevent blank states and jumping timers
 try {
-  const cachedStatus = localStorage.getItem('cache_status');
-  const cachedStats  = localStorage.getItem('cache_stats');
-  const cachedTrades = localStorage.getItem('cache_trades');
+  const cachedStatus = localStorage.getItem(ck('status'));
+  const cachedStats  = localStorage.getItem(ck('stats'));
+  const cachedTrades = localStorage.getItem(ck('trades'));
   
   if (cachedStatus) {
     const cachedSt = JSON.parse(cachedStatus);
@@ -2156,8 +2192,8 @@ async function pollWalletBalance() {
     }
     // Refresh tile strip if stats already rendered
     try {
-      const s = JSON.parse(localStorage.getItem('cache_stats') || 'null');
-      const t = JSON.parse(localStorage.getItem('cache_trades') || 'null');
+      const s = JSON.parse(localStorage.getItem(ck('stats')) || 'null');
+      const t = JSON.parse(localStorage.getItem(ck('trades')) || 'null');
       if (s && t) render(s, t);
     } catch (e) {}
   } catch (e) {
@@ -2220,6 +2256,7 @@ document.getElementById('c-start').onclick = async () => {
   const body = {
     mode,
     asset:    document.getElementById('c-asset').value,
+    timeframe: curTf(),
     strategy: document.getElementById('c-strategy').value,
     bankroll: document.getElementById('c-bankroll').value,
     bet:      document.getElementById('c-bet').value,
@@ -2263,9 +2300,9 @@ document.getElementById('c-start').onclick = async () => {
         // otherwise stale trades/bankroll linger until the first new trade
         // writes fresh state files (looked like the reset was broken).
         try {
-          localStorage.removeItem('cache_status');
-          localStorage.removeItem('cache_stats');
-          localStorage.removeItem('cache_trades');
+          localStorage.removeItem(ck('status'));
+          localStorage.removeItem(ck('stats'));
+          localStorage.removeItem(ck('trades'));
         } catch (e) {}
         slotEndTs = null;
         lastTopRound = null;
@@ -2678,13 +2715,21 @@ function renderAnalysis(rep) {
 async function loadAnalysis() {
   const hrs = document.getElementById('an-range').value;
   try {
-    const rep = await fetch('/api/analyze' + (hrs ? ('?hours=' + hrs) : ''),
+    const rep = await fetch('/api/analyze' + tfq() + (hrs ? ('&hours=' + hrs) : ''),
                             { cache: 'no-store' }).then(r => r.json());
     renderAnalysis(rep);
   } catch (e) {
     renderAnalysis({ ok: false, error: 'Analysis unavailable: ' + e });
   }
 }
+document.getElementById('c-timeframe').addEventListener('change', () => {
+  // Repaint for the newly selected series: clear the view, then re-poll its
+  // own state files (each timeframe has separate trades/stats/logs).
+  slotEndTs = null; lastTopRound = null; lastStatusTs = 0;
+  document.getElementById('rows').innerHTML =
+    '<tr><td class="empty-msg" colspan="11">Loading ' + curTf() + ' data…</td></tr>';
+  poll(); loadAnalysis(); ctlState();
+});
 document.getElementById('an-refresh').onclick = loadAnalysis;
 document.getElementById('an-range').addEventListener('change', loadAnalysis);
 setInterval(loadAnalysis, 60000);
@@ -2766,8 +2811,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except (TypeError, ValueError):
                 hours = None
             session = (q.get("session") or [None])[0]
+            tf = (q.get("tf") or ["5m"])[0]
             try:
-                return self._json(analyze.compute_report(hours, session))
+                return self._json(analyze.compute_report(
+                    hours, session, state_dir=_state_dir_for(tf)))
             except Exception as e:
                 return self._json({"ok": False, "error": str(e)}, 500)
 
@@ -2789,10 +2836,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         # Logs API
         if path == "/api/logs":
+            from urllib.parse import urlparse, parse_qs
+            _tf = (parse_qs(urlparse(self.path).query).get("tf") or ["5m"])[0]
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.send_header("Cache-Control", "no-store")
-            body = _get_logs().encode("utf-8")
+            body = _get_logs(_tf).encode("utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -2801,9 +2850,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # State JSON files
         if path.startswith("/state/") and path.endswith(".json"):
             # Sanitize: only allow simple filenames
+            from urllib.parse import urlparse, parse_qs
             fname = os.path.basename(path)
             if fname in ("stats.json", "trades.json", "status.json"):
-                fpath = os.path.join(STATE_DIR, fname)
+                _tf = (parse_qs(urlparse(self.path).query).get("tf") or ["5m"])[0]
+                fpath = os.path.join(_state_dir_for(_tf), fname)
                 return self._serve_file(fpath, "application/json")
 
         # Fallback 404

@@ -32,8 +32,17 @@ STATS = os.path.join(_STATE, "stats.json")
 MOMENTUM_TARGET_N = 100  # sample size where the verdict starts to mean something
 
 
-def load_rows(hours: float | None, session: str | None) -> list[dict]:
+def paths_for(state_dir: str | None = None) -> tuple[str, str]:
+    """(history_jsonl, stats_json) for a given state dir (None = this one)."""
+    st = state_dir or _STATE
+    return (os.path.join(st, "archive", "trades_history.jsonl"),
+            os.path.join(st, "stats.json"))
+
+
+def load_rows(hours: float | None, session: str | None,
+              state_dir: str | None = None) -> list[dict]:
     rows = []
+    HISTORY, _ = paths_for(state_dir)
     if not os.path.isfile(HISTORY):
         return rows
     cutoff = time.time() - hours * 3600 if hours else None
@@ -115,9 +124,15 @@ def _agg(label: str, rows: list[dict]) -> dict:
 
 
 def compute_report(hours: float | None = None,
-                   session: str | None = None) -> dict:
-    """Structured report used by both the CLI and the dashboard."""
-    rows = load_rows(hours, session)
+                   session: str | None = None,
+                   state_dir: str | None = None) -> dict:
+    """Structured report used by both the CLI and the dashboard.
+
+    state_dir lets the dashboard analyse any timeframe's archive without
+    re-importing the module with a different TIMEFRAME.
+    """
+    rows = load_rows(hours, session, state_dir)
+    _, STATS_P = paths_for(state_dir)
     scope = (f"last {hours:g}h" if hours
              else (f"session {session}" if session else "all history"))
     out: dict = {"ok": True, "scope": scope, "n": len(rows),
@@ -181,9 +196,9 @@ def compute_report(hours: float | None = None,
         src[k] = src.get(k, 0) + 1
     out["sources"] = src
 
-    if os.path.isfile(STATS):
+    if os.path.isfile(STATS_P):
         try:
-            s = json.load(open(STATS, encoding="utf-8"))
+            s = json.load(open(STATS_P, encoding="utf-8"))
             out["session_id"] = s.get("session_id")
             out["skips"] = {k: v for k, v in (s.get("skips") or {}).items() if v}
             out["stream_warning"] = (
