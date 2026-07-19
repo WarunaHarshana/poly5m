@@ -219,7 +219,14 @@ LATE_MOMENTUM_BIDIRECTIONAL = _env_bool("LATE_MOMENTUM_BIDIRECTIONAL", True)
 # momentum gates mutually unsatisfiable: a modest move + edge>=0 requires an
 # ask well below where the book prices favorites late in the slot.
 LATE_MOMENTUM_MIN_ENTRY = float(os.getenv("LATE_MOMENTUM_MIN_ENTRY", "0.55"))
-LATE_MOMENTUM_MAX_ENTRY = float(os.getenv("LATE_MOMENTUM_MAX_ENTRY", "0.92"))
+# 0.80 cap set 2026-07-19 from 203 fee-adjusted late_momentum trades. Edge
+# declines monotonically with entry price because the breakeven win rate
+# (= the price) rises faster than the model's directional accuracy:
+#   <0.70 +$1.67/trade | 0.70-0.80 +$0.35 | 0.80-0.90 ~$0.00 | 0.90+ -$0.12
+# Mechanism: a cheap favorite means the book is UNDER-reacting to a move the
+# Chainlink feed already sees. Above ~0.90 the book has fully priced it and
+# there is nothing left to buy.
+LATE_MOMENTUM_MAX_ENTRY = float(os.getenv("LATE_MOMENTUM_MAX_ENTRY", "0.80"))
 # Edge floor AND ceiling (model_prob − ask). Archive buckets: edge 0–0.05 was
 # the best performer; edge ≥ 0.15 was the WORST (75% WR, −$0.15/trade) — a
 # huge "model edge" in the last minute usually means stale strike / vol

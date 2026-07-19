@@ -55,12 +55,45 @@ def fnum(row, key, default=0.0):
         return default
 
 
+def net_pnl(row) -> float:
+    """PnL with real taker fees applied.
+
+    Trades archived before the fee model (2026-07-18) recorded fee_usd=0, so
+    their stored pnl is OVERSTATED. Retro-charge them at the real rate —
+    otherwise historical buckets look profitable when they were not (this
+    exact illusion made 0.80-0.90 entries look like a small edge).
+    """
+    pnl = fnum(row, "pnl")
+    fee = fnum(row, "fee_usd")
+    if fee > 0:
+        return pnl
+    try:
+        import config
+        return pnl - fnum(row, "shares") * config.taker_fee_per_share(
+            fnum(row, "entry_price"))
+    except Exception:
+        return pnl
+
+
+def est_fee(row) -> float:
+    """Fee actually charged, or the retro estimate for old rows."""
+    fee = fnum(row, "fee_usd")
+    if fee > 0:
+        return fee
+    try:
+        import config
+        return fnum(row, "shares") * config.taker_fee_per_share(
+            fnum(row, "entry_price"))
+    except Exception:
+        return 0.0
+
+
 def _agg(label: str, rows: list[dict]) -> dict:
     n = len(rows)
     if not n:
         return {"label": label, "n": 0}
     wins = sum(1 for r in rows if r.get("won"))
-    pnl = sum(fnum(r, "pnl") for r in rows)
+    pnl = sum(net_pnl(r) for r in rows)   # fee-adjusted (see net_pnl)
     stake = sum(fnum(r, "stake_usd") for r in rows)
     return {
         "label": label,
@@ -71,7 +104,7 @@ def _agg(label: str, rows: list[dict]) -> dict:
         "expectancy": round(pnl / n, 3),
         "avg_entry": round(sum(fnum(r, "entry_price") for r in rows) / n, 3),
         "avg_stake": round(stake / n, 2),
-        "fees": round(sum(fnum(r, "fee_usd") for r in rows), 2),
+        "fees": round(sum(est_fee(r) for r in rows), 2),
     }
 
 
@@ -102,7 +135,7 @@ def compute_report(hours: float | None = None,
         n = len(mom)
         wins = sum(1 for r in mom if r.get("won"))
         avg_entry = sum(fnum(r, "entry_price") for r in mom) / n
-        fees = sum(fnum(r, "fee_usd") for r in mom)
+        fees = sum(est_fee(r) for r in mom)
         stake = sum(fnum(r, "stake_usd") for r in mom) or 1.0
         breakeven = avg_entry + fees / stake * avg_entry
         achieved = wins / n
@@ -122,10 +155,10 @@ def compute_report(hours: float | None = None,
             ],
         }
 
-    ordered = sorted(rows, key=lambda r: abs(fnum(r, "pnl")), reverse=True)
+    ordered = sorted(rows, key=lambda r: abs(net_pnl(r)), reverse=True)
     top = ordered[0]
-    total = sum(fnum(r, "pnl") for r in rows)
-    top_pnl = fnum(top, "pnl")
+    total = sum(net_pnl(r) for r in rows)
+    top_pnl = net_pnl(top)
     out["outlier"] = {
         "side": top.get("side"),
         "pnl": round(top_pnl, 2),
