@@ -86,3 +86,41 @@ fee rebates instead of paying the 7% taker fee).
 - Wallet auth: CLOB accepts creds, signature_type=3, creds cached in
   `state/poly_api_creds.json`.
 - Live balance found 2026-07-18: **$0.57 — must deposit before trading.**
+
+## Running multiple timeframes in parallel
+
+Verified 2026-07-19: only **5m, 15m and 4h** series exist (1h / 30m / 10m
+do NOT). Each instance needs its own state directory or they overwrite
+each other's trades — that is automatic for non-5m runs.
+
+```powershell
+# terminal 1 — 5m (default, uses state/)
+python bot.py --mode paper_live --rounds 200
+
+# terminal 2 — 15m (uses state/15m/ automatically)
+$env:TIMEFRAME='15m'; python bot.py --mode paper_live --rounds 100
+```
+
+TIMEFRAME must be set in the environment, not via `--timeframe`: the slug
+prefix and state paths are resolved at import time.
+
+Analyse each series separately (they are different strategies statistically):
+
+```powershell
+python analyze.py                                    # 5m
+# for 15m, point HISTORY at state/15m/archive/trades_history.jsonl
+```
+
+### Honest trade-offs before you do this
+
+- **Liquidity is ~4x worse on 15m** ($23k/24h vs $81k on 5m) — expect
+  worse fills and fewer maker fills, which is where the edge now is.
+- **Correlated exposure.** 5m and 15m windows overlap; being long UP on
+  both is one bigger directional bet, not diversification. The risk caps
+  are PER INSTANCE, so two instances = double the configured exposure.
+  Halve the stake settings if you run both.
+- **The upside is sample size**, not edge: +4 slots/hour on top of 12,
+  i.e. ~33% faster learning. The late-window logic itself transfers
+  cleanly (fair value keys off REMAINING seconds, not window length).
+- **4h is not worth it** at 0.25 slots/hour — one trade every four hours
+  will never accumulate a meaningful sample.

@@ -70,7 +70,18 @@ LIVE_AGGRESSIVE = _env_bool("LIVE_AGGRESSIVE", False)
 # The bot computes the current slot as floor(now/SLOT_SECONDS)*SLOT_SECONDS and
 # fetches that event by slug. Override the prefix only if Polymarket renames it.
 ASSET = os.getenv("ASSET", "btc").strip().lower()
-SLOT_SECONDS = int(os.getenv("SLOT_SECONDS", "300"))  # 5-minute slots
+
+# Which recurring series to trade. Verified live 2026-07-19: only 5m, 15m
+# and 4h exist (1h / 30m / 10m / 3m / 1m do NOT). Longer series are far
+# thinner: 5m ~$81k/24h vs 15m ~$23k, so expect worse fills on 15m.
+# The late-window logic itself transfers cleanly between series — the fair
+# value model keys off REMAINING seconds, not window length.
+TIMEFRAME = (os.getenv("TIMEFRAME", "5m") or "5m").strip().lower()
+_TF_SECONDS = {"5m": 300, "15m": 900, "4h": 14400}
+if TIMEFRAME not in _TF_SECONDS:
+    print(f"[config] unknown TIMEFRAME '{TIMEFRAME}' -> 5m")
+    TIMEFRAME = "5m"
+SLOT_SECONDS = int(os.getenv("SLOT_SECONDS", str(_TF_SECONDS[TIMEFRAME])))
 
 BTC_SLUG_PREFIX = ""
 BTC_MARKET_ASSET_TERMS = []
@@ -81,8 +92,9 @@ BTC_PRICE_SOURCES = []
 def reapply_asset_config():
     global BTC_SLUG_PREFIX, BTC_MARKET_ASSET_TERMS, BTC_MARKET_UPDOWN_TERMS, BTC_MARKET_MATCH, BTC_PRICE_SOURCES
     
-    # Target slug prefix dynamically mapped to ASSET
-    BTC_SLUG_PREFIX = os.getenv("BTC_SLUG_PREFIX") or f"{ASSET}-updown-5m-"
+    # Target slug prefix mapped to ASSET *and* TIMEFRAME
+    BTC_SLUG_PREFIX = (os.getenv("BTC_SLUG_PREFIX")
+                       or f"{ASSET}-updown-{TIMEFRAME}-")
     
     # Asset terms dynamically mapped
     default_asset_terms = f"{ASSET},bitcoin" if ASSET == "btc" else (f"{ASSET},ethereum" if ASSET == "eth" else f"{ASSET},solana")

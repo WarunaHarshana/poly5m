@@ -34,7 +34,15 @@ from risk import RiskManager
 from executor import PaperExecutor, Trade, stamp_trade_times
 from decision_journal import log_decision
 
-STATE_DIR = os.path.join(os.path.dirname(__file__), "state")
+# Parallel timeframe instances MUST NOT share state files or they overwrite
+# each other's trades/stats. STATE_SUBDIR (or --timeframe on a non-5m run)
+# gives each instance its own directory; the 5m default keeps the original
+# paths so existing history and the dashboard are unaffected.
+_STATE_SUB = (os.getenv("STATE_SUBDIR") or "").strip()
+if not _STATE_SUB and getattr(config, "TIMEFRAME", "5m") != "5m":
+    _STATE_SUB = config.TIMEFRAME
+STATE_DIR = os.path.join(os.path.dirname(__file__), "state", _STATE_SUB) \
+    if _STATE_SUB else os.path.join(os.path.dirname(__file__), "state")
 os.makedirs(STATE_DIR, exist_ok=True)
 TRADES_PATH = os.path.join(STATE_DIR, "trades.json")
 STATS_PATH = os.path.join(STATE_DIR, "stats.json")
@@ -1704,6 +1712,10 @@ if __name__ == "__main__":
                          "late_momentum (other strategies were retired)")
     ap.add_argument("--asset", choices=["btc", "eth", "sol"], default=None,
                     help="btc | eth | sol (defaults to asset in .env/config)")
+    ap.add_argument("--timeframe", choices=["5m", "15m", "4h"], default=None,
+                    help="which recurring series to trade (only these exist). "
+                         "Non-5m runs use their own state/<tf>/ directory so "
+                         "parallel instances do not clobber each other.")
     ap.add_argument("--rounds", type=int, default=None)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--sleep", type=float, default=0.0)
@@ -1719,6 +1731,17 @@ if __name__ == "__main__":
     if args.asset:
         config.ASSET = args.asset.lower()
         config.reapply_asset_config()
+    if args.timeframe and args.timeframe != config.TIMEFRAME:
+        # TIMEFRAME shapes the slug prefix and the state paths, both of which
+        # are resolved at import time — setting it via CLI here would be too
+        # late and would silently write into the 5m state directory.
+        raise SystemExit(
+            f"--timeframe {args.timeframe} must be set via the environment so "
+            f"slug + state paths are built for that series:\n"
+            f"  PowerShell:  $env:TIMEFRAME='{args.timeframe}'; "
+            f"python bot.py --mode paper_live\n"
+            f"  bash:        TIMEFRAME={args.timeframe} "
+            f"python bot.py --mode paper_live")
     if args.strategy:
         config.STRATEGY = args.strategy
     # Normalize menu aliases (late_every -> EVERY_SLOT on, late_scalp selective)
