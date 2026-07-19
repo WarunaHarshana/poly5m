@@ -85,12 +85,41 @@ def reset_state():
 
 
 _status: dict = {}
+# Trades placed but not yet settled. Since settlement moved to background
+# tasks the main loop keeps writing status for the NEXT slot, which clobbered
+# the "holding" snapshot — the dashboard showed phase=waiting/side=None while
+# money was actually at risk. This list survives those writes so the UI can
+# always show what is open (there can be several at once).
+_open_positions: dict = {}
+
+
+def _register_open(trade, end_ts) -> None:
+    _open_positions[str(trade.round_id)] = {
+        "round_id": trade.round_id,
+        "side": trade.side,
+        "entry_price": trade.entry_price,
+        "shares": trade.shares,
+        "stake_usd": trade.stake_usd,
+        "end_ts": end_ts,
+        "slug": trade.slug,
+        "question": trade.question,
+        "event_url": trade.event_url,
+        "placed_ts": trade.ts,
+        "time_et": trade.time_et,
+        "is_maker": bool(getattr(trade, "is_maker", False)),
+    }
+
+
+def _clear_open(trade) -> None:
+    _open_positions.pop(str(getattr(trade, "round_id", "")), None)
 
 
 def write_status(**kw):
     """Merge + persist a live snapshot for the dashboard status bar."""
     _status.update(kw)
     _status["mode"] = config.MODE
+    # Always current, never stale-merged like the rest of the snapshot.
+    _status["open_positions"] = list(_open_positions.values())
     _status["updated_at"] = time.time()
     try:
         from config import get_time_suitability
@@ -954,6 +983,10 @@ async def run_realtime(rounds: int = 100, paper: bool = True):
                 # Release exposure so one settle failure can't wedge sizing.
                 risk.on_close(stake, 0.0)
                 persist(trades, risk, skips)
+        finally:
+            # Position is no longer open however this ended.
+            _clear_open(trade)
+            write_status()
 
     async def _try_arb(market, question, end_ts, remaining):
         """Detect and (paper-)execute a sum-to-one arb. One attempt per slot.
@@ -1065,6 +1098,7 @@ async def run_realtime(rounds: int = 100, paper: bool = True):
         )
         stamp_trade_times(trade)
         risk.on_open(stake)
+        _register_open(trade, end_ts)
         placed += 1
         print(f"  TRADE PLACED [arb] R{trade.round_id} ARB "
               f"{shares:.2f} pairs @ {pair_cost:.3f} ${stake:.2f} "
@@ -1591,6 +1625,7 @@ async def run_realtime(rounds: int = 100, paper: bool = True):
         )
         stamp_trade_times(trade)
         risk.on_open(stake)
+        _register_open(trade, end_ts)
         trade_event_id = f"placed-{trade.round_id}-{int(trade.ts)}"
         strat_lbl = "late_momentum"
         try:

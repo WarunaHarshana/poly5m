@@ -109,9 +109,10 @@ STRATEGY_FIELDS = [
     {"key": "LATE_MOMENTUM_MAX_ENTRY", "label": "Max entry ask", "type": "float",
      "default": "0.88", "group": "late_momentum",
      "hint": "0.80-0.90 is breakeven (n=92) and gives trade flow; 0.90+ loses -$0.12/trade"},
-    {"key": "LATE_MOMENTUM_MIN_EDGE", "label": "Edge floor (0=off)", "type": "float",
+    {"key": "LATE_MOMENTUM_MIN_EDGE", "label": "Edge floor (0 = NO filter)", "type": "float",
      "default": "0.0", "group": "late_momentum",
-     "hint": "Min model_prob − ask; archive says small/no floor is fine"},
+     "hint": "0 disables the floor entirely (negative-edge trades allowed). "
+             "Use 0.01+ to actually require positive edge"},
     {"key": "LATE_MOMENTUM_MAX_EDGE", "label": "Edge ceiling (0=off)", "type": "float",
      "default": "0.10", "group": "late_momentum",
      "hint": "Skip when model is FAR above book — stale strike, book usually right"},
@@ -1672,6 +1673,15 @@ body.trade-flash-lose { animation: page-flash-down 1.6s ease-out; }
     </div>
   </div>
 
+  <!-- ===== OPEN POSITIONS (placed, not yet settled) ===== -->
+  <div class="panel glass-card" id="open-panel" style="display:none;margin-bottom:14px">
+    <div class="phead">
+      <span>Open Positions · live</span>
+      <span id="open-sub" class="mono">—</span>
+    </div>
+    <div style="overflow-x:auto"><table id="open-rows"></table></div>
+  </div>
+
   <!-- ===== TRADE BLOTTER ===== -->
   <div class="panel glass-card blotter">
     <div class="phead"><span>Trade Blotter · Newest First</span><span id="blsub">—</span></div>
@@ -1795,6 +1805,8 @@ function everySecond() {
     el.textContent = '--:--';
     el.className = 'sb-v big mono';
   }
+
+  renderOpenPositions();  // keep open-position countdowns ticking
 
   // connection freshness (measure if server is responding to polling)
   const stale = (Date.now() / 1000 - lastPollTime) > 8 || !lastPollTime;
@@ -1925,6 +1937,49 @@ function handleTradeEvent(st) {
   }
 }
 
+/* ===== OPEN POSITIONS (placed but not yet settled) ===== */
+let openPositions = [];
+
+function renderOpenPositions() {
+  const panel = document.getElementById('open-panel');
+  const tbl = document.getElementById('open-rows');
+  const sub = document.getElementById('open-sub');
+  if (!panel || !tbl) return;
+  if (!openPositions.length) { panel.style.display = 'none'; return; }
+  panel.style.display = '';
+  const now = Date.now() / 1000 + serverTimeOffset;
+  let atRisk = 0;
+  tbl.innerHTML =
+    '<thead><tr><th>Placed (ET)</th><th>Round</th><th>Side</th><th>Entry</th>' +
+    '<th>Shares</th><th>Stake</th><th>Fill</th><th>Resolves in</th><th>Market</th>' +
+    '</tr></thead><tbody>' +
+    openPositions.map(p => {
+      atRisk += Number(p.stake_usd || 0);
+      const cls = p.side === 'ARB' ? 'arb' : (p.side === 'UP' ? 'up' : 'down');
+      let rem = p.end_ts ? Math.round(p.end_ts - now) : null;
+      let remTxt, remCls = '';
+      if (rem === null) { remTxt = '—'; }
+      else if (rem > 0) {
+        const m = Math.floor(rem / 60), sec = rem % 60;
+        remTxt = (m < 10 ? '0' : '') + m + ':' + (sec < 10 ? '0' : '') + sec;
+        remCls = rem <= 30 ? 'count-soon' : 'count-live';
+      } else { remTxt = 'resolving…'; remCls = 'count-soon'; }
+      const label = p.question || p.slug || '—';
+      const link = p.event_url
+        ? `<a href="${p.event_url}" target="_blank" rel="noopener">${label.length > 38 ? label.slice(0, 36) + '…' : label}</a>`
+        : (label.length > 38 ? label.slice(0, 36) + '…' : label);
+      return `<tr><td class="mono">${(p.time_et || '').replace(/^.*?(\d{1,2}:\d{2}:\d{2})/, '$1') || '—'}</td>` +
+        `<td>R${p.round_id}</td><td class="${cls}">${p.side}</td>` +
+        `<td>${Number(p.entry_price).toFixed(3)}</td>` +
+        `<td>${Number(p.shares).toFixed(2)}</td>` +
+        `<td>${fmtUsd(p.stake_usd)}</td>` +
+        `<td>${p.is_maker ? '<span class="won">maker</span>' : 'taker'}</td>` +
+        `<td class="mono ${remCls}">${remTxt}</td>` +
+        `<td class="slot-link">${link}</td></tr>`;
+    }).join('') + '</tbody>';
+  sub.textContent = openPositions.length + ' open · ' + fmtUsd(atRisk) + ' at risk';
+}
+
 /* ===== STATUS RENDER ===== */
 function renderStatus(st) {
   if (!st) return;
@@ -1973,6 +2028,8 @@ function renderStatus(st) {
     }
   }
 
+  openPositions = Array.isArray(st.open_positions) ? st.open_positions : [];
+  renderOpenPositions();
   slotEndTs = (st.end_ts && ['analyzing', 'holding', 'waiting', 'resolving'].includes(st.phase)) ? st.end_ts : null;
   handleTradeEvent(st);
   everySecond();
