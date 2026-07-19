@@ -1733,7 +1733,6 @@ let currentPhase = '';
 let serverTimeOffset = 0;
 let lastPollTime = 0;
 let lastTradeEventId = null;
-try { lastTradeEventId = localStorage.getItem('last_trade_event_id'); } catch (e) {}
 // MUST be declared here, before everySecond() first runs: it calls
 // renderOpenPositions(), and a `let` read before its declaration throws a
 // ReferenceError that kills the rest of the script (whole UI dead).
@@ -1907,9 +1906,21 @@ function desktopNotify(title, body) {
 
 function handleTradeEvent(st) {
   if (!st || !st.trade_event || !st.trade_event_id) return;
-  if (String(st.trade_event_id) === String(lastTradeEventId)) return;
-  lastTradeEventId = String(st.trade_event_id);
-  try { localStorage.setItem('last_trade_event_id', lastTradeEventId); } catch (e) {}
+  const evId = String(st.trade_event_id);
+  // Read per-timeframe so switching series cannot replay the other's event.
+  let seen = lastTradeEventId;
+  if (!seen) {
+    try { seen = localStorage.getItem(ck('last_trade_event_id')); } catch (e) {}
+  }
+  if (evId === String(seen)) return;
+  lastTradeEventId = evId;
+  try { localStorage.setItem(ck('last_trade_event_id'), evId); } catch (e) {}
+  // status.json keeps the LAST trade event indefinitely, so a fresh browser
+  // (empty localStorage) fired a "WON" popup for a trade that settled ages
+  // ago — with "@ —" because the main loop had since cleared mkt. Ids look
+  // like "resolved-<round>-<unix_ts>": mark old ones seen, but stay silent.
+  const evTs = parseInt(evId.split('-').pop(), 10);
+  if (Number.isFinite(evTs) && (Date.now() / 1000 - evTs) > 90) return;
 
   const side = (st.side || '').toUpperCase();
   const mkt = st.mkt != null ? Number(st.mkt).toFixed(2) : '—';
