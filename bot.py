@@ -287,6 +287,7 @@ def persist(trades, risk, skip_counts: dict | None = None):
     mom_pnl = sum(t.pnl for t in mom)
     arb_pnl = sum(t.pnl for t in arb_t)
     total_fees = sum(getattr(t, "fee_usd", 0.0) or 0.0 for t in settled)
+    maker_n = sum(1 for t in mom if getattr(t, "is_maker", False))
     avg_edge = (sum(t.edge for t in settled) / len(settled)) if settled else 0.0
     avg_entry = (sum(t.entry_price for t in settled) / len(settled)) if settled else 0.0
     avg_stake = (sum(t.stake_usd for t in settled) / len(settled)) if settled else 0.0
@@ -319,6 +320,8 @@ def persist(trades, risk, skip_counts: dict | None = None):
         "arb_trades": len(arb_t),
         "arb_pnl": round(arb_pnl, 2),
         "fees_paid": round(total_fees, 2),
+        "maker_fills": maker_n,
+        "maker_fill_rate": round(100 * maker_n / len(mom), 1) if mom else 0.0,
         "avg_edge": round(avg_edge, 4),
         "avg_entry": round(avg_entry, 4),
         "avg_stake": round(avg_stake, 2),
@@ -512,6 +515,48 @@ def _scan_sum_to_one_arb(pub, market) -> dict | None:
             }
     except Exception:
         return None
+    return None
+
+
+async def _try_maker_entry(pub, market, side: str, best_ask: float,
+                           remaining: float | None) -> float | None:
+    """Rest one tick under the ask; return the fill price if we got filled.
+
+    PAPER FILL RULE (deliberately strict): we only count a fill when the
+    observed best ask drops to at or below our resting price — i.e. the
+    market actually traded down to us. Simply waiting never produces a fill.
+
+    Still slightly optimistic: it ignores queue position (other bids at our
+    price may absorb the flow first), so treat maker fill RATES from paper as
+    an upper bound. The fill PRICE and the zero fee are exact.
+    """
+    if not getattr(config, "MAKER_FIRST_ENABLED", True):
+        return None
+    tick = 0.01
+    ticks = max(1, int(getattr(config, "MAKER_IMPROVE_TICKS", 1) or 1))
+    limit = round(float(best_ask) - tick * ticks, 2)
+    if limit <= 0 or limit < float(getattr(config, "MIN_ENTRY_PRICE", 0) or 0):
+        return None
+    wait_s = float(getattr(config, "MAKER_WAIT_SECONDS", 3.0) or 0.0)
+    min_rem = float(getattr(config, "MAKER_MIN_REMAINING", 6.0) or 0.0)
+    if remaining is not None and remaining - wait_s < min_rem:
+        return None  # not enough slot left to wait then still act
+    if config.ROUND_SECONDS <= 0:
+        wait_s = min(wait_s, 0.05)  # fast/test mode
+    deadline = time.time() + wait_s
+    while time.time() < deadline:
+        await asyncio.sleep(min(0.5, max(0.05, wait_s / 6.0)))
+        q = await asyncio.to_thread(_quote_side, pub, market, side)
+        if not q:
+            continue
+        # best_ask is None when the book is one-sided and buy_quote fell back
+        # to the midpoint — use the executable price in that case, otherwise
+        # the fill check silently never triggers.
+        ba = q.get("best_ask")
+        if ba is None:
+            ba = q.get("price")
+        if ba is not None and float(ba) <= limit + 1e-9:
+            return limit
     return None
 
 
@@ -1475,10 +1520,26 @@ async def run_realtime(rounds: int = 100, paper: bool = True):
                 await _sleep_until_slot_end(end_ts, cl_stream)
                 continue
 
+        # --- MAKER-FIRST: try to rest under the ask before crossing ---
+        # Makers pay ZERO fee here (feeSchedule.takerOnly), and the fee is
+        # several times the spread — so this is the single largest
+        # controllable cost in the system.
+        is_maker = False
+        maker_ok = (paper or getattr(config, "MAKER_FIRST_LIVE", False))
+        if maker_ok:
+            rem_now = (end_ts - _now(cl_stream)) if end_ts else remaining
+            maker_px = await _try_maker_entry(pub, market, side, mkt, rem_now)
+            if maker_px is not None:
+                is_maker = True
+                mkt = maker_px
+                print(f"  [maker] filled resting @ {maker_px:.3f} "
+                      f"(ask was {q['price']:.3f}) — no taker fee")
+
         # Pessimistic paper fills — pay ask + slippage (thin end-of-slot books
         # slip the most; skipping this made late paper results unrealistic).
+        # Maker fills skip slippage: we set the price, we did not cross.
         fill_px = float(mkt)
-        if paper:
+        if paper and not is_maker:
             slip = float(getattr(config, "PAPER_FILL_SLIPPAGE", 0.01) or 0.0)
             if slip > 0:
                 fill_px = min(0.99, float(mkt) + slip)
@@ -1488,6 +1549,9 @@ async def run_realtime(rounds: int = 100, paper: bool = True):
                     print(f"  [paper] pessimistic fill ask {mkt:.3f} + "
                           f"slip {slip:.3f} -> {fill_px:.3f} "
                           f"(shares={shares:.2f} stake=${stake:.2f})")
+        elif is_maker:
+            shares = round(stake / fill_px, 4) if fill_px > 0 else shares
+            stake = round(shares * fill_px, 2)
 
         trade = Trade(
             ts=time.time(),
@@ -1498,7 +1562,11 @@ async def run_realtime(rounds: int = 100, paper: bool = True):
             stake_usd=stake,
             model_prob=round(model_side_prob, 4),
             edge=round(edge, 4),
-            fee_usd=round(shares * config.taker_fee_per_share(fill_px, fee_rate), 4),
+            # Maker fills pay no fee (takerOnly). Rebates are real but NOT
+            # credited — they are a proportional daily pool, not guaranteed.
+            fee_usd=(0.0 if is_maker else
+                     round(shares * config.taker_fee_per_share(fill_px, fee_rate), 4)),
+            is_maker=is_maker,
             slug=market.get("slug") or "",
             question=question,
             slot_start_ts=slot_start_time,
@@ -1565,14 +1633,18 @@ async def run_realtime(rounds: int = 100, paper: bool = True):
                     q2 = await asyncio.to_thread(_quote_side, pub, market, sig.side)
                     if not q2 or "price" not in q2:
                         raise RuntimeError("failed to re-check quote before order")
-                    if q2["price"] > mkt + 0.02:
-                        raise RuntimeError(
-                            f"ask moved {mkt:.3f} -> {q2['price']:.3f} before order")
-                    if q2["price"] > mkt:
-                        mkt = q2["price"]
-                        trade.entry_price = round(mkt, 4)
-                        shares = round(stake / mkt, 4)
-                        trade.shares = shares
+                    # Maker orders rest BELOW the ask on purpose — an ask that
+                    # is higher than our limit is expected, not a reason to
+                    # abort or to chase upward.
+                    if not is_maker:
+                        if q2["price"] > mkt + 0.02:
+                            raise RuntimeError(
+                                f"ask moved {mkt:.3f} -> {q2['price']:.3f} before order")
+                        if q2["price"] > mkt:
+                            mkt = q2["price"]
+                            trade.entry_price = round(mkt, 4)
+                            shares = round(stake / mkt, 4)
+                            trade.shares = shares
                 except RuntimeError:
                     raise
                 except Exception:

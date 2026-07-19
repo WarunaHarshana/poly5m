@@ -86,6 +86,7 @@ class Trade:
     event_url: str = ""
     resolve_source: str = ""     # polymarket-official / chainlink-stream / ...
     fee_usd: float = 0.0         # taker fee (crypto_fees_v2); deducted from pnl
+    is_maker: bool = False       # resting fill -> zero fee (takerOnly venue)
 
     def to_dict(self):
         # Ensure times are populated even if older code paths skipped stamping.

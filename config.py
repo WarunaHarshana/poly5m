@@ -285,6 +285,28 @@ FIXED_STAKE_USD = float(os.getenv("FIXED_STAKE_USD", "0"))
 MIN_QUOTE = float(os.getenv("MIN_QUOTE", "0.02"))
 MAX_QUOTE = float(os.getenv("MAX_QUOTE", "0.98"))
 
+# --- Maker-first execution (verified: feeSchedule.takerOnly=True) ---
+# Takers pay rate*min(p,1-p)/share; MAKERS PAY ZERO and additionally receive
+# a share of the taker-fee pool (rebateRate 0.2). On this venue the fee is
+# several times the typical 1c spread, so the prize for resting an order is
+# not spread capture — it is fee avoidance.
+# Flow: post 1 tick under the ask, wait briefly; if the market trades down to
+# us we filled as a maker (no fee). If not, fall back to crossing at the ask
+# exactly as before — so this can only improve the entry, never lose a trade.
+MAKER_FIRST_ENABLED = _env_bool("MAKER_FIRST_ENABLED", True)
+# Ticks below the best ask to rest at (1 tick = 0.01 here).
+MAKER_IMPROVE_TICKS = int(os.getenv("MAKER_IMPROVE_TICKS", "1"))
+# Seconds to wait for the market to come to our price.
+MAKER_WAIT_SECONDS = float(os.getenv("MAKER_WAIT_SECONDS", "3.0"))
+# Never start a maker attempt without this much slot time left afterwards.
+MAKER_MIN_REMAINING = float(os.getenv("MAKER_MIN_REMAINING", "6.0"))
+# Live maker-first is OFF by default: it needs cancel/fill race handling that
+# has not been validated against the real exchange. Paper proves it first.
+MAKER_FIRST_LIVE = _env_bool("MAKER_FIRST_LIVE", False)
+# Maker rebates are a proportional daily pool — real, but NOT credited to
+# PnL here. Counting speculative rebates would be the same optimistic
+# accounting the fee bug already taught us to avoid.
+
 # --- Trading fees (verified live 2026-07-18 via Gamma feeSchedule) ---
 # Polymarket 5m crypto markets charge TAKERS: rate * min(p, 1-p) per share.
 # rate=0.07 → ~3.5c/share at p=0.5, ~1c/share at p=0.85. Makers get rebates.

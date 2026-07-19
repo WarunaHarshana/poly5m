@@ -199,4 +199,48 @@ print("PHASE_C_OK (live order path) trades=", stats_c["trades"],
       "orders=", len(buys), "cancels=", len(cancels),
       "avg_stake=", stats_c["avg_stake"])
 
-print("\nSELFTEST_OK momentum+arb+live")
+# ---- Phase D: maker-first execution ----
+# D1: market NEVER trades down to our resting price -> must NOT fill as
+#     maker; falls back to crossing at the ask and paying the taker fee.
+config.MODE = "paper_live"
+config.MAKER_FIRST_ENABLED = True
+config.MAKER_IMPROVE_TICKS = 1
+config.MAKER_WAIT_SECONDS = 1.0
+config.MAKER_MIN_REMAINING = 0.0
+config.LATE_MOMENTUM_MIN_MOVE = 10.0
+config.LATE_MOMENTUM_MAX_ENTRY = 0.92
+config.ARB_TRADE_ENABLED = False
+polymarket_client.PolymarketPublic = FakePubMomentum   # ask pinned at 0.70
+stats_d1 = asyncio.run(bot.run_realtime(rounds=5, paper=True))
+# ask never drops to 0.69 -> taker path: 0.70 + 0.01 slippage
+assert abs(stats_d1["avg_entry"] - 0.71) < 1e-6, stats_d1["avg_entry"]
+assert stats_d1["fees_paid"] > 0, "taker fallback must pay fees"
+print("PHASE_D1_OK (no maker fill when market never comes to us) "
+      "avg_entry=", stats_d1["avg_entry"], "fees=", stats_d1["fees_paid"])
+
+
+class FakePubMakerFill(FakePubMomentum):
+    """Per slot: ask reads 0.70 first, then 0.69 -> our resting bid is hit.
+
+    Counted PER TOKEN so every round behaves identically (a run-wide counter
+    made only the first round fill).
+    """
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.reads = {}
+    def midpoint(self, token_id):
+        if token_id.startswith("MUP"):
+            self.reads[token_id] = self.reads.get(token_id, 0) + 1
+            return 0.70 if self.reads[token_id] <= 1 else 0.69
+        return 0.30
+
+
+polymarket_client.PolymarketPublic = FakePubMakerFill
+stats_d2 = asyncio.run(bot.run_realtime(rounds=5, paper=True))
+# maker fill at 0.70 - 0.01 = 0.69, NO slippage, NO fee
+assert abs(stats_d2["avg_entry"] - 0.69) < 1e-6, stats_d2["avg_entry"]
+assert stats_d2["fees_paid"] == 0, f"maker fills pay no fee, got {stats_d2['fees_paid']}"
+print("PHASE_D2_OK (maker fill when market trades to us) "
+      "avg_entry=", stats_d2["avg_entry"], "fees=", stats_d2["fees_paid"])
+
+print("\nSELFTEST_OK momentum+arb+live+maker")
