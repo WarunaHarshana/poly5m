@@ -51,8 +51,18 @@ def _state_dir_for(tf: str | None) -> str:
         else os.path.join(HERE, "state", tf)
 
 _lock = threading.Lock()
-_bot = {"proc": None, "cmd": None, "mode": None, "log_file": None,
-        "timeframe": "5m"}
+# One process slot PER TIMEFRAME. A single shared slot meant you could not
+# run 5m and 15m together, and — worse — switching the UI to 15m while a 5m
+# bot ran left Stop enabled pointing at the 5m process with no indication.
+_bots: dict = {}
+
+
+def _slot(tf: str | None) -> dict:
+    tf = (tf or "5m").strip().lower()
+    if tf not in ALLOWED_TIMEFRAMES:
+        tf = "5m"
+    return _bots.setdefault(tf, {"proc": None, "cmd": None, "mode": None,
+                                 "log_file": None, "timeframe": tf})
 
 
 # ---------------------------------------------------------------------------
@@ -625,9 +635,18 @@ def _save_wallet(body: dict) -> dict:
 # ---------------------------------------------------------------------------
 # Bot process management (same logic as serve.py + stdout logging)
 # ---------------------------------------------------------------------------
-def _running() -> bool:
-    p = _bot["proc"]
+def _running(tf: str | None = None) -> bool:
+    """True if that timeframe's bot is alive (any bot when tf is None)."""
+    if tf is None:
+        return any(b.get("proc") is not None and b["proc"].poll() is None
+                   for b in _bots.values())
+    p = _slot(tf)["proc"]
     return p is not None and p.poll() is None
+
+
+def _running_timeframes() -> list:
+    return [tf for tf, b in _bots.items()
+            if b.get("proc") is not None and b["proc"].poll() is None]
 
 
 def _get_logs(tf: str | None = None) -> str:
@@ -644,8 +663,16 @@ def _get_logs(tf: str | None = None) -> str:
 
 def _start(opts: dict) -> dict:
     with _lock:
-        if _running():
-            return {"ok": False, "error": "A run is already in progress \u2014 stop it first."}
+        # Guard PER TIMEFRAME: 5m and 15m are separate processes with separate
+        # state, so blocking on "any bot running" needlessly prevented running
+        # both series at once.
+        _tf_req = str(opts.get("timeframe") or "5m").strip().lower()
+        if _tf_req not in ALLOWED_TIMEFRAMES:
+            _tf_req = "5m"
+        if _running(_tf_req):
+            return {"ok": False,
+                    "error": f"A {_tf_req} run is already in progress \u2014 "
+                             f"stop that one first."}
         mode = str(opts.get("mode", "paper_live"))
         if mode not in ALLOWED_MODES:
             return {"ok": False,
@@ -717,8 +744,10 @@ def _start(opts: dict) -> dict:
         os.makedirs(run_state_dir, exist_ok=True)
         log_path = os.path.join(run_state_dir, "bot.log")
         try:
-            if _bot["log_file"]:
-                _bot["log_file"].close()
+            # Close only THIS timeframe's previous handle — closing a shared
+            # one would have yanked the log out from under the other series.
+            if _slot(timeframe)["log_file"]:
+                _slot(timeframe)["log_file"].close()
         except Exception:
             pass
 
@@ -739,17 +768,19 @@ def _start(opts: dict) -> dict:
             log_file.close()
             return {"ok": False, "error": f"Failed to launch bot: {e}"}
 
-        _bot.update(proc=proc, cmd=cmd, mode=mode, log_file=log_file,
-                    timeframe=timeframe)
+        _slot(timeframe).update(proc=proc, cmd=cmd, mode=mode,
+                                log_file=log_file, timeframe=timeframe)
         return {"ok": True, "running": True, "pid": proc.pid, "cmd": cmd,
                 "mode": mode, "timeframe": timeframe}
 
 
-def _stop() -> dict:
+def _stop(tf: str | None = None) -> dict:
     with _lock:
-        p = _bot["proc"]
+        b = _slot(tf)
+        p = b["proc"]
         if p is None or p.poll() is not None:
-            return {"ok": True, "running": False, "message": "Nothing was running."}
+            return {"ok": True, "running": False,
+                    "message": f"Nothing was running on {b['timeframe']}."}
         p.terminate()
         try:
             p.wait(timeout=5)
@@ -758,24 +789,29 @@ def _stop() -> dict:
         
         # Close the log file handle
         try:
-            if _bot["log_file"]:
-                _bot["log_file"].close()
+            if b["log_file"]:
+                b["log_file"].close()
         except Exception:
             pass
-        _bot["log_file"] = None
-        
-        return {"ok": True, "running": False, "message": "Stopped the bot."}
+        b["log_file"] = None
+        b["proc"] = None
+
+        return {"ok": True, "running": False,
+                "message": f"Stopped the {b['timeframe']} bot."}
 
 
-def _state() -> dict:
-    p = _bot["proc"]
+def _state(tf: str | None = None) -> dict:
+    b = _slot(tf)
+    p = b["proc"]
     return {
-        "running": _running(),
+        "running": _running(b["timeframe"]),
         "pid": p.pid if p else None,
-        "mode": _bot["mode"],
-        "timeframe": _bot.get("timeframe") or "5m",
-        "cmd": _bot["cmd"],
+        "mode": b["mode"],
+        "timeframe": b["timeframe"],
+        "cmd": b["cmd"],
         "exit_code": (p.poll() if p else None),
+        # So the UI can show that another series is still trading.
+        "running_timeframes": _running_timeframes(),
     }
 
 
@@ -2219,15 +2255,19 @@ function setCtl(running, s) {
   }
   startBtn.disabled = running;
   stopBtn.disabled = !running;
-  stEl.textContent = running
-    ? ('running · pid ' + ((s && s.pid) || '?'))
-    : 'idle';
+  // Status is per timeframe; note any OTHER series still trading so Stop
+  // is never ambiguous about which bot it targets.
+  const others = ((s && s.running_timeframes) || []).filter(t => t !== curTf());
+  const extra = others.length ? (' · also running: ' + others.join(', ')) : '';
+  stEl.textContent = (running
+    ? (curTf() + ' running · pid ' + ((s && s.pid) || '?'))
+    : (curTf() + ' idle')) + extra;
   stEl.className = 'ctl-status ' + (running ? 'on' : '');
 }
 
 async function ctlState() {
   try {
-    const s = await fetch('/api/control', { cache: 'no-store' }).then(r => r.json());
+    const s = await fetch('/api/control' + tfq(), { cache: 'no-store' }).then(r => r.json());
     setCtl(!!s.running, s);
   } catch (e) {
     setCtl(null);
@@ -2329,7 +2369,11 @@ document.getElementById('c-stop').onclick = async () => {
   msg.textContent = 'stopping…';
   msg.className = 'ctl-msg';
   try {
-    const r = await fetch('/api/stop', { method: 'POST' }).then(r => r.json());
+    const r = await fetch('/api/stop', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ timeframe: curTf() }),
+    }).then(r => r.json());
     msg.textContent = r.message || 'stopped';
     msg.className = 'ctl-msg';
   } catch (e) {
@@ -2820,7 +2864,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         # Control API
         if path == "/api/control":
-            return self._json(_state())
+            from urllib.parse import urlparse, parse_qs
+            _tf = (parse_qs(urlparse(self.path).query).get("tf") or ["5m"])[0]
+            return self._json(_state(_tf))
 
         # Live wallet readiness (never returns full private key)
         if path == "/api/wallet":
@@ -2874,7 +2920,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if route == "/api/start":
             return self._json(_start(opts))
         if route == "/api/stop":
-            return self._json(_stop())
+            _tf = (opts or {}).get("timeframe") if isinstance(opts, dict) else None
+            return self._json(_stop(_tf))
         if route == "/api/wallet":
             return self._json(_save_wallet(opts if isinstance(opts, dict) else {}))
         if route == "/api/settings":

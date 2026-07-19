@@ -1564,7 +1564,10 @@ async def run_realtime(rounds: int = 100, paper: bool = True):
                           f"slip {slip:.3f} -> {fill_px:.3f} "
                           f"(shares={shares:.2f} stake=${stake:.2f})")
         elif is_maker:
-            shares = round(stake / fill_px, 4) if fill_px > 0 else shares
+            # Keep the share count the depth cap approved and spend LESS —
+            # recomputing shares from the cheaper maker price would push size
+            # back above the cap (and past the venue-minimum check already
+            # done above), buying more than the book was shown to support.
             stake = round(shares * fill_px, 2)
 
         trade = Trade(
