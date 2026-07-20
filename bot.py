@@ -84,6 +84,36 @@ def reset_state():
     print(f"[archive] permanent history kept in {ARCHIVE_DIR}")
 
 
+def _atomic_write_json(path: str, obj) -> None:
+    """Write JSON so a reader never sees a half-written file.
+
+    Plain open(path,"w") truncates first: a dashboard poll landing mid-write
+    gets a partial parse, and a process killed while the handle is open can
+    leave the file as pure NUL bytes on Windows (observed: status.json,
+    1052 bytes, all zeros — permanently unreadable until rewritten).
+    Write to a temp file in the same directory, flush+fsync, then os.replace,
+    which is atomic on both Windows and POSIX.
+    """
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2, default=str)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def read_json_safe(path: str, default=None):
+    """Read JSON, tolerating a torn/NUL-filled file from an older run."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = f.read()
+        if not data or data[:1] == "\x00":
+            return default
+        return json.loads(data)
+    except Exception:
+        return default
+
+
 _status: dict = {}
 # Trades placed but not yet settled. Since settlement moved to background
 # tasks the main loop keeps writing status for the NEXT slot, which clobbered
@@ -128,8 +158,7 @@ def write_status(**kw):
     except Exception:
         pass
     try:
-        with open(STATUS_PATH, "w") as f:
-            json.dump(_status, f, indent=2)
+        _atomic_write_json(STATUS_PATH, _status)
     except Exception:
         pass
 
@@ -311,8 +340,7 @@ def archive_records(trades, stats: dict) -> int:
 
 def persist(trades, risk, skip_counts: dict | None = None):
     """Write live dashboard files + permanent archive (survives --reset)."""
-    with open(TRADES_PATH, "w") as f:
-        json.dump([t.to_dict() for t in trades], f, indent=2)
+    _atomic_write_json(TRADES_PATH, [t.to_dict() for t in trades])
     settled = [t for t in trades if t.won is not None]
     wins = sum(1 for t in settled if t.won)
     # Split the headline: ARB wins are structural (a paired position pays
@@ -370,8 +398,7 @@ def persist(trades, risk, skip_counts: dict | None = None):
         "history_jsonl": HISTORY_JSONL,
         "history_csv": HISTORY_CSV,
     }
-    with open(STATS_PATH, "w") as f:
-        json.dump(stats, f, indent=2)
+    _atomic_write_json(STATS_PATH, stats)
     archive_records(trades, stats)
     return stats
 

@@ -198,7 +198,9 @@ def compute_report(hours: float | None = None,
 
     if os.path.isfile(STATS_P):
         try:
-            s = json.load(open(STATS_P, encoding="utf-8"))
+            _raw = open(STATS_P, encoding="utf-8").read()
+            # Tolerate a torn / NUL-filled file left by a killed process.
+            s = json.loads(_raw) if _raw and _raw[:1] != "\x00" else {}
             out["session_id"] = s.get("session_id")
             out["skips"] = {k: v for k, v in (s.get("skips") or {}).items() if v}
             out["stream_warning"] = (

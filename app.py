@@ -2975,6 +2975,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if fname in ("stats.json", "trades.json", "status.json"):
                 _tf = (parse_qs(urlparse(self.path).query).get("tf") or ["5m"])[0]
                 fpath = os.path.join(_state_dir_for(_tf), fname)
+                # A NUL-filled/partial file (process killed mid-write) would
+                # otherwise be served as garbage and break the page render.
+                try:
+                    with open(fpath, "r", encoding="utf-8") as _fh:
+                        _raw = _fh.read()
+                    if not _raw or _raw[:1] == "\x00":
+                        raise ValueError("state file not readable yet")
+                    json.loads(_raw)
+                except FileNotFoundError:
+                    pass
+                except Exception:
+                    self.send_response(404)
+                    self.send_header("Content-Type", "text/plain")
+                    self.end_headers()
+                    self.wfile.write(b"state file unreadable")
+                    return
                 return self._serve_file(fpath, "application/json")
 
         # Fallback 404
