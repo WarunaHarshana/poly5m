@@ -135,3 +135,47 @@ child process inherits TIMEFRAME).
   cleanly (fair value keys off REMAINING seconds, not window length).
 - **4h is not worth it** at 0.25 slots/hour — one trade every four hours
   will never accumulate a meaningful sample.
+
+## Why ARB is paper-only, and what live arb would require
+
+`_try_arb()` refuses to execute when `paper=False` — it logs the signal and
+returns. This is not a missing flag; the live path does not exist. Do not
+"enable" arb live by removing that guard.
+
+### The problem: leg risk
+
+An arb is only riskless if BOTH legs fill. Buy UP at 0.46 and DOWN at 0.46
+and you are guaranteed $1 back. Fill only the UP leg and you are holding a
+naked directional bet you never wanted, at a price you did not choose. In
+5m markets the book can move between the two submissions.
+
+### What a live implementation needs
+
+1. **Near-simultaneous submission** of both legs (the CLOB has no atomic
+   pair order — they are two independent orders).
+2. **Fill monitoring on both legs** with a short deadline.
+3. **An unwind path**: if one leg fills and the other does not within the
+   deadline, immediately sell the filled leg back (crossing the spread and
+   paying the taker fee) rather than carrying the exposure to settlement.
+   Budget for that unwind cost in the edge gate — it is the real cost of
+   the strategy, not the quoted spread.
+4. **Partial-fill handling**: legs can fill for different share counts;
+   the pair is only hedged up to min(fill_up, fill_down).
+5. **A hard cap on concurrent open arbs** so a stuck leg cannot compound.
+
+### The better version: maker arb (unbuilt)
+
+Taker fees are what kill most arbs — near 0.50/0.50 the pair costs ~6.6c in
+fees, which is why `ARB_MIN_LOCKED_EDGE` rejects so many. Resting bids on
+BOTH sides instead pays ZERO fee and earns rebates (`takerOnly: true`,
+`rebateRate: 0.2`). That converts the largest cost into income. It is
+harder: fills are not guaranteed, so it needs the same unwind logic above
+plus inventory management. This is the highest-value unbuilt idea in the
+project.
+
+### Order of operations
+
+1. Momentum live first (it is simpler: one leg, no unwind path).
+2. Only once live momentum fills match paper fills, consider arb.
+3. Prefer building maker arb over taker arb — taker arb's edge is mostly
+   eaten by the fees it must pay.
