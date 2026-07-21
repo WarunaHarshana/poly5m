@@ -1741,10 +1741,25 @@ async def run_realtime(rounds: int = 100, paper: bool = True):
                             raise RuntimeError(
                                 f"ask moved {mkt:.3f} -> {q2['price']:.3f} before order")
                         if q2["price"] > mkt:
-                            mkt = q2["price"]
+                            # Keep the SHARE COUNT and pay slightly more.
+                            # Recomputing shares from the higher ask shrank the
+                            # order below the 5-share venue minimum — live
+                            # rejected 4.93 shares on the very first real trade.
+                            new_mkt = float(q2["price"])
+                            new_stake = round(shares * new_mkt, 2)
+                            stake_cap = float(getattr(
+                                config, "LATE_SCALP_MAX_STAKE_USD", 5.0) or 5.0)
+                            if (new_stake > stake_cap + 1e-9
+                                    or new_stake > risk.bankroll):
+                                raise RuntimeError(
+                                    f"ask moved to {new_mkt:.3f}; stake "
+                                    f"${new_stake:.2f} would exceed cap")
+                            mkt = new_mkt
                             trade.entry_price = round(mkt, 4)
-                            shares = round(stake / mkt, 4)
-                            trade.shares = shares
+                            # Keep exposure accounting consistent with on_open.
+                            risk.open_exposure += new_stake - stake
+                            stake = new_stake
+                            trade.stake_usd = stake
                 except RuntimeError:
                     raise
                 except Exception:
@@ -1759,6 +1774,9 @@ async def run_realtime(rounds: int = 100, paper: bool = True):
                 print(f"  order failed: {e}")
                 skips["order_fail"] += 1
                 risk.on_close(stake, 0.0)
+                _clear_open(trade)
+                write_status(phase="waiting",
+                             message=f"order failed: {str(e)[:80]}")
                 await _sleep_until_slot_end(end_ts, cl_stream)
                 continue
 

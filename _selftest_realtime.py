@@ -243,4 +243,52 @@ assert stats_d2["fees_paid"] == 0, f"maker fills pay no fee, got {stats_d2['fees
 print("PHASE_D2_OK (maker fill when market trades to us) "
       "avg_entry=", stats_d2["avg_entry"], "fees=", stats_d2["fees_paid"])
 
-print("\nSELFTEST_OK momentum+arb+live+maker")
+# ---- Phase E: live pre-order ask rise must KEEP >= 5 shares ----
+# Reproduces the first real-money failure: approved 5 x 0.70, ask ticked up
+# before the order, old code shrank shares to stake/new_ask < 5 and the
+# venue rejected it ("Size (4.93) lower than the minimum: 5").
+class FakePubAskRise(FakePubMomentum):
+    """Ask 0.70 during analysis; 0.72 on the final pre-order re-check."""
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.reads = {}
+    def midpoint(self, token_id):
+        if token_id.startswith("MUP"):
+            n = self.reads.get(token_id, 0) + 1
+            self.reads[token_id] = n
+            # Read 1: analysis quote (requote off). Read 2+: pre-order check.
+            return 0.70 if n <= 1 else 0.72
+        return 0.30
+
+
+class FakeLiveClientE(FakeLiveClient):
+    calls = []
+    def buy(self, token_id, price, size, condition_id):
+        FakeLiveClientE.calls.append((price, size))
+        assert size >= 5.0, f"order below venue minimum: {size}"
+        return {"orderID": "ord-E"}
+    def cancel_order(self, order_id):
+        return {"canceled": [order_id]}
+    def _client(self):
+        class I:
+            def get_trades(self):
+                return [{"taker_order_id": "ord-E", "size": 5.0}]
+        return I()
+
+
+polymarket_client.PolymarketClient = FakeLiveClientE
+polymarket_client.PolymarketPublic = FakePubAskRise
+config.MODE = "live"
+config.MAKER_FIRST_ENABLED = False
+config.LATE_SCALP_MAX_STAKE_USD = 50.0
+stats_e = asyncio.run(bot.run_realtime(rounds=2, paper=False))
+config.MODE = "paper_live"
+assert stats_e["trades"] == 2, f"expected 2 live trades, got {stats_e['trades']}"
+for px, size in FakeLiveClientE.calls:
+    assert size >= 5.0, f"venue-min violated: {size}"
+# shares kept at 5, price bumped to 0.72 -> stake 3.60
+assert abs(stats_e["avg_stake"] - 3.60) < 1e-6, stats_e["avg_stake"]
+print("PHASE_E_OK (ask-rise keeps venue min) orders=",
+      [(p, s) for p, s in FakeLiveClientE.calls], "avg_stake=", stats_e["avg_stake"])
+
+print("\nSELFTEST_OK momentum+arb+live+maker+venue-min")
