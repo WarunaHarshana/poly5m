@@ -815,6 +815,7 @@ async def run_realtime(rounds: int = 100, paper: bool = True):
     max_slots = max(rounds * 30, 300)  # safety cap so a dead market can't spin forever
 
     settle_tasks: set = set()
+    last_counted_end_ts = None  # count real slots, not poll iterations
     last_traded_end_ts = None   # momentum: never re-enter a traded slot
     arb_done_end_ts = None      # arb: at most one attempt per slot
     early_seen_end_ts = None    # count slot_too_early once per slot
@@ -1190,7 +1191,6 @@ async def run_realtime(rounds: int = 100, paper: bool = True):
         return True
 
     while placed < rounds and slots_seen < max_slots:
-        slots_seen += 1
         if risk.halted:
             print(f"[HALT] {risk.halt_reason}; stopping.")
             write_status(phase="halted", message=risk.halt_reason)
@@ -1232,6 +1232,13 @@ async def run_realtime(rounds: int = 100, paper: bool = True):
         question = market.get("question") or "BTC 5-minute Up/Down"
         end_ts = market.get("end_ts")
         remaining = (end_ts - _now(cl_stream)) if end_ts else None
+        # Count SLOTS toward max_slots, not loop iterations. The arb scanner
+        # re-polls every ~15s, so iteration-counting hit the 300 cap in ~75
+        # minutes and shut down a healthy (just selective) live session with
+        # zero trades placed.
+        if end_ts is None or end_ts != last_counted_end_ts:
+            slots_seen += 1
+            last_counted_end_ts = end_ts
         if end_ts is not None and end_ts == last_traded_end_ts:
             # Already traded this slot (settling in background) — never
             # double-enter the same market; wait for the next slot.
