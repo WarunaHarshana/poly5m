@@ -31,6 +31,13 @@ STATS = os.path.join(_STATE, "stats.json")
 
 MOMENTUM_TARGET_N = 100  # sample size where the verdict starts to mean something
 
+# When the CURRENT configuration came into force (2026-07-19 ~18:26 UTC:
+# 0.88 entry cap + real fee model + maker-first + honest fills all live).
+# Trades before this tested strategies/configs that no longer exist — they
+# stay in the archive as the evidence base for today's gates, but they must
+# not count toward validating the current bot.
+CONFIG_ERA_START = 1784500000
+
 
 def paths_for(state_dir: str | None = None) -> tuple[str, str]:
     """(history_jsonl, stats_json) for a given state dir (None = this one)."""
@@ -40,12 +47,14 @@ def paths_for(state_dir: str | None = None) -> tuple[str, str]:
 
 
 def load_rows(hours: float | None, session: str | None,
-              state_dir: str | None = None) -> list[dict]:
+              state_dir: str | None = None, era: bool = False) -> list[dict]:
     rows = []
     HISTORY, _ = paths_for(state_dir)
     if not os.path.isfile(HISTORY):
         return rows
     cutoff = time.time() - hours * 3600 if hours else None
+    if era:
+        cutoff = max(cutoff or 0, CONFIG_ERA_START)
     with open(HISTORY, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -125,16 +134,19 @@ def _agg(label: str, rows: list[dict]) -> dict:
 
 def compute_report(hours: float | None = None,
                    session: str | None = None,
-                   state_dir: str | None = None) -> dict:
+                   state_dir: str | None = None,
+                   era: bool = False) -> dict:
     """Structured report used by both the CLI and the dashboard.
 
     state_dir lets the dashboard analyse any timeframe's archive without
     re-importing the module with a different TIMEFRAME.
     """
-    rows = load_rows(hours, session, state_dir)
+    rows = load_rows(hours, session, state_dir, era=era)
     _, STATS_P = paths_for(state_dir)
     scope = (f"last {hours:g}h" if hours
-             else (f"session {session}" if session else "all history"))
+             else (f"session {session}" if session
+                   else ("current config (since Jul 19)" if era
+                         else "all history")))
     out: dict = {"ok": True, "scope": scope, "n": len(rows),
                  "generated_at": time.time()}
     if not rows:
@@ -228,8 +240,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--hours", type=float, default=None)
     ap.add_argument("--session", type=str, default=None)
+    ap.add_argument("--era", action="store_true",
+                    help="only trades since the current config (the sample "
+                         "that counts toward the n=100 verdict)")
     args = ap.parse_args()
-    rep = compute_report(args.hours, args.session)
+    rep = compute_report(args.hours, args.session, era=args.era)
     if not rep.get("ok"):
         print(rep.get("error"))
         return

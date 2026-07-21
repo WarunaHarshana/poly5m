@@ -1700,8 +1700,9 @@ body.trade-flash-lose { animation: page-flash-down 1.6s ease-out; }
       <span>Performance Analysis · archive</span>
       <span style="display:flex;gap:8px;align-items:center">
         <select id="an-range" class="ctl-select" style="min-width:0;padding:4px 8px;font-size:11px">
-          <option value="">All history</option>
-          <option value="24" selected>Last 24h</option>
+          <option value="era" selected>Current config (the n=100 sample)</option>
+          <option value="">All history (incl. retired strategies)</option>
+          <option value="24">Last 24h</option>
           <option value="12">Last 12h</option>
           <option value="6">Last 6h</option>
         </select>
@@ -2831,9 +2832,10 @@ function renderAnalysis(rep) {
 }
 
 async function loadAnalysis() {
-  const hrs = document.getElementById('an-range').value;
+  const val = document.getElementById('an-range').value;
+  const extra = val === 'era' ? '&era=1' : (val ? ('&hours=' + val) : '');
   try {
-    const rep = await fetch('/api/analyze' + tfq() + (hrs ? ('&hours=' + hrs) : ''),
+    const rep = await fetch('/api/analyze' + tfq() + extra,
                             { cache: 'no-store' }).then(r => r.json());
     renderAnalysis(rep);
   } catch (e) {
@@ -2930,9 +2932,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 hours = None
             session = (q.get("session") or [None])[0]
             tf = (q.get("tf") or ["5m"])[0]
+            era = (q.get("era") or ["0"])[0] in ("1", "true", "yes")
             try:
                 return self._json(analyze.compute_report(
-                    hours, session, state_dir=_state_dir_for(tf)))
+                    hours, session, state_dir=_state_dir_for(tf), era=era))
             except Exception as e:
                 return self._json({"ok": False, "error": str(e)}, 500)
 
