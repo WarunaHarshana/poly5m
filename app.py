@@ -775,6 +775,74 @@ def _start(opts: dict) -> dict:
                 "mode": mode, "timeframe": timeframe}
 
 
+_recorders: dict = {}   # timeframe -> {proc, log_file}
+
+
+def _rec_slot(tf: str | None) -> dict:
+    tf = (tf or "5m").strip().lower()
+    if tf not in ALLOWED_TIMEFRAMES:
+        tf = "5m"
+    return _recorders.setdefault(tf, {"proc": None, "log_file": None, "tf": tf})
+
+
+def _rec_running(tf: str | None) -> bool:
+    p = _rec_slot(tf)["proc"]
+    return p is not None and p.poll() is None
+
+
+def _rec_count(tf: str | None) -> int:
+    path = os.path.join(_state_dir_for(tf), "archive", "book_recordings.jsonl")
+    if not os.path.isfile(path):
+        return 0
+    try:
+        with open(path, encoding="utf-8") as f:
+            return sum(1 for ln in f if ln.strip())
+    except Exception:
+        return 0
+
+
+def _rec_start(tf: str | None) -> dict:
+    with _lock:
+        b = _rec_slot(tf)
+        if _rec_running(b["tf"]):
+            return {"ok": False, "error": f"{b['tf']} recorder already running"}
+        state_dir = _state_dir_for(b["tf"])
+        os.makedirs(os.path.join(state_dir, "archive"), exist_ok=True)
+        log_path = os.path.join(state_dir, "recorder.log")
+        try:
+            lf = open(log_path, "w", encoding="utf-8")
+            env = os.environ.copy()
+            env["TIMEFRAME"] = b["tf"]
+            p = subprocess.Popen(
+                [sys.executable, "-u", "record_books.py"],
+                cwd=HERE, stdout=lf, stderr=subprocess.STDOUT, env=env)
+        except Exception as e:
+            return {"ok": False, "error": f"failed to launch recorder: {e}"}
+        b.update(proc=p, log_file=lf)
+        return {"ok": True, "running": True, "pid": p.pid, "timeframe": b["tf"]}
+
+
+def _rec_stop(tf: str | None) -> dict:
+    with _lock:
+        b = _rec_slot(tf)
+        p = b["proc"]
+        if p is None or p.poll() is not None:
+            return {"ok": True, "running": False}
+        p.terminate()
+        try:
+            p.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            p.kill()
+        try:
+            if b["log_file"]:
+                b["log_file"].close()
+        except Exception:
+            pass
+        b["log_file"] = None
+        b["proc"] = None
+        return {"ok": True, "running": False}
+
+
 def _stop(tf: str | None = None) -> dict:
     with _lock:
         b = _slot(tf)
@@ -1717,6 +1785,30 @@ body.trade-flash-lose { animation: page-flash-down 1.6s ease-out; }
         <div style="overflow-x:auto"><table id="an-buckets"></table></div>
       </div>
       <p id="an-notes" style="margin-top:10px;font-size:11.5px;color:var(--txt-soft);line-height:1.5"></p>
+    </div>
+  </div>
+
+  <!-- ===== MARKET-MAKING RESEARCH (paper only) ===== -->
+  <div class="panel glass-card" id="mm-panel" style="margin-top:14px">
+    <div class="phead">
+      <span>Market-Making Research · <span style="color:var(--accent2)">paper, no risk</span></span>
+      <span id="mm-recstatus" class="mono">—</span>
+    </div>
+    <div class="pbody">
+      <div style="display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:12px">
+        <button type="button" class="btn-save" id="mm-rec-toggle">Start recorder</button>
+        <span style="font-size:11.5px;color:var(--txt-soft)">records both-side books (no orders, no wallet) toward the backtest</span>
+        <span style="margin-left:auto;font-size:11px;color:var(--dim)">edge under ask</span>
+        <input id="mm-edge" class="ctl-input" type="number" value="0.02" min="0.01" step="0.01" style="width:80px;padding:6px 8px">
+        <span style="font-size:11px;color:var(--dim)">shares</span>
+        <input id="mm-size" class="ctl-input" type="number" value="5" min="1" step="1" style="width:70px;padding:6px 8px">
+        <button type="button" class="btn-ghost" id="mm-run">Run backtest</button>
+      </div>
+      <div id="mm-verdict" class="an-verdict">Start the recorder, let it collect slots, then run the backtest.</div>
+      <div style="overflow-x:auto"><table id="mm-table"></table></div>
+      <p style="margin-top:10px;font-size:11.5px;color:var(--txt-soft);line-height:1.5">
+        Rests bids on both UP and DOWN below the ask; a bid fills only when the market trades through it (honest, no queue model). Maker fills pay zero fee. <b>One-sided fills leave you naked-directional</b> — the risk row is the number that matters, not the PnL, until n≥100.
+      </p>
     </div>
   </div>
 
@@ -2855,6 +2947,67 @@ document.getElementById('an-range').addEventListener('change', loadAnalysis);
 setInterval(loadAnalysis, 60000);
 loadAnalysis();
 
+/* ===== MARKET-MAKING RESEARCH PANEL ===== */
+let mmRecRunning = false;
+
+function renderMM(d) {
+  const rs = document.getElementById('mm-recstatus');
+  const toggle = document.getElementById('mm-rec-toggle');
+  const verdict = document.getElementById('mm-verdict');
+  const tbl = document.getElementById('mm-table');
+  if (!d || !d.ok) { rs.textContent = 'unavailable'; return; }
+  mmRecRunning = !!d.recorder_running;
+  rs.textContent = (mmRecRunning ? '● recording' : '○ stopped')
+    + ' · ' + (d.recorded_slots || 0) + ' slots recorded';
+  rs.style.color = mmRecRunning ? 'var(--green)' : 'var(--dim)';
+  toggle.textContent = mmRecRunning ? 'Stop recorder' : 'Start recorder';
+
+  const b = d.backtest || {};
+  if (!b.ok) {
+    verdict.className = 'an-verdict';
+    verdict.textContent = b.error || 'No backtest yet.';
+    tbl.innerHTML = '';
+    return;
+  }
+  const enough = b.sample_ok;
+  const positive = b.pnl_per_slot > 0;
+  verdict.className = 'an-verdict ' + (enough ? (positive ? 'good' : 'bad') : 'warn');
+  verdict.innerHTML = enough
+    ? `Two-sided quoting <b>${b.verdict}</b> — ${(b.pnl_per_slot>=0?'+':'')}${b.pnl_per_slot}/slot over ${b.usable_slots} slots`
+    : `${b.usable_slots} usable slots (of ${b.recorded_slots} recorded) — <b>not a verdict yet</b>, keep recording toward 100+`;
+  tbl.innerHTML =
+    '<thead><tr><th>Metric</th><th>Value</th></tr></thead><tbody>' +
+    `<tr><td>Both bids filled (spread capture)</td><td>${b.both_filled_pct}%</td></tr>` +
+    `<tr><td>One-sided (naked directional)</td><td class="${b.one_filled_pct>b.both_filled_pct?'lost':''}">${b.one_filled_pct}%</td></tr>` +
+    `<tr><td>Neither filled</td><td>${b.none_filled_pct}%</td></tr>` +
+    `<tr><td>Total PnL (maker fee = 0)</td><td class="${b.total_pnl>=0?'won':'lost'}">${b.total_pnl>=0?'+':''}${b.total_pnl}</td></tr>` +
+    `<tr><td>Return on deployed</td><td class="${b.return_on_deployed_pct>=0?'won':'lost'}">${b.return_on_deployed_pct}%</td></tr>` +
+    `<tr><td>Gross directional shares (RISK)</td><td class="amb">${b.gross_directional_shares}</td></tr>` +
+    '</tbody>';
+}
+
+async function loadMM() {
+  const edge = document.getElementById('mm-edge').value || '0.02';
+  const size = document.getElementById('mm-size').value || '5';
+  try {
+    const d = await fetch('/api/mm' + tfq() + '&edge=' + edge + '&size=' + size,
+                          { cache: 'no-store' }).then(r => r.json());
+    renderMM(d);
+  } catch (e) { document.getElementById('mm-recstatus').textContent = 'error: ' + e; }
+}
+document.getElementById('mm-rec-toggle').onclick = async () => {
+  const url = mmRecRunning ? '/api/mm/record/stop' : '/api/mm/record/start';
+  try {
+    await fetch(url, { method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ timeframe: curTf() }) });
+  } catch (e) {}
+  setTimeout(loadMM, 400);
+};
+document.getElementById('mm-run').onclick = loadMM;
+loadMM();
+setInterval(loadMM, 20000);
+
 loadSettings();
 loadWallet();
 ctlState();
@@ -2945,6 +3098,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
             _tf = (parse_qs(urlparse(self.path).query).get("tf") or ["5m"])[0]
             return self._json(_state(_tf))
 
+        # Market-making research: recorder status + backtest
+        if path == "/api/mm":
+            from urllib.parse import urlparse, parse_qs
+            q = parse_qs(urlparse(self.path).query)
+            tf = (q.get("tf") or ["5m"])[0]
+            out = {"ok": True, "timeframe": tf,
+                   "recorder_running": _rec_running(tf),
+                   "recorded_slots": _rec_count(tf)}
+            try:
+                edge = float((q.get("edge") or ["0.02"])[0])
+                size = float((q.get("size") or ["5"])[0])
+            except (TypeError, ValueError):
+                edge, size = 0.02, 5.0
+            try:
+                import mm_backtest
+                out["backtest"] = mm_backtest.compute_backtest(
+                    edge=edge, size=size, state_dir=_state_dir_for(tf))
+            except Exception as e:
+                out["backtest"] = {"ok": False, "error": str(e)}
+            return self._json(out)
+
         # Live wallet readiness (never returns full private key)
         if path == "/api/wallet":
             return self._json(_wallet_status())
@@ -3015,6 +3189,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if route == "/api/stop":
             _tf = (opts or {}).get("timeframe") if isinstance(opts, dict) else None
             return self._json(_stop(_tf))
+        if route == "/api/mm/record/start":
+            _tf = (opts or {}).get("timeframe") if isinstance(opts, dict) else None
+            return self._json(_rec_start(_tf))
+        if route == "/api/mm/record/stop":
+            _tf = (opts or {}).get("timeframe") if isinstance(opts, dict) else None
+            return self._json(_rec_stop(_tf))
         if route == "/api/wallet":
             return self._json(_save_wallet(opts if isinstance(opts, dict) else {}))
         if route == "/api/settings":

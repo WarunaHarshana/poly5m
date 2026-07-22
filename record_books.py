@@ -22,8 +22,16 @@ import time
 import config
 from polymarket_client import PolymarketPublic
 
-OUT = os.path.join(os.path.dirname(__file__), "state", "archive",
-                   "book_recordings.jsonl")
+def _state_dir() -> str:
+    """Per-timeframe state dir, matching bot.py / app.py / analyze.py."""
+    here = os.path.dirname(__file__)
+    tf = (os.getenv("TIMEFRAME") or "5m").strip().lower()
+    sub = (os.getenv("STATE_SUBDIR") or ("" if tf == "5m" else tf)).strip()
+    return os.path.join(here, "state", sub) if sub \
+        else os.path.join(here, "state")
+
+
+OUT = os.path.join(_state_dir(), "archive", "book_recordings.jsonl")
 SAMPLE_S = float(os.getenv("BOOK_SAMPLE_S", "3.0"))
 
 

@@ -20,15 +20,26 @@ import os
 
 from market_maker import MMQuote, simulate_slot, MMStats
 
-REC = os.path.join(os.path.dirname(__file__), "state", "archive",
-                   "book_recordings.jsonl")
+
+def _rec_path(state_dir: str | None = None) -> str:
+    if state_dir:
+        return os.path.join(state_dir, "archive", "book_recordings.jsonl")
+    here = os.path.dirname(__file__)
+    tf = (os.getenv("TIMEFRAME") or "5m").strip().lower()
+    sub = (os.getenv("STATE_SUBDIR") or ("" if tf == "5m" else tf)).strip()
+    base = os.path.join(here, "state", sub) if sub else os.path.join(here, "state")
+    return os.path.join(base, "archive", "book_recordings.jsonl")
 
 
-def load_slots() -> list[dict]:
+REC = _rec_path()
+
+
+def load_slots(rec_path: str | None = None) -> list[dict]:
     out = []
-    if not os.path.isfile(REC):
+    path = rec_path or REC
+    if not os.path.isfile(path):
         return out
-    with open(REC, encoding="utf-8") as f:
+    with open(path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -52,6 +63,52 @@ def ask_path(snaps: list, key: str) -> list[float]:
             except (TypeError, ValueError):
                 pass
     return path
+
+
+def compute_backtest(edge: float = 0.02, size: float = 5.0,
+                     rebate: float = 0.0,
+                     state_dir: str | None = None) -> dict:
+    """Structured MM backtest result — shared by the CLI and the dashboard."""
+    path = _rec_path(state_dir)
+    slots = load_slots(path)
+    recorded = 0
+    if os.path.isfile(path):
+        with open(path, encoding="utf-8") as f:
+            recorded = sum(1 for ln in f if ln.strip())
+    if not slots:
+        return {"ok": False, "recorded_slots": recorded,
+                "usable_slots": 0,
+                "error": ("No usable recordings yet. Start the recorder and "
+                          "let it collect slots (needs the two-sided book "
+                          "path + outcome per slot).")}
+    st = MMStats()
+    skipped = 0
+    for d in slots:
+        up = ask_path(d["snapshots"], "up_ask")
+        dn = ask_path(d["snapshots"], "dn_ask")
+        if not up or not dn:
+            skipped += 1
+            continue
+        st.add(simulate_slot(
+            MMQuote(up_bid=round(up[0] - edge, 2),
+                    down_bid=round(dn[0] - edge, 2), size=size),
+            up_ask_path=up, down_ask_path=dn,
+            resolved_up=bool(d["resolved_up"]), slot_id=d.get("slug", ""),
+            fee_rebate_share=rebate))
+    s = st.summary()
+    s["ok"] = True
+    s["recorded_slots"] = recorded
+    s["usable_slots"] = s["slots"]
+    s["skipped"] = skipped
+    s["edge"] = edge
+    s["size"] = size
+    s["sample_ok"] = s["slots"] >= 100
+    if s["slots"] >= 100:
+        s["verdict"] = ("captures spread" if s["pnl_per_slot"] > 0
+                        else "inventory risk eats the spread")
+    else:
+        s["verdict"] = None
+    return s
 
 
 def main() -> None:
