@@ -69,8 +69,52 @@ def _write_slot(slug: str, end_ts, snaps: list, resolved_up) -> None:
           f"resolved={'UP' if resolved_up else ('DOWN' if resolved_up is False else '?')}")
 
 
+def backfill_outcomes(pub: PolymarketPublic, path: str = OUT,
+                      verbose: bool = True) -> int:
+    """Fill resolved_up for slots recorded before Gamma had settled them.
+
+    The inline poll after each slot is short (so the recorder can move on to
+    the NEXT slot's opening book instead of blocking). Outcomes stay on Gamma
+    indefinitely, so we backfill the None ones on a later pass. Rewrites the
+    file atomically. Returns how many were filled.
+    """
+    if not os.path.isfile(path):
+        return 0
+    try:
+        rows = [json.loads(ln) for ln in open(path, encoding="utf-8")
+                if ln.strip()]
+    except Exception:
+        return 0
+    filled = 0
+    for r in rows:
+        if r.get("resolved_up") is None and r.get("slug"):
+            try:
+                o = pub.get_official_btc_updown_outcome(r["slug"])
+            except Exception:
+                o = None
+            if o in ("UP", "DOWN"):
+                r["resolved_up"] = (o == "UP")
+                filled += 1
+    if filled:
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            for r in rows:
+                f.write(json.dumps(r, default=str) + "\n")
+        os.replace(tmp, path)
+        if verbose:
+            print(f"  [rec] backfilled {filled} outcome(s)")
+    return filled
+
+
 def main() -> None:
     pub = PolymarketPublic()
+    # Recover outcomes for anything recorded earlier but never resolved.
+    try:
+        n = backfill_outcomes(pub)
+        if n:
+            print(f"[book recorder] backfilled {n} pending outcome(s) on startup")
+    except Exception as e:
+        print(f"[book recorder] startup backfill skipped: {e}")
     print(f"[book recorder] {config.ASSET} {config.TIMEFRAME} -> {OUT}")
     print(f"  sampling every {SAMPLE_S:.0f}s; no orders, no wallet. Ctrl+C to stop.")
     seen_slugs: set = set()
@@ -95,9 +139,11 @@ def main() -> None:
                 s["rem"] = round(end_ts - s["t"], 1)
                 snaps.append(s)
             time.sleep(SAMPLE_S)
-        # slot ended — fetch official outcome (best effort, ~90s)
+        # slot ended — short outcome attempt only (~15s). Gamma often needs
+        # longer, so we DON'T block here waiting (that would miss the next
+        # slot's opening book). Unresolved ones get backfilled below.
         resolved_up = None
-        for _ in range(30):
+        for _ in range(5):
             try:
                 o = pub.get_official_btc_updown_outcome(slug)
             except Exception:
@@ -107,6 +153,11 @@ def main() -> None:
                 break
             time.sleep(3)
         _write_slot(slug, end_ts, snaps, resolved_up)
+        # Backfill outcomes for earlier slots Gamma has since settled.
+        try:
+            backfill_outcomes(pub, verbose=True)
+        except Exception:
+            pass
         # prune memory so a long run doesn't grow unbounded
         if len(seen_slugs) > 5000:
             seen_slugs = set(list(seen_slugs)[-1000:])
