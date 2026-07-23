@@ -257,8 +257,17 @@ LATE_MOMENTUM_MAX_ENTRY = float(os.getenv("LATE_MOMENTUM_MAX_ENTRY", "0.88"))
 # the best performer; edge ≥ 0.15 was the WORST (75% WR, −$0.15/trade) — a
 # huge "model edge" in the last minute usually means stale strike / vol
 # misestimate, and the book is right. 0 = gate off.
+# Edge is U-shaped for profit (228 fee-adjusted trades): BOTH extremes lose.
+#   edge < -0.20 : -$0.14/trade (n=69)  <- strongly "overpriced" per model
+#   -0.20 .. +0.15: profitable
+#   edge > +0.15 : -$0.23/trade (n=12)  <- model far above book, stale strike
+# So gate with a FLOOR and a CEILING. Floor -0.20 set 2026-07-23 after a live
+# loss at edge -0.21 (rich 0.85 entry, marginal move) — 0.0 meant "floor off"
+# and let those through. -0.20 drops only the clear-loser bucket, keeping the
+# profitable mildly-negative trades (the model is anti-predictive in the
+# middle). MIN_EDGE=0 still disables the floor entirely.
 LATE_MOMENTUM_MIN_EDGE = float(os.getenv("LATE_MOMENTUM_MIN_EDGE",
-                               os.getenv("LATE_SCALP_MIN_EDGE", "0.0")))
+                               os.getenv("LATE_SCALP_MIN_EDGE", "-0.20")))
 LATE_MOMENTUM_MAX_EDGE = float(os.getenv("LATE_MOMENTUM_MAX_EDGE", "0.10"))
 # Skip slots where price crossed the strike more than this many times in the
 # recent sample window (lead = noise, not momentum). 0 = off.

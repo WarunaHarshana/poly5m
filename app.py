@@ -109,10 +109,10 @@ STRATEGY_FIELDS = [
     {"key": "LATE_MOMENTUM_MAX_ENTRY", "label": "Max entry ask", "type": "float",
      "default": "0.88", "group": "late_momentum",
      "hint": "0.80-0.90 is breakeven (n=92) and gives trade flow; 0.90+ loses -$0.12/trade"},
-    {"key": "LATE_MOMENTUM_MIN_EDGE", "label": "Edge floor (0 = NO filter)", "type": "float",
-     "default": "0.0", "group": "late_momentum",
-     "hint": "0 disables the floor entirely (negative-edge trades allowed). "
-             "Use 0.01+ to actually require positive edge"},
+    {"key": "LATE_MOMENTUM_MIN_EDGE", "label": "Edge floor (0 = off)", "type": "float",
+     "default": "-0.20", "group": "late_momentum",
+     "hint": "Skip trades the model prices as strongly overpriced (edge < -0.20 "
+             "lost -$0.14/trade over n=69). Middle edges are fine; 0 = floor off"},
     {"key": "LATE_MOMENTUM_MAX_EDGE", "label": "Edge ceiling (0=off)", "type": "float",
      "default": "0.10", "group": "late_momentum",
      "hint": "Skip when model is FAR above book — stale strike, book usually right"},
