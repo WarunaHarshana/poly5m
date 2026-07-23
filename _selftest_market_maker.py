@@ -62,4 +62,17 @@ assert approx(s["total_pnl"], -4.20), s
 assert s["gross_directional_shares"] == 5.0, s   # the one-sided slot's risk
 print("T5 aggregate stats + risk accounting OK  ->", s)
 
+# 6. Selective quoting: disabling a side means it never fills, even if the
+#    market traded through where our bid would have been.
+r = simulate_slot(MMQuote(up_bid=0.85, down_bid=0.14, size=5),
+                  up_ask_path=[0.85], down_ask_path=[0.14],
+                  resolved_up=True, quote_up=True, quote_down=False)
+assert r.filled_up == 5 and r.filled_down == 0, r   # DOWN disabled -> no fill
+assert r.net_inventory == 5, r
+r2 = simulate_slot(MMQuote(up_bid=0.85, down_bid=0.14, size=5),
+                   up_ask_path=[0.85], down_ask_path=[0.14],
+                   resolved_up=True, quote_up=False, quote_down=False)
+assert r2.filled_up == 0 and r2.filled_down == 0 and r2.pnl == 0, r2
+print("T6 selective quoting (disabled side never fills) OK")
+
 print("\nSELFTEST_OK market_maker")

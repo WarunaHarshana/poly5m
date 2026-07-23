@@ -61,8 +61,10 @@ def simulate_slot(
     resolved_up: bool,
     slot_id: str = "",
     fee_rebate_share: float = 0.0,
+    quote_up: bool = True,
+    quote_down: bool = True,
 ) -> MMResult:
-    """Simulate one 5-minute slot of two-sided quoting.
+    """Simulate one 5-minute slot of quoting.
 
     `up_ask_path` / `down_ask_path` are the observed best-ask series for each
     token over the slot (e.g. one sample per second). A resting bid on a side
@@ -70,17 +72,21 @@ def simulate_slot(
     then hold `size` shares on that side. Only one fill per side per slot
     (a single resting order).
 
+    quote_up / quote_down: whether we actually rest a bid on that side. This
+    is how the strategy variants (favorite-only, underdog-only, inventory-
+    managed) express which side(s) to quote — a disabled side never fills.
+
     resolved_up: which side pays $1/share at settlement.
     fee_rebate_share: optional, for the SEPARATE upside estimate only.
     """
     r = MMResult(slot_id=slot_id, resolved_up=resolved_up)
 
-    # UP bid: filled when the UP ask trades through our bid.
-    if any(a <= quote.up_bid + 1e-9 for a in up_ask_path):
+    # UP bid: filled when the UP ask trades through our bid (if we quote it).
+    if quote_up and any(a <= quote.up_bid + 1e-9 for a in up_ask_path):
         r.filled_up = quote.size
         r.cost_up = round(quote.size * quote.up_bid, 6)
     # DOWN bid: same, independently.
-    if any(a <= quote.down_bid + 1e-9 for a in down_ask_path):
+    if quote_down and any(a <= quote.down_bid + 1e-9 for a in down_ask_path):
         r.filled_down = quote.size
         r.cost_down = round(quote.size * quote.down_bid, 6)
 
