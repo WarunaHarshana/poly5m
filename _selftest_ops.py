@@ -248,6 +248,36 @@ check("a stale lock is taken over", held["pid"] == os.getpid(), str(held))
 bot.release_lock()
 check("release removes the lock", not os.path.exists(bot.LOCK_PATH))
 
+# ---------------------------------------------------------------------------
+print("T8 research export never leaks credentials")
+os.environ.setdefault("NO_BROWSER", "1")
+import io  # noqa: E402
+import zipfile  # noqa: E402
+
+import app  # noqa: E402
+
+banned = ("poly_api_creds", ".env", "private", "secret", "passphrase", "..")
+suspicious = [f for f in app.EXPORT_FILES + app.EXPORT_FILES_FULL
+              if any(b in f.lower() for b in banned)]
+check("no credential-shaped entry on the allowlist", not suspicious,
+      str(suspicious))
+
+export_base = app._state_dir_for("5m")
+os.makedirs(os.path.join(export_base, "archive"), exist_ok=True)
+with open(os.path.join(export_base, "poly_api_creds.json"), "w") as f:
+    f.write('{"api_secret": "CANARY_MUST_NOT_ESCAPE"}')
+with open(os.path.join(export_base, "stats.json"), "w") as f:
+    f.write('{"bankroll": 1}')
+
+blob, _manifest = app._export_zip("5m")
+names = zipfile.ZipFile(io.BytesIO(blob)).namelist()
+check("credentials file is not in the archive",
+      not any("creds" in n for n in names), str(names))
+check("credential content appears nowhere in the bytes",
+      b"CANARY_MUST_NOT_ESCAPE" not in blob)
+check("real data still exports", "stats.json" in names, str(names))
+check("a manifest is always included", "MANIFEST.json" in names, str(names))
+
 print()
 if FAIL:
     raise SystemExit(f"SELFTEST_FAILED ops: {FAIL}")

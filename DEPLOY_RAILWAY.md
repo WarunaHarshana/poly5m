@@ -122,6 +122,39 @@ not support one" are the tuner working correctly, not a bug. Judge it on the
 paper bankroll curve over weeks, and treat a positive paper result as a
 necessary condition for going live, not a sufficient one.
 
+## Getting the data onto your PC
+
+The data lives on the Railway volume. `railway run` will not reach it — that
+command runs on *your* machine with the service's variables injected, not
+inside the container. Two ways to pull it down:
+
+**From the dashboard.** The *Self-Tuning & Data Export* panel has a
+**Download research data (.zip)** button. That is the whole thing — the panel
+also shows how many labeled slots have been collected, which parameters are
+currently in force (and which the tuner moved), and the last few tuning
+decisions with their reasons.
+
+**From the command line**, when you want it scripted or merged:
+
+```bash
+python fetch_data.py https://your-app.up.railway.app --token YOUR_DASH_TOKEN
+```
+
+It lands in `data/<host>/`. Analyse it with the tools already in the repo:
+
+```bash
+STATE_ROOT=data/your-app.up.railway.app python analyze.py
+```
+
+`--merge` appends the deployed rows into your local `state/` archive instead,
+de-duplicated, so local and remote history become one dataset. `--full` adds
+order-book recordings and the bot log (much larger).
+
+The export is an **allowlist**, not "everything except". The same directory
+holds `poly_api_creds.json`, so a blocklist would be one typo away from
+shipping credentials — they are never included, and the endpoint needs
+`DASH_TOKEN` like every other control route.
+
 ## Checking on it
 
 ```bash

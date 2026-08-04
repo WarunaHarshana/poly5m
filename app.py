@@ -56,6 +56,65 @@ ALLOWED_MODES = {"paper", "paper_live", "live"}
 ALLOWED_TIMEFRAMES = {"5m", "15m"}
 
 
+# ---------------------------------------------------------------------------
+# Research export
+# ---------------------------------------------------------------------------
+# Files the export endpoint may send, relative to the state dir. This is an
+# ALLOWLIST on purpose: the same directory holds poly_api_creds.json (CLOB API
+# key, secret and passphrase), so a "everything except..." rule is one typo
+# away from mailing out credentials.
+EXPORT_FILES = (
+    "archive/observations.jsonl",     # the labeled learning dataset
+    "archive/trades_history.jsonl",   # permanent trade archive
+    "archive/trades_history.csv",
+    "archive/decisions.jsonl",
+    "archive/decisions.csv",
+    "archive/tuning_log.jsonl",       # every tuning decision + reason
+    "tuned_params.json",              # parameters currently in force
+    "stats.json",
+    "trades.json",
+    "status.json",
+    "supervisor.json",
+)
+# Only with ?full=1 — big, and rarely what you want over a slow link.
+EXPORT_FILES_FULL = (
+    "archive/book_recordings.jsonl",
+    "bot.log",
+    "bot.log.1",
+)
+
+
+def _export_zip(tf: str | None, full: bool = False) -> tuple[bytes, list]:
+    """Zip the research data for one timeframe. Returns (bytes, manifest)."""
+    import io
+    import zipfile
+
+    base = _state_dir_for(tf)
+    names = list(EXPORT_FILES) + (list(EXPORT_FILES_FULL) if full else [])
+    manifest = []
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for rel in names:
+            src = os.path.join(base, *rel.split("/"))
+            # Refuse anything that resolves outside the state dir, so a future
+            # edit to the list cannot walk into the repo or the filesystem.
+            if not os.path.abspath(src).startswith(os.path.abspath(base)):
+                continue
+            if not os.path.isfile(src):
+                continue
+            try:
+                zf.write(src, rel)
+                manifest.append({"file": rel, "bytes": os.path.getsize(src)})
+            except OSError:
+                continue
+        zf.writestr("MANIFEST.json", json.dumps({
+            "exported_at": time.time(),
+            "timeframe": tf or "5m",
+            "files": manifest,
+        }, indent=2))
+    return buf.getvalue(), manifest
+
+
 def _state_dir_for(tf: str | None) -> str:
     """State directory for a timeframe. 5m keeps the original paths."""
     tf = (tf or "5m").strip().lower()
@@ -1775,6 +1834,33 @@ body.trade-flash-lose { animation: page-flash-down 1.6s ease-out; }
     </table>
   </div>
 
+  <!-- ===== LEARNING & DATA ===== -->
+  <div class="panel glass-card" id="learn-panel" style="margin-top:14px">
+    <div class="phead">
+      <span>Self-Tuning &amp; Data Export</span>
+      <span style="display:flex;gap:8px;align-items:center">
+        <button type="button" class="btn-ghost" id="ln-refresh" style="padding:4px 10px;font-size:11px">Refresh</button>
+      </span>
+    </div>
+    <div class="pbody">
+      <div id="ln-summary" class="an-verdict">Loading learning state…</div>
+      <div style="display:flex;gap:10px;flex-wrap:wrap;margin:12px 0 4px">
+        <a class="btn-save" id="ln-dl" href="/api/export" download
+           style="text-decoration:none;display:inline-block">&#11015; Download research data (.zip)</a>
+        <a class="btn-ghost" id="ln-dl-full" href="/api/export?full=1" download
+           style="text-decoration:none;display:inline-block">&#11015; Download everything (+ books &amp; logs)</a>
+      </div>
+      <p style="margin-top:6px;font-size:11.5px;color:var(--txt-soft);line-height:1.5">
+        The zip holds the labeled observation log, the trade archive, the decision
+        journal and every tuning decision. Credentials are never included.
+        Analyse a download locally with
+        <code>STATE_ROOT=&lt;folder&gt; python analyze.py</code>.
+      </p>
+      <div style="overflow-x:auto;margin-top:10px"><table id="ln-params"></table></div>
+      <div style="overflow-x:auto;margin-top:12px"><table id="ln-journal"></table></div>
+    </div>
+  </div>
+
   <!-- ===== PERFORMANCE ANALYSIS (archive) ===== -->
   <div class="panel glass-card" id="analysis-panel" style="margin-top:14px">
     <div class="phead">
@@ -2960,6 +3046,74 @@ document.getElementById('an-range').addEventListener('change', loadAnalysis);
 setInterval(loadAnalysis, 60000);
 loadAnalysis();
 
+/* ===== SELF-TUNING & DATA EXPORT PANEL ===== */
+function renderLearning(d) {
+  const sum = document.getElementById('ln-summary');
+  const ptab = document.getElementById('ln-params');
+  const jtab = document.getElementById('ln-journal');
+  if (!d || !d.ok) {
+    sum.textContent = 'Learning state unavailable: ' + ((d && d.error) || '?');
+    ptab.innerHTML = ''; jtab.innerHTML = '';
+    return;
+  }
+  const need = d.needed_to_tune || 0;
+  const pct = need ? Math.min(100, Math.round(100 * d.labeled / need)) : 0;
+  const sup = d.supervisor || {};
+  let s = d.labeled >= need
+    ? `Dataset ready: ${d.labeled} labeled slots of ${d.observations} recorded. `
+    : `Collecting data: ${d.labeled} labeled of ${need} needed to tune (${pct}%). `;
+  if (sup.bot_restarts != null) s += `Bot restarts: ${sup.bot_restarts}. `;
+  const lt = sup.last_tune;
+  if (lt && lt.action) {
+    const when = lt.at ? new Date(lt.at * 1000).toISOString().slice(0, 16).replace('T', ' ') : '';
+    s += `Last tuning cycle ${when}Z: ${lt.action}.`;
+  }
+  sum.textContent = s;
+
+  // Which parameters are in force, and whether they came from the tuner.
+  const act = d.active_params || {}, def = d.defaults || {};
+  let rows = '<thead><tr><th>Parameter</th><th>In force</th><th>Default</th><th></th></tr></thead><tbody>';
+  Object.keys(act).forEach(k => {
+    const moved = String(act[k]) !== String(def[k]);
+    rows += `<tr><td class="mono">${k.replace('LATE_MOMENTUM_', '')}</td>` +
+            `<td class="mono">${act[k]}</td><td class="mono">${def[k]}</td>` +
+            `<td>${moved ? '<span class="badge">learned</span>' : ''}</td></tr>`;
+  });
+  ptab.innerHTML = rows + '</tbody>';
+
+  const j = d.journal || [];
+  if (!j.length) { jtab.innerHTML = ''; return; }
+  let jr = '<thead><tr><th>When (UTC)</th><th>Decision</th><th>Detail</th></tr></thead><tbody>';
+  j.slice(0, 8).forEach(e => {
+    let detail = '';
+    if (e.action === 'apply' && e.changes) {
+      detail = Object.keys(e.changes).map(k =>
+        `${k.replace('LATE_MOMENTUM_', '')} ${e.changes[k].from}→${e.changes[k].to}`).join(', ');
+    } else if (e.action === 'reject') {
+      detail = (e.rejected_for || []).join('; ');
+    } else if (e.action === 'revert') {
+      detail = 'rolled back — realised results were negative and worse';
+    } else if (e.action === 'hold') {
+      detail = 'no change cleared the guardrails';
+    }
+    jr += `<tr><td class="mono">${(e.time_utc || '').replace(' UTC', '')}</td>` +
+          `<td>${e.action}</td><td style="font-size:11px">${detail}</td></tr>`;
+  });
+  jtab.innerHTML = jr + '</tbody>';
+}
+
+async function loadLearning() {
+  try {
+    const d = await fetch('/api/learning', { cache: 'no-store' }).then(r => r.json());
+    renderLearning(d);
+  } catch (e) {
+    renderLearning({ ok: false, error: String(e) });
+  }
+}
+document.getElementById('ln-refresh').onclick = loadLearning;
+setInterval(loadLearning, 60000);
+loadLearning();
+
 /* ===== MARKET-MAKING RESEARCH PANEL ===== */
 let mmRecRunning = false;
 
@@ -3156,6 +3310,37 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     hours, session, state_dir=_state_dir_for(tf), era=era))
             except Exception as e:
                 return self._json({"ok": False, "error": str(e)}, 500)
+
+        # Research export: everything needed to analyse and tune locally,
+        # as one zip. `?full=1` adds book recordings and the bot log.
+        if path == "/api/export":
+            from urllib.parse import urlparse, parse_qs
+            q = parse_qs(urlparse(self.path).query)
+            tf = (q.get("tf") or ["5m"])[0]
+            full = (q.get("full") or ["0"])[0] in ("1", "true", "yes")
+            try:
+                blob, manifest = _export_zip(tf, full=full)
+            except Exception as e:
+                return self._json({"ok": False, "error": str(e)}, 500)
+            if not manifest:
+                return self._json(
+                    {"ok": False,
+                     "error": "no data files yet — has the bot recorded a slot?"},
+                    404)
+            stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+            name = f"polybot-data-{tf}-{stamp}.zip"
+            self.send_response(200)
+            self.send_header("Content-Type", "application/zip")
+            self.send_header("Content-Length", str(len(blob)))
+            self.send_header("Content-Disposition",
+                             f'attachment; filename="{name}"')
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            try:
+                self.wfile.write(blob)
+            except OSError:
+                pass
+            return
 
         # Learning state: dataset size, parameters in force, recent decisions.
         # Without this the self-tuning loop is invisible unless you SSH in.
