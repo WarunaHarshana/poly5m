@@ -278,6 +278,39 @@ check("credential content appears nowhere in the bytes",
 check("real data still exports", "stats.json" in names, str(names))
 check("a manifest is always included", "MANIFEST.json" in names, str(names))
 
+# ---------------------------------------------------------------------------
+print("T9 persistent-volume detection")
+import importlib  # noqa: E402
+
+import supervisor  # noqa: E402
+
+_saved = {k: os.environ.get(k) for k in
+          ("STATE_ROOT", "RAILWAY_VOLUME_MOUNT_PATH", "RAILWAY_ENVIRONMENT")}
+
+
+def persistence(**env):
+    for k in _saved:
+        os.environ.pop(k, None)
+    os.environ.update(env)
+    importlib.reload(supervisor)
+    return supervisor.check_persistence()
+
+
+check("state inside an attached volume reads as persistent",
+      persistence(STATE_ROOT="/data/x",
+                  RAILWAY_VOLUME_MOUNT_PATH="/data")["persistent"] is True)
+check("a volume mounted somewhere else is flagged",
+      persistence(STATE_ROOT=tempfile.mkdtemp(),
+                  RAILWAY_VOLUME_MOUNT_PATH="/data")["persistent"] is False)
+check("local dev raises no false alarm",
+      persistence(STATE_ROOT=tempfile.mkdtemp())["persistent"] is None)
+
+for k, v in _saved.items():
+    if v is None:
+        os.environ.pop(k, None)
+    else:
+        os.environ[k] = v
+
 print()
 if FAIL:
     raise SystemExit(f"SELFTEST_FAILED ops: {FAIL}")

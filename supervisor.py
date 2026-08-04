@@ -272,12 +272,71 @@ def serve_dashboard() -> None:
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+def check_persistence() -> dict:
+    """Is the state directory actually on a persistent volume?
+
+    Getting this wrong is silent and expensive: the container happily writes to
+    /data whether or not a volume is mounted there, so a deploy without one
+    looks completely healthy right up until the next redeploy erases the trade
+    archive and everything the tuner has learned.
+
+    Two signals. Railway sets RAILWAY_VOLUME_MOUNT_PATH when a volume is
+    attached, which is definitive when present. Otherwise compare device ids:
+    a real mount is a different filesystem from /, a plain directory is not.
+    """
+    root = paths.state_root()
+    mount = (os.getenv("RAILWAY_VOLUME_MOUNT_PATH") or "").strip()
+    result = {"state_root": root, "volume_mount": mount or None}
+
+    if mount:
+        same = os.path.abspath(root).startswith(os.path.abspath(mount))
+        result["persistent"] = bool(same)
+        result["reason"] = ("state root is inside the mounted volume" if same
+                            else f"a volume is mounted at {mount} but state "
+                                 f"is being written to {root}")
+        return result
+
+    # Only claim "not persistent" when we know we are deployed. Running from a
+    # checkout the state directory is an ordinary folder that persists fine,
+    # and the st_dev test would flag it every time — on Windows especially,
+    # where os.stat("/") resolves to C:\ and matches everything on that drive.
+    in_container = (os.name == "posix"
+                    and (os.path.exists("/.dockerenv")
+                         or any(k.startswith("RAILWAY_") for k in os.environ)))
+    if not in_container:
+        result["persistent"] = None
+        result["reason"] = "not a container deployment; local state persists"
+        return result
+
+    try:
+        # A real mount is a different filesystem from the container's root.
+        result["persistent"] = os.stat(root).st_dev != os.stat("/").st_dev
+        result["reason"] = ("state root is on its own filesystem"
+                            if result["persistent"] else
+                            "state root is on the container filesystem")
+    except OSError as e:
+        result["persistent"] = None
+        result["reason"] = f"could not determine ({e})"
+    return result
+
+
 def main() -> int:
     log(f"state root: {paths.state_root()}")
-    if not os.getenv("STATE_ROOT"):
-        log("STATE_ROOT is not set - state lives in the repo directory. On a "
-            "container platform that is wiped on every deploy; mount a volume "
-            "and set STATE_ROOT to its path to keep the learning data.")
+    persistence = check_persistence()
+    if persistence["persistent"] is False:
+        log("=" * 68)
+        log("WARNING: state is NOT on a persistent volume "
+            f"({persistence['reason']}).")
+        log("Everything written here - the trade archive, the observation log")
+        log("and every parameter the tuner learns - is DESTROYED on the next")
+        log("deploy or restart. The bot will appear to work and will never")
+        log("improve, because it starts from zero every time.")
+        log("Fix: attach a volume to this service with mount path /data.")
+        log("=" * 68)
+    elif persistence["persistent"]:
+        log(f"state is on a persistent volume ({persistence['reason']}) - "
+            f"history and learned parameters survive redeploys")
+    _update(persistence=persistence)
     log(f"mode={MODE}  bot recycle every {BOT_LIFETIME_H:g}h  "
         f"tune every {TUNE_INTERVAL_S / 3600:.1f}h")
 

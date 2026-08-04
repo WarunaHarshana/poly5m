@@ -3059,7 +3059,15 @@ function renderLearning(d) {
   const need = d.needed_to_tune || 0;
   const pct = need ? Math.min(100, Math.round(100 * d.labeled / need)) : 0;
   const sup = d.supervisor || {};
-  let s = d.labeled >= need
+  let s = '';
+  // A deploy with no volume looks perfectly healthy until the next redeploy
+  // wipes it, so say so where it cannot be missed.
+  const pers = sup.persistence;
+  if (pers && pers.persistent === false) {
+    s += '⚠ DATA IS NOT PERSISTENT — everything below is destroyed on the ' +
+         'next redeploy. Attach a volume mounted at /data. ';
+  }
+  s += d.labeled >= need
     ? `Dataset ready: ${d.labeled} labeled slots of ${d.observations} recorded. `
     : `Collecting data: ${d.labeled} labeled of ${need} needed to tune (${pct}%). `;
   if (sup.bot_restarts != null) s += `Bot restarts: ${sup.bot_restarts}. `;
