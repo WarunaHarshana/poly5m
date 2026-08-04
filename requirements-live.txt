@@ -1,0 +1,6 @@
+# Real-money trading only (MODE=live). Not needed for paper or paper_live.
+#   pip install -r requirements.txt -r requirements-live.txt
+-r requirements.txt
+
+# Pulls eth-account / eth-abi / py-order-utils for order signing.
+py-clob-client-v2>=0.1.0

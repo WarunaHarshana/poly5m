@@ -1,7 +1,13 @@
-# paper_live (real data, simulated fills) only needs:
+# Runtime deps for paper / paper_live — real BTC prices and real Polymarket
+# order books, simulated fills. This is what the Dockerfile installs, and it is
+# everything the 24/7 Railway deployment needs.
 requests>=2.31
 python-dotenv>=1.0
 websockets>=12.0          # Polymarket RTDS Chainlink Data Stream (btc/usd)
 
-# live trading (MODE=live) additionally needs the Polymarket CLOB V2 client:
-py-clob-client-v2>=0.1.0
+# Real-money trading (MODE=live) additionally needs the Polymarket CLOB V2
+# client — see requirements-live.txt. It is kept out of this file on purpose:
+# every py_clob_client_v2 import in polymarket_client.py sits inside a function,
+# so paper mode never touches it, and it drags in the whole eth-account stack.
+# Installing it in the paper image would add minutes to every deploy for code
+# that never runs there.
