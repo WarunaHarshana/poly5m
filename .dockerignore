@@ -1,0 +1,20 @@
+# Secrets must come from Railway service variables, never the image.
+.env
+.env.*
+*.pem
+*.key
+
+# Runtime data lives on the mounted volume, not in the image.
+state/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+.git/
+.github/
+.claude/
+.idea/
+.vscode/
+*.log
+*.docx

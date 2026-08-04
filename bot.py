@@ -28,6 +28,8 @@ import time
 from types import SimpleNamespace
 
 import config
+import observations
+import paths
 from price_feed import SimulatedPriceFeed, LivePriceFeed, ChainlinkDataStream
 from signal_engine import compute_signal, count_strike_crossings, fair_value
 from risk import RiskManager
@@ -41,9 +43,9 @@ from decision_journal import log_decision
 _STATE_SUB = (os.getenv("STATE_SUBDIR") or "").strip()
 if not _STATE_SUB and getattr(config, "TIMEFRAME", "5m") != "5m":
     _STATE_SUB = config.TIMEFRAME
-STATE_DIR = os.path.join(os.path.dirname(__file__), "state", _STATE_SUB) \
-    if _STATE_SUB else os.path.join(os.path.dirname(__file__), "state")
-os.makedirs(STATE_DIR, exist_ok=True)
+# paths.state_dir honours STATE_ROOT so a Railway volume (e.g. /data) holds the
+# archive instead of the container's ephemeral filesystem.
+STATE_DIR = paths.state_dir(_STATE_SUB)
 TRADES_PATH = os.path.join(STATE_DIR, "trades.json")
 STATS_PATH = os.path.join(STATE_DIR, "stats.json")
 STATUS_PATH = os.path.join(STATE_DIR, "status.json")
@@ -67,6 +69,81 @@ def _ensure_session_id() -> str:
     return _session_id
 
 
+def _set_session_id(session_id: str) -> None:
+    """Adopt an existing session id (used when resuming after a restart)."""
+    global _session_id
+    _session_id = session_id
+
+
+# ---------------------------------------------------------------------------
+# Single-instance lock
+# ---------------------------------------------------------------------------
+# Two bots sharing one state directory interleave writes to trades.json and
+# stats.json and corrupt the account: each keeps its own in-memory bankroll and
+# overwrites the other's. That is easy to trigger by accident — the supervisor
+# runs a bot AND the dashboard has a Start button pointing at the same state.
+# A heartbeat lock is used rather than an OS file lock because it works the
+# same on Windows and Linux and survives a hard kill (the entry simply goes
+# stale and the next process takes it).
+LOCK_PATH = os.path.join(STATE_DIR, "bot.lock")
+LOCK_STALE_S = float(os.getenv("BOT_LOCK_STALE_S", "90"))
+LOCK_REFRESH_S = float(os.getenv("BOT_LOCK_REFRESH_S", "20"))
+
+
+def _read_lock() -> dict | None:
+    data = read_json_safe(LOCK_PATH, default=None)
+    return data if isinstance(data, dict) else None
+
+
+def _write_lock() -> None:
+    _atomic_write_json(LOCK_PATH, {
+        "pid": os.getpid(),
+        "heartbeat": time.time(),
+        "mode": config.MODE,
+        "session_id": _ensure_session_id(),
+        "state_dir": STATE_DIR,
+    })
+
+
+def acquire_lock(force: bool = False) -> None:
+    """Claim this state directory, or exit with an explanation."""
+    held = _read_lock()
+    if held and not force:
+        age = time.time() - float(held.get("heartbeat") or 0)
+        if age < LOCK_STALE_S and held.get("pid") != os.getpid():
+            raise SystemExit(
+                f"Another bot is already trading this state directory "
+                f"(pid {held.get('pid')}, last seen {age:.0f}s ago in "
+                f"{STATE_DIR}).\n"
+                f"Two bots on one state directory overwrite each other's "
+                f"trades and bankroll.\n"
+                f"Stop the other one first, or pass --force-lock if you are "
+                f"certain it is gone.")
+        if age >= LOCK_STALE_S:
+            print(f"[lock] taking over a stale lock from pid "
+                  f"{held.get('pid')} (last heartbeat {age:.0f}s ago)")
+    _write_lock()
+
+
+def release_lock() -> None:
+    held = _read_lock()
+    if held and held.get("pid") == os.getpid():
+        try:
+            os.remove(LOCK_PATH)
+        except OSError:
+            pass
+
+
+async def _lock_heartbeat() -> None:
+    """Keep the lock fresh so a live bot is never mistaken for a dead one."""
+    while True:
+        await asyncio.sleep(LOCK_REFRESH_S)
+        try:
+            _write_lock()
+        except OSError:
+            pass
+
+
 def reset_state():
     """Delete previous-run artifacts so a fresh run starts clean.
 
@@ -82,6 +159,51 @@ def reset_state():
     print("[reset] cleared previous trades/stats/status." if removed
           else "[reset] no previous state to clear.")
     print(f"[archive] permanent history kept in {ARCHIVE_DIR}")
+
+
+# Cap the *live* blotter. Running 24/7 for months would otherwise grow
+# trades.json without bound and make every dashboard poll heavier; the full
+# record already lives in the archive, which is never trimmed.
+LIVE_BLOTTER_MAX = int(os.getenv("LIVE_BLOTTER_MAX", "400"))
+
+
+def load_session() -> tuple[list, float, str | None]:
+    """Restore the previous run's blotter so a restart continues the account.
+
+    A supervised 24/7 process gets restarted — on crash, on redeploy, when the
+    round budget runs out. Without this every restart silently reset the paper
+    bankroll to STARTING_BANKROLL and reported a fresh 0-trade session, which
+    makes "is this profitable?" unanswerable across restarts.
+
+    Returns (trades, bankroll, session_id). Missing/unreadable state yields
+    the cold-start defaults.
+    """
+    trades: list[Trade] = []
+    raw = read_json_safe(TRADES_PATH, default=None)
+    if isinstance(raw, list):
+        fields = {f for f in Trade.__dataclass_fields__}
+        for d in raw:
+            if not isinstance(d, dict):
+                continue
+            try:
+                trades.append(Trade(**{k: v for k, v in d.items() if k in fields}))
+            except Exception:
+                continue
+    stats = read_json_safe(STATS_PATH, default=None) or {}
+    bankroll = stats.get("bankroll")
+    try:
+        bankroll = float(bankroll)
+    except (TypeError, ValueError):
+        bankroll = None
+    if bankroll is None or bankroll <= 0:
+        # No usable stats: rebuild from the blotter's last settled trade.
+        settled = [t for t in trades if t.won is not None and t.bankroll_after]
+        bankroll = float(settled[-1].bankroll_after) if settled \
+            else float(config.STARTING_BANKROLL)
+    session_id = stats.get("session_id") or None
+    if len(trades) > LIVE_BLOTTER_MAX:
+        trades = trades[-LIVE_BLOTTER_MAX:]
+    return trades, bankroll, session_id
 
 
 def _atomic_write_json(path: str, obj) -> None:
@@ -340,6 +462,14 @@ def archive_records(trades, stats: dict) -> int:
 
 def persist(trades, risk, skip_counts: dict | None = None):
     """Write live dashboard files + permanent archive (survives --reset)."""
+    # Trim the live blotter in place before writing. Running for months would
+    # otherwise make trades.json grow without bound and every dashboard poll
+    # heavier; archive_records() below has already banked the full history.
+    # Only settled trades are dropped — an open position must stay visible.
+    if len(trades) > LIVE_BLOTTER_MAX:
+        keep = [t for t in trades[:-LIVE_BLOTTER_MAX] if t.won is None]
+        del trades[:-LIVE_BLOTTER_MAX]
+        trades[:0] = keep
     _atomic_write_json(TRADES_PATH, [t.to_dict() for t in trades])
     settled = [t for t in trades if t.won is not None]
     wins = sum(1 for t in settled if t.won)
@@ -656,7 +786,8 @@ def _journal(session_id: str, mode: str, strategy: str, **kw):
     log_decision(row)
 
 
-async def run_realtime(rounds: int = 100, paper: bool = True):
+async def run_realtime(rounds: int = 100, paper: bool = True,
+                       resume: bool = False):
     """Real BTC data + real Polymarket quotes for the current 5-minute slot.
 
     SINGLE strategy: late_momentum — in the last LATE_MOMENTUM window
@@ -794,7 +925,18 @@ async def run_realtime(rounds: int = 100, paper: bool = True):
             print(f"  [warn] wallet balance lookup failed: {e}")
 
     trades: list[Trade] = []
-    placed = 0
+    if resume:
+        trades, resumed_bankroll, resumed_session = load_session()
+        risk.bankroll = resumed_bankroll
+        risk.starting_bankroll = resumed_bankroll
+        if resumed_session:
+            _set_session_id(resumed_session)
+        settled_n = sum(1 for t in trades if t.won is not None)
+        print(f"[resume] continuing session {_ensure_session_id()}: "
+              f"bankroll ${resumed_bankroll:,.2f}, {settled_n} settled trade(s) "
+              f"in the blotter (lifetime PnL "
+              f"{resumed_bankroll - config.STARTING_BANKROLL:+,.2f})")
+    placed = len(trades)
     lookup_fails = 0
     slots_seen = 0
     skips = {
@@ -814,11 +956,17 @@ async def run_realtime(rounds: int = 100, paper: bool = True):
     }
     max_slots = max(rounds * 30, 300)  # safety cap so a dead market can't spin forever
 
+    _hb_task = asyncio.create_task(_lock_heartbeat())
+
     settle_tasks: set = set()
+    # One observation row per slot: the retry loop re-evaluates the same slot
+    # every ~1s, and 40 near-identical rows would swamp the tuner's sample.
+    obs_written: dict = {"end_ts": None}
     last_counted_end_ts = None  # count real slots, not poll iterations
     last_traded_end_ts = None   # momentum: never re-enter a traded slot
     arb_done_end_ts = None      # arb: at most one attempt per slot
     early_seen_end_ts = None    # count slot_too_early once per slot
+    time_guard_seen_end_ts = None  # log the time-guard verdict once per slot
 
     # Write fresh (empty) trades/stats immediately so a --reset start shows a
     # clean dashboard right away — previously the files only appeared after
@@ -1191,6 +1339,12 @@ async def run_realtime(rounds: int = 100, paper: bool = True):
         return True
 
     while placed < rounds and slots_seen < max_slots:
+        # Continuous operation crosses UTC midnight; clear the per-day caps
+        # when it does or "trades per day" becomes "trades ever".
+        if risk.roll_day():
+            print(f"[day] UTC day rolled over — daily counters reset "
+                  f"(bankroll ${risk.bankroll:,.2f})")
+
         if risk.halted:
             print(f"[HALT] {risk.halt_reason}; stopping.")
             write_status(phase="halted", message=risk.halt_reason)
@@ -1248,20 +1402,30 @@ async def run_realtime(rounds: int = 100, paper: bool = True):
             continue
         rem_txt = f"{remaining:.0f}s left" if remaining is not None else "no end time"
         print(f"\nslot: {question}  ({rem_txt})")
+        observe_only = ""   # non-empty => evaluate + record, but never trade
         try:
             from config import get_time_suitability
             suitability, reason = get_time_suitability()
-            print(f"  [Time Guard] Suitability: {suitability} - {reason}")
+            # The retry loop revisits a slot every ~15s; printing the guard
+            # verdict each time buries the trading decisions in a 24/7 log.
+            first_look = end_ts != time_guard_seen_end_ts
+            time_guard_seen_end_ts = end_ts
+            if first_look:
+                print(f"  [Time Guard] Suitability: {suitability} - {reason}")
             if suitability == "AVOID":
-                print(f"  [Time Guard] Skipping slot due to unsuitable "
-                      f"trading period: {reason}")
-                write_status(phase="waiting", question=question,
-                             slug=market.get("slug"), end_ts=end_ts,
-                             side=None, edge=None, mkt=None)
-                await _sleep_until_slot_end(end_ts, cl_stream)
-                continue
+                # Walk the slot through the full gate stack but refuse to
+                # trade it. Bailing out here (the old behaviour) meant the
+                # avoided hours produced no observations at all, so the tuner
+                # could never test whether the guard actually helps — the
+                # filter was permanently unfalsifiable. Now it is measured.
+                observe_only = f"time_guard: {reason}"
+                if first_look:
+                    print(f"  [Time Guard] observe-only for this slot "
+                          f"(recording features, placing no trade)")
+            else:
+                observe_only = ""
         except Exception:
-            pass
+            observe_only = ""
         write_status(phase="analyzing", question=question, slug=market.get("slug"),
                      end_ts=end_ts, side=None, edge=None, mkt=None)
 
@@ -1314,6 +1478,29 @@ async def run_realtime(rounds: int = 100, paper: bool = True):
         # ---- LATE MOMENTUM PATH ----
         phase_name = "late_momentum"
 
+        # Feature vector for THIS slot, filled in as the gates run and flushed
+        # once — traded or skipped — by _flush_obs below. Retries rebuild it
+        # from scratch (the loop `continue`s back to here), so only the final
+        # evaluation of a slot is ever recorded.
+        slot_obs: dict = {
+            "slug": market.get("slug"),
+            "end_ts": end_ts,
+            "slot_start_ts": (end_ts - config.SLOT_SECONDS) if end_ts else None,
+            "mode": config.MODE,
+            "timeframe": getattr(config, "TIMEFRAME", "5m"),
+            "asset": getattr(config, "ASSET", "btc"),
+            "session_id": _ensure_session_id(),
+            "remaining_s": remaining,
+        }
+        def _flush_obs(decision: str, skip_reason: str = "") -> None:
+            """Record this slot's features exactly once."""
+            if not slot_obs.get("end_ts") or obs_written.get("end_ts") == end_ts:
+                return
+            obs_written["end_ts"] = end_ts
+            slot_obs["decision"] = decision
+            slot_obs["skip_reason"] = skip_reason
+            observations.record(slot_obs)
+
         # Stagger entry: if we just entered the late window, add a tiny random
         # delay (100-400ms) to reduce API congestion and quote volatility.
         if remaining is not None and remaining >= late_max - 0.5:
@@ -1335,6 +1522,7 @@ async def run_realtime(rounds: int = 100, paper: bool = True):
                 await asyncio.sleep(min(1.2, max(0.4, rem_now - late_min)))
                 return "retry"
             skips[skip_key] = skips.get(skip_key, 0) + 1
+            _flush_obs("skip", msg)
             await _sleep_until_slot_end(end_ts, cl_stream)
             return "done"
 
@@ -1377,6 +1565,8 @@ async def run_realtime(rounds: int = 100, paper: bool = True):
             slot_open_ref = price_before
             strike_src = "warmup-fallback"
         move_usd = abs(price_before - slot_open_ref) if slot_open_ref else 0.0
+        slot_obs.update(strike=slot_open_ref, strike_src=strike_src,
+                        spot=price_before)
         rem_lbl = f"{remaining:.0f}s left" if remaining is not None else "n/a left"
         print(f"  [{phase_name}] strike=${slot_open_ref:,.2f} [{strike_src}]  "
               f"btc=${price_before:,.2f} move=${move_usd:.1f}  {rem_lbl}")
@@ -1422,9 +1612,13 @@ async def run_realtime(rounds: int = 100, paper: bool = True):
 
         # Chop filter: if price flip-flopped across the strike WITHIN this
         # slot, a "lead" is noise, not momentum — skip.
+        slot_obs["realized_vol_daily"] = rv
         max_chop = int(getattr(config, "LATE_MOMENTUM_MAX_CHOP", 3) or 0)
+        if slot_open_ref and len(slot_prices) >= 4:
+            slot_obs["chop_crosses"] = count_strike_crossings(
+                slot_prices, float(slot_open_ref))
         if max_chop > 0 and slot_open_ref and len(slot_prices) >= 4:
-            crossings = count_strike_crossings(slot_prices, float(slot_open_ref))
+            crossings = slot_obs["chop_crosses"]
             if crossings > max_chop:
                 if await _late_skip(
                     "thin_move",
@@ -1442,6 +1636,12 @@ async def run_realtime(rounds: int = 100, paper: bool = True):
         min_move = float(lm_min_move)
         if remaining is not None and remaining > 0:
             min_move *= math.sqrt(max(float(remaining), 1.0) / 20.0)
+
+        # Record the direction the move points at even when it is too small to
+        # trade — that is exactly the counterfactual the tuner needs to answer
+        # "would a lower min-move threshold have made money?".
+        slot_obs.update(move_usd=diff, min_move_req=min_move,
+                        side=("UP" if diff >= 0 else "DOWN"))
 
         side = None
         if diff >= min_move:
@@ -1471,6 +1671,9 @@ async def run_realtime(rounds: int = 100, paper: bool = True):
                                 retry=True) == "retry":
                 continue
             continue
+
+        slot_obs.update(ask=mkt, bid=q.get("bid"), spread=q.get("spread"),
+                        ask_size=q.get("ask_size"))
 
         min_entry = lm_min_entry
         max_entry = lm_max_entry
@@ -1544,6 +1747,9 @@ async def run_realtime(rounds: int = 100, paper: bool = True):
                          else getattr(config, "TAKER_FEE_RATE", 0.07))
         fee_ps = config.taker_fee_per_share(mkt, fee_rate)
         edge_net = edge - fee_ps
+        slot_obs.update(model_prob=model_side_prob, edge=edge,
+                        edge_net=edge_net, fee_per_share=fee_ps,
+                        side=side, ask=mkt, remaining_s=remaining)
 
         if lm_min_edge != 0.0 and edge_net < lm_min_edge:
             if await _late_skip(
@@ -1567,6 +1773,16 @@ async def run_realtime(rounds: int = 100, paper: bool = True):
                 retry=True,
             ) == "retry":
                 continue
+            continue
+
+        if observe_only:
+            # All features are captured; the slot is recorded and left alone.
+            print(f"  [late_momentum] {observe_only} — would have taken "
+                  f"{side} @ {mkt:.3f} (edge {edge_net:+.3f}); not trading")
+            _flush_obs("skip", observe_only)
+            write_status(phase="waiting", message=observe_only,
+                         strategy=phase_name)
+            await _sleep_until_slot_end(end_ts, cl_stream)
             continue
 
         stake = risk.size_late_scalp(mkt, edge=max(edge_net, 0.0))
@@ -1610,6 +1826,7 @@ async def run_realtime(rounds: int = 100, paper: bool = True):
             if stake < 0.5:
                 print("  sized below dust after depth cap; skip")
                 skips["thin_book"] += 1
+                _flush_obs("skip", "sized below dust after depth cap")
                 await _sleep_until_slot_end(end_ts, cl_stream)
                 continue
             # Venue minimum: if the depth cap pushed us under MIN_ORDER_SHARES,
@@ -1620,6 +1837,7 @@ async def run_realtime(rounds: int = 100, paper: bool = True):
                 print(f"  depth cap left {shares:.2f} shares < venue min "
                       f"{min_sh:.0f}; skip (book too thin)")
                 skips["thin_book"] += 1
+                _flush_obs("skip", "depth cap below venue minimum shares")
                 await _sleep_until_slot_end(end_ts, cl_stream)
                 continue
 
@@ -1679,6 +1897,11 @@ async def run_realtime(rounds: int = 100, paper: bool = True):
             end_ts=end_ts,
         )
         stamp_trade_times(trade)
+        # `ask` stays the RAW book ask on every row. Overwriting it with the
+        # post-slippage/maker fill would make traded rows systematically
+        # cheaper than skipped ones and bias every backtest that compares them.
+        slot_obs.update(fill_price=fill_px, is_maker=is_maker, stake_usd=stake)
+        _flush_obs("trade")
         risk.on_open(stake)
         _register_open(trade, end_ts)
         trade_event_id = f"placed-{trade.round_id}-{int(trade.ts)}"
@@ -1810,7 +2033,9 @@ async def run_realtime(rounds: int = 100, paper: bool = True):
     if settle_tasks:
         print(f"\n[settle] waiting for {len(settle_tasks)} open trade(s) to resolve...")
         await asyncio.gather(*settle_tasks, return_exceptions=True)
+    _hb_task.cancel()
     cl_stream.stop()
+    release_lock()
     stats = persist(trades, risk, skips)
     if not risk.halted:
         write_status(phase="stopped", message="run complete")
@@ -1843,6 +2068,13 @@ if __name__ == "__main__":
                          "(sets both the base and max trade size)")
     ap.add_argument("--reset", action="store_true",
                     help="clear previous trades/stats/status before running")
+    ap.add_argument("--resume", action="store_true",
+                    help="continue the previous run's bankroll and blotter "
+                         "instead of restarting the paper account (used by "
+                         "supervisor.py for 24/7 operation)")
+    ap.add_argument("--force-lock", action="store_true",
+                    help="start even if another bot appears to hold this "
+                         "state directory (only if you know it is gone)")
     args = ap.parse_args()
     config.MODE = args.mode
     if args.asset:
@@ -1878,10 +2110,15 @@ if __name__ == "__main__":
     if args.reset:
         reset_state()
 
+    # Claim the state directory before anything writes to it.
+    acquire_lock(force=args.force_lock)
+
     if args.mode == "paper":
         run_sim(rounds=args.rounds or 200, sleep_between=args.sleep, seed=args.seed)
     elif args.mode == "paper_live":
-        asyncio.run(run_realtime(rounds=args.rounds or 100, paper=True))
+        asyncio.run(run_realtime(rounds=args.rounds or 100, paper=True,
+                                 resume=args.resume and not args.reset))
     elif args.mode == "live":
         # Default to very few live rounds; override with --rounds if needed.
-        asyncio.run(run_realtime(rounds=args.rounds or 5, paper=False))
+        asyncio.run(run_realtime(rounds=args.rounds or 5, paper=False,
+                                 resume=args.resume and not args.reset))

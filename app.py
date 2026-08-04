@@ -16,6 +16,7 @@ Endpoints:
     GET  /state/*.json   -> state files for dashboard polling
 """
 
+import hmac
 import http.server
 import json
 import os
@@ -23,17 +24,30 @@ import re
 import subprocess
 import sys
 import threading
+import time
 import webbrowser
 
-PORT = int(os.getenv("DASH_PORT", "8000"))
+import paths
+
+# Railway injects PORT; DASH_PORT stays the local override.
+PORT = int(os.getenv("DASH_PORT") or os.getenv("PORT") or "8000")
+# Bind publicly only when asked (Railway sets HOST=0.0.0.0 via the Dockerfile).
+# Defaulting to loopback keeps the wallet-setup endpoints off the LAN locally.
+HOST = (os.getenv("DASH_HOST") or "127.0.0.1").strip()
+DASH_TOKEN = (os.getenv("DASH_TOKEN") or "").strip()
+if HOST not in ("127.0.0.1", "localhost", "::1") and not DASH_TOKEN:
+    raise SystemExit(
+        "Refusing to serve on a public interface without DASH_TOKEN.\n"
+        "This dashboard can start/stop the bot and write wallet settings, so a\n"
+        "public bind needs a token. Set DASH_TOKEN=<a long random string> in\n"
+        "the service variables and open the dashboard as ?token=<that value>.")
 HERE = os.path.dirname(os.path.abspath(__file__))
 # Mirror bot.py: a non-5m instance keeps its state in state/<timeframe>/, so
 # a second dashboard can watch it on another port. Example (15m on :8015):
 #   $env:TIMEFRAME='15m'; $env:DASH_PORT='8015'; python app.py
 _TF = (os.getenv("TIMEFRAME") or "5m").strip().lower()
 _STATE_SUB = (os.getenv("STATE_SUBDIR") or ("" if _TF == "5m" else _TF)).strip()
-STATE_DIR = os.path.join(HERE, "state", _STATE_SUB) if _STATE_SUB \
-    else os.path.join(HERE, "state")
+STATE_DIR = paths.state_dir(_STATE_SUB)
 ENV_PATH = os.path.join(HERE, ".env")
 os.chdir(HERE)
 
@@ -47,8 +61,7 @@ def _state_dir_for(tf: str | None) -> str:
     tf = (tf or "5m").strip().lower()
     if tf not in ALLOWED_TIMEFRAMES:
         tf = "5m"
-    return os.path.join(HERE, "state") if tf == "5m" \
-        else os.path.join(HERE, "state", tf)
+    return paths.state_dir("" if tf == "5m" else tf)
 
 _lock = threading.Lock()
 # One process slot PER TIMEFRAME. A single shared slot meant you could not
@@ -3031,6 +3044,50 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 TimeoutError, OSError):
             pass
 
+    # -- auth -------------------------------------------------------------
+    # Bound to loopback this server is trusted by definition. Bound to
+    # 0.0.0.0 (Railway) it is on the public internet, and it can start/stop
+    # the bot and write wallet settings into .env — so a token is mandatory
+    # there. Pass it once as ?token=..., it is stored as a cookie afterwards.
+    def _authed(self) -> bool:
+        if not DASH_TOKEN:
+            return True
+        from urllib.parse import urlparse, parse_qs
+        q = parse_qs(urlparse(self.path).query)
+        supplied = (q.get("token") or [None])[0]
+        if not supplied:
+            supplied = self.headers.get("X-Dash-Token")
+        if not supplied:
+            for part in (self.headers.get("Cookie") or "").split(";"):
+                name, _, val = part.strip().partition("=")
+                if name == "dash_token":
+                    supplied = val
+                    break
+        return bool(supplied) and hmac.compare_digest(str(supplied), DASH_TOKEN)
+
+    def _deny(self):
+        body = (b"<h1>401</h1><p>Add <code>?token=YOUR_DASH_TOKEN</code> to the "
+                b"URL. Set DASH_TOKEN in the service variables.</p>")
+        self.send_response(401)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except OSError:
+            pass
+
+    def _set_token_cookie(self):
+        """Persist a freshly supplied ?token= so polling requests carry it."""
+        from urllib.parse import urlparse, parse_qs
+        if not DASH_TOKEN:
+            return
+        q = parse_qs(urlparse(self.path).query)
+        if (q.get("token") or [None])[0]:
+            self.send_header(
+                "Set-Cookie",
+                f"dash_token={DASH_TOKEN}; Path=/; HttpOnly; SameSite=Strict")
+
     def _json(self, obj, code=200):
         body = json.dumps(obj).encode()
         try:
@@ -3049,6 +3106,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        self._set_token_cookie()
         self.end_headers()
         self.wfile.write(body)
 
@@ -3067,6 +3125,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = self.path.split("?")[0]
+
+        # Unauthenticated liveness probe for the platform healthcheck.
+        if path == "/healthz":
+            return self._json({"ok": True, "ts": time.time()})
+
+        if not self._authed():
+            return self._deny()
 
         # Dashboard
         if path in ("/", "/dashboard"):
@@ -3089,6 +3154,37 @@ class Handler(http.server.BaseHTTPRequestHandler):
             try:
                 return self._json(analyze.compute_report(
                     hours, session, state_dir=_state_dir_for(tf), era=era))
+            except Exception as e:
+                return self._json({"ok": False, "error": str(e)}, 500)
+
+        # Learning state: dataset size, parameters in force, recent decisions.
+        # Without this the self-tuning loop is invisible unless you SSH in.
+        if path == "/api/learning":
+            try:
+                import observations
+                import tuner
+                rows = observations.load()
+                labeled = [r for r in rows if r.get("outcome") in ("UP", "DOWN")]
+                journal = tuner.read_journal()[-20:]
+                tuned = tuner.load_tuned()
+                sup = {}
+                try:
+                    with open(os.path.join(STATE_DIR, "supervisor.json"),
+                              encoding="utf-8") as f:
+                        sup = json.load(f)
+                except (OSError, ValueError):
+                    pass
+                return self._json({
+                    "ok": True,
+                    "observations": len(rows),
+                    "labeled": len(labeled),
+                    "needed_to_tune": tuner.MIN_LABELED_ROWS,
+                    "active_params": tuner.active_params(),
+                    "defaults": tuner.DEFAULTS,
+                    "tuned": tuned,
+                    "journal": list(reversed(journal)),
+                    "supervisor": sup,
+                })
             except Exception as e:
                 return self._json({"ok": False, "error": str(e)}, 500)
 
@@ -3177,6 +3273,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(b"Not Found")
 
     def do_POST(self):
+        if not self._authed():
+            return self._deny()
         route = self.path.split("?")[0]
         length = int(self.headers.get("Content-Length") or 0)
         raw = self.rfile.read(length) if length else b""
@@ -3215,7 +3313,7 @@ if __name__ == "__main__":
     # Ensure state directory exists
     os.makedirs(STATE_DIR, exist_ok=True)
 
-    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+    httpd = http.server.ThreadingHTTPServer((HOST, PORT), Handler)
 
     print()
     print("  +------------------------------------------------------+")
@@ -3236,8 +3334,9 @@ if __name__ == "__main__":
     print("  +------------------------------------------------------+")
     print()
 
-    # Auto-open browser
-    threading.Timer(0.5, lambda: webbrowser.open(url)).start()
+    # Auto-open browser (never on a headless host — there is no browser there)
+    if HOST in ("127.0.0.1", "localhost") and not os.getenv("NO_BROWSER"):
+        threading.Timer(0.5, lambda: webbrowser.open(url)).start()
 
     try:
         httpd.serve_forever()

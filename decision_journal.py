@@ -13,8 +13,11 @@ import os
 import time
 from datetime import datetime, timezone
 
-ARCHIVE_DIR = os.path.join(os.path.dirname(__file__), "state", "archive")
-os.makedirs(ARCHIVE_DIR, exist_ok=True)
+import paths
+
+# Volume-aware, and timeframe-scoped like the rest of the state tree — the old
+# hard-coded repo path meant a 15m instance wrote its journal into the 5m one.
+ARCHIVE_DIR = paths.archive_dir()
 DECISIONS_JSONL = os.path.join(ARCHIVE_DIR, "decisions.jsonl")
 DECISIONS_CSV = os.path.join(ARCHIVE_DIR, "decisions.csv")
 

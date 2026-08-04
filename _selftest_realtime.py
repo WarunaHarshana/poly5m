@@ -28,6 +28,12 @@ bot.HISTORY_JSONL = os.path.join(bot.ARCHIVE_DIR, "trades_history.jsonl")
 bot.HISTORY_CSV = os.path.join(bot.ARCHIVE_DIR, "trades_history.csv")
 bot.SESSIONS_DIR = os.path.join(bot.ARCHIVE_DIR, "sessions")
 os.makedirs(bot.SESSIONS_DIR, exist_ok=True)
+# The observation log lives in its own module, so redirect it too or the
+# selftest's synthetic slots end up in the real learning dataset.
+import observations
+observations.ARCHIVE_DIR = bot.ARCHIVE_DIR
+observations.OBSERVATIONS_JSONL = os.path.join(
+    bot.ARCHIVE_DIR, "observations.jsonl")
 
 # Fast mode + deterministic gates (independent of whatever .env says)
 config.MODE = "paper_live"

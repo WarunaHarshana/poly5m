@@ -24,11 +24,8 @@ from market_maker import MMQuote, simulate_slot, MMStats
 def _rec_path(state_dir: str | None = None) -> str:
     if state_dir:
         return os.path.join(state_dir, "archive", "book_recordings.jsonl")
-    here = os.path.dirname(__file__)
-    tf = (os.getenv("TIMEFRAME") or "5m").strip().lower()
-    sub = (os.getenv("STATE_SUBDIR") or ("" if tf == "5m" else tf)).strip()
-    base = os.path.join(here, "state", sub) if sub else os.path.join(here, "state")
-    return os.path.join(base, "archive", "book_recordings.jsonl")
+    import paths
+    return os.path.join(paths.archive_dir(), "book_recordings.jsonl")
 
 
 REC = _rec_path()

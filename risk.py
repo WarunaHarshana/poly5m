@@ -5,7 +5,12 @@ model confidence, with an explicit fee buffer. Live mode typically uses a fixed
 tiny stake (FIXED_STAKE_USD) so a bad streak cannot scale up.
 """
 from __future__ import annotations
+import time
 import config
+
+
+def _utc_day(ts: float | None = None) -> int:
+    return int((ts if ts is not None else time.time()) // 86400)
 
 
 class RiskManager:
@@ -19,6 +24,29 @@ class RiskManager:
         self.trades_today = 0
         self.consecutive_losses = 0
         self.last_skip_reason = ""
+        self._day = _utc_day()
+
+    def roll_day(self, ts: float | None = None) -> bool:
+        """Reset the per-day counters at the UTC midnight boundary.
+
+        The bot used to be run in short sessions, so "today" was however long
+        the process lived and this never came up. Running continuously, a
+        daily cap that is never cleared is not a daily cap — it halts trading
+        permanently the first time it trips. Returns True on a rollover.
+        """
+        today = _utc_day(ts)
+        if today == self._day:
+            return False
+        self._day = today
+        self.trades_today = 0
+        self.realized_pnl_today = 0.0
+        # Clear only the halts that are by definition daily. A consecutive-loss
+        # halt is about the current streak, not the calendar, so it stands.
+        if self.halted and ("daily" in self.halt_reason
+                            or "max trades per day" in self.halt_reason):
+            self.halted = False
+            self.halt_reason = ""
+        return True
 
     def _daily_loss_limit(self) -> float:
         """Tighter of absolute $ cap and bankroll % (minimal risk)."""

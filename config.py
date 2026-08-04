@@ -525,6 +525,59 @@ def strategy_name() -> str:
     return "late_momentum"
 
 
+# ---------------------------------------------------------------------------
+# Learned parameters
+# ---------------------------------------------------------------------------
+# The nightly tuner writes state/tuned_params.json after validating a change on
+# data it did not fit to. Applying it here — last, after every env default —
+# means the running bot picks the learned values up on its next restart without
+# anything else in the codebase needing to know the tuner exists.
+#
+# Precedence, highest first:
+#   1. TUNER_FROZEN_KEYS   (comma-separated) — pin a key, tuner may not move it
+#   2. tuned_params.json   (when TUNER_ENABLED is on, the default)
+#   3. .env / environment
+#   4. the hard-coded defaults above
+TUNER_ENABLED = _env_bool("TUNER_ENABLED", True)
+TUNER_FROZEN_KEYS = {
+    k.strip().upper()
+    for k in (os.getenv("TUNER_FROZEN_KEYS") or "").split(",") if k.strip()
+}
+TUNED_APPLIED: dict = {}
+
+
+def apply_tuned_params(verbose: bool = True) -> dict:
+    """Overlay learned parameters onto this module. Returns what changed."""
+    global TUNED_APPLIED
+    TUNED_APPLIED = {}
+    if not TUNER_ENABLED:
+        return TUNED_APPLIED
+    try:
+        import tuner
+        learned = (tuner.load_tuned().get("params") or {})
+        allowed = set(tuner.LADDERS)
+    except Exception as e:  # tuner is optional; never block startup on it
+        if verbose:
+            print(f"[config] tuned params unavailable ({e}); using defaults")
+        return TUNED_APPLIED
+    for key, value in learned.items():
+        if key not in allowed or key in TUNER_FROZEN_KEYS:
+            continue
+        old = globals().get(key)
+        if old is None or old == value:
+            continue
+        globals()[key] = type(old)(value) if isinstance(old, (int, float)) else value
+        TUNED_APPLIED[key] = {"from": old, "to": globals()[key]}
+    if TUNED_APPLIED and verbose:
+        print("[config] learned parameters applied (state/tuned_params.json):")
+        for key, ch in TUNED_APPLIED.items():
+            print(f"  {key}: {ch['from']} -> {ch['to']}")
+    return TUNED_APPLIED
+
+
+apply_tuned_params()
+
+
 def get_time_suitability(ts: float | None = None) -> tuple[str, str]:
     """Check if the current time is suitable for trading.
     

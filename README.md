@@ -39,11 +39,61 @@ risk), which is not handled, so in `live` mode arb signals are logged only.
 prices and real Polymarket order books**, but only *simulates* the fills — so
 nothing is at stake and **no wallet or private key is required**.
 
+## Running it 24/7 (Railway, paper money)
+
+`supervisor.py` is a single process that serves the dashboard, keeps
+`bot.py --mode paper_live` alive forever, and runs a nightly learning cycle
+that tunes the strategy on data the bot collected itself. See
+[DEPLOY_RAILWAY.md](DEPLOY_RAILWAY.md) for the full deployment.
+
+```bash
+STATE_ROOT=/data DASH_TOKEN=$(python -c "import secrets;print(secrets.token_urlsafe(32))") python supervisor.py
+```
+
+Three pieces make continuous operation work:
+
+- **`--resume`** — a restart continues the same paper account instead of
+  resetting the bankroll. The supervisor recycles the bot every 6 hours (feeds
+  go stale) and after any parameter change, so this happens routinely.
+- **`STATE_ROOT`** — points all state at a mounted volume. Container
+  filesystems are wiped on every deploy; without it the learning data dies
+  with each redeploy.
+- **A single-instance lock** — two bots sharing one state directory overwrite
+  each other's trades and bankroll. The second one refuses to start.
+
+## Self-improvement: what it actually learns
+
+The bot writes one row per *evaluated* slot to
+`state/archive/observations.jsonl` — the move, the ask, the spread, the model
+edge, the hour, the seconds remaining — **whether or not it traded**, and
+labels it afterwards with how the slot really resolved. That is ~288 labeled
+samples a day instead of the ~5 the trade log provides, and it is the only way
+to answer "would a wider entry band have earned money?", because the slots a
+wider band would have taken are otherwise never recorded.
+
+Nightly, `tuner.py` splits that history chronologically, searches parameter
+ladders on the older part, and requires the winner to beat the incumbent on a
+recent slice it never saw. It writes a change only if all hold: ≥300 labeled
+slots, enough trades in both slices, better expectancy on both, positive
+holdout expectancy with t ≥ 2, and no parameter moving more than one notch.
+Rejections are journalled with the reason. A change followed by real losses is
+rolled back automatically.
+
+`_selftest_tuner.py` measures the property that matters: on 80 synthetic
+pure-noise datasets the tuner changed nothing 80 times, while still finding a
+real effect when one was present. **Long stretches of "no change" are the
+system working**, not a fault — it tunes thresholds on an existing signal and
+cannot manufacture edge that is not there.
+
 ## Files
 
 | File | Role |
 |------|------|
-| `config.py` | All settings + secrets from `.env` |
+| `config.py` | All settings + secrets from `.env`, plus learned overrides |
+| `paths.py` | Where state lives (`STATE_ROOT`-aware, for mounted volumes) |
+| `supervisor.py` | 24/7 entrypoint: dashboard + supervised bot + learning cycle |
+| `observations.py` | Per-slot feature log + official-outcome labeling |
+| `tuner.py` | Walk-forward parameter search with anti-overfit guardrails |
 | `price_feed.py` | Live BTC spot (Chainlink Data Stream first, multi-source fallback) **or** offline simulator |
 | `signal_engine.py` | Drift/diffusion CDF fair value → model probability for the momentum side |
 | `risk.py` | Edge-scaled sizing, exposure cap, daily-loss circuit breaker |
@@ -52,7 +102,7 @@ nothing is at stake and **no wallet or private key is required**.
 | `bot.py` | Main loop: `run_sim` (offline) + `run_realtime` (real data, background settlement) |
 | `discover.py` | Prints the current auto-discovered 5-min market (debugging) |
 | `app.py` | **All-in-one dashboard server + control API** (start/stop the bot from the browser) |
-| `_selftest_realtime.py` / `_selftest_discovery.py` / `_selftest_pricing.py` | Offline self-tests (network stubbed) |
+| `_selftest_*.py` | Offline self-tests (network stubbed) |
 
 ## Quick start
 
@@ -221,6 +271,12 @@ bankroll.
 ## Self-tests (offline, no network)
 
 ```bash
+python3 _selftest_ops.py         # 24/7 behaviours: resume, blotter trim, daily
+                                 #   rollover, observation dedupe, volume paths,
+                                 #   dashboard auth, single-instance lock
+python3 _selftest_tuner.py       # the tuner's guardrails — including the one
+                                 #   that matters: 80 pure-noise datasets must
+                                 #   produce zero parameter changes
 python3 _selftest_realtime.py    # full realtime loop, feeds/Gamma stubbed:
                                  #   Phase A: late_momentum must trade and win
                                  #   Phase B: arb must place pairs with locked-in PnL

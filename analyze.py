@@ -22,10 +22,8 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 # Follow the same per-timeframe layout as bot.py / app.py, so a 15m instance
 # analyses its OWN trades instead of silently reporting the 5m archive.
-_TF = (os.getenv("TIMEFRAME") or "5m").strip().lower()
-_STATE_SUB = (os.getenv("STATE_SUBDIR") or ("" if _TF == "5m" else _TF)).strip()
-_STATE = os.path.join(HERE, "state", _STATE_SUB) if _STATE_SUB \
-    else os.path.join(HERE, "state")
+import paths
+_STATE = paths.state_dir()
 HISTORY = os.path.join(_STATE, "archive", "trades_history.jsonl")
 STATS = os.path.join(_STATE, "stats.json")
 
