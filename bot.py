@@ -1610,23 +1610,11 @@ async def run_realtime(rounds: int = 100, paper: bool = True,
         price_window_start = slot_prices[0] if slot_prices else price_before
         price_now = price_before
 
-        # Chop filter: if price flip-flopped across the strike WITHIN this
-        # slot, a "lead" is noise, not momentum — skip.
         slot_obs["realized_vol_daily"] = rv
         max_chop = int(getattr(config, "LATE_MOMENTUM_MAX_CHOP", 3) or 0)
         if slot_open_ref and len(slot_prices) >= 4:
             slot_obs["chop_crosses"] = count_strike_crossings(
                 slot_prices, float(slot_open_ref))
-        if max_chop > 0 and slot_open_ref and len(slot_prices) >= 4:
-            crossings = slot_obs["chop_crosses"]
-            if crossings > max_chop:
-                if await _late_skip(
-                    "thin_move",
-                    f"choppy: {crossings} strike crossings > {max_chop}",
-                    retry=True,
-                ) == "retry":
-                    continue
-                continue
 
         diff = price_now - slot_open_ref
         # Scale the required lead with sqrt(time left): diffusion noise over
@@ -1640,8 +1628,48 @@ async def run_realtime(rounds: int = 100, paper: bool = True,
         # Record the direction the move points at even when it is too small to
         # trade — that is exactly the counterfactual the tuner needs to answer
         # "would a lower min-move threshold have made money?".
-        slot_obs.update(move_usd=diff, min_move_req=min_move,
-                        side=("UP" if diff >= 0 else "DOWN"))
+        side_hint = "UP" if diff >= 0 else "DOWN"
+        slot_obs.update(move_usd=diff, min_move_req=min_move, side=side_hint)
+
+        # Quote the momentum side BEFORE the cheap gates get a chance to bail.
+        #
+        # This costs one extra book read on slots we are about to skip, and it
+        # buys the only thing that makes those gates testable. Previously the
+        # chop filter and the move threshold rejected a slot before any price
+        # was recorded, so 46% of a day's labeled observations carried no ask —
+        # and a backtest cannot price a trade it has no price for. The tuner
+        # could therefore never answer "is MAX_CHOP=3 too strict?", which meant
+        # those gates were permanently exempt from the evidence. Same class of
+        # blind spot as the time guard, fixed the same way: evaluate and
+        # record, then decide.
+        q = None
+        mkt = None
+        if bool(getattr(config, "OBSERVE_QUOTE_ALWAYS", True)):
+            try:
+                q = await asyncio.to_thread(_quote_side, pub, market, side_hint)
+                if q and q.get("price") is not None:
+                    mkt = float(q["price"])
+                    slot_obs.update(ask=mkt, bid=q.get("bid"),
+                                    spread=q.get("spread"),
+                                    ask_size=q.get("ask_size"))
+            except Exception as e:
+                # Observation-only failure: never let it kill the slot. The
+                # gates below re-fetch if they actually need a tradeable quote.
+                print(f"  [obs] quote for {side_hint} unavailable: {e}")
+                q = None
+
+        # Chop filter: if price flip-flopped across the strike WITHIN this
+        # slot, a "lead" is noise, not momentum — skip.
+        if max_chop > 0 and slot_open_ref and len(slot_prices) >= 4:
+            crossings = slot_obs["chop_crosses"]
+            if crossings > max_chop:
+                if await _late_skip(
+                    "thin_move",
+                    f"choppy: {crossings} strike crossings > {max_chop}",
+                    retry=True,
+                ) == "retry":
+                    continue
+                continue
 
         side = None
         if diff >= min_move:
@@ -1658,22 +1686,25 @@ async def run_realtime(rounds: int = 100, paper: bool = True,
                 continue
             continue
 
-        # Fetch quote for decided side
-        try:
-            token_id = market["tokens"][side]
-            q = await asyncio.to_thread(_quote_side, pub, market, side)
-            if not q:
-                raise ValueError("Failed to get quote")
-            mkt = float(q["price"])
-        except Exception as e:
-            if await _late_skip("quote_fail",
-                                f"failed to get quote for {side}: {e}",
-                                retry=True) == "retry":
+        # side is always side_hint here (both derive from the sign of diff), so
+        # the observation quote above is for the right token; only re-fetch if
+        # it failed or was disabled.
+        token_id = market["tokens"][side]
+        if mkt is None:
+            try:
+                q = await asyncio.to_thread(_quote_side, pub, market, side)
+                if not q:
+                    raise ValueError("Failed to get quote")
+                mkt = float(q["price"])
+                slot_obs.update(ask=mkt, bid=q.get("bid"),
+                                spread=q.get("spread"),
+                                ask_size=q.get("ask_size"))
+            except Exception as e:
+                if await _late_skip("quote_fail",
+                                    f"failed to get quote for {side}: {e}",
+                                    retry=True) == "retry":
+                    continue
                 continue
-            continue
-
-        slot_obs.update(ask=mkt, bid=q.get("bid"), spread=q.get("spread"),
-                        ask_size=q.get("ask_size"))
 
         min_entry = lm_min_entry
         max_entry = lm_max_entry
@@ -2046,6 +2077,7 @@ async def run_realtime(rounds: int = 100, paper: bool = True,
 
 if __name__ == "__main__":
     import argparse
+    import signal
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", choices=["paper", "paper_live", "live"],
                     default=config.MODE, help="overrides MODE from .env")
@@ -2112,6 +2144,24 @@ if __name__ == "__main__":
 
     # Claim the state directory before anything writes to it.
     acquire_lock(force=args.force_lock)
+
+    # The supervisor recycles this process with SIGTERM every few hours. Python
+    # does not run any cleanup for it by default, so the lock file was left
+    # behind with a fresh heartbeat and the *replacement* bot refused to start
+    # until it went stale — roughly 90s of crash-restart after every recycle
+    # (measured: 31 restarts in 23h where 4 were expected). Releasing the lock
+    # on the way out makes a recycle instant.
+    def _release_and_exit(signum, _frame):
+        print(f"[lock] signal {signum} — releasing {LOCK_PATH}")
+        release_lock()
+        raise SystemExit(0)
+
+    for _sig in (getattr(signal, "SIGTERM", None), getattr(signal, "SIGINT", None)):
+        if _sig is not None:
+            try:
+                signal.signal(_sig, _release_and_exit)
+            except (ValueError, OSError):
+                pass
 
     if args.mode == "paper":
         run_sim(rounds=args.rounds or 200, sleep_between=args.sleep, seed=args.seed)

@@ -55,6 +55,9 @@ HEALTHY_RUN_S = float(os.getenv("HEALTHY_RUN_S", "300"))
 LABEL_INTERVAL_S = float(os.getenv("LABEL_INTERVAL_S", "900"))      # 15 min
 TUNE_INTERVAL_S = float(os.getenv("TUNE_INTERVAL_S", str(24 * 3600)))
 TUNE_FIRST_DELAY_S = float(os.getenv("TUNE_FIRST_DELAY_S", "3600"))
+# How soon to look again when the dataset was too small to judge. Must be far
+# shorter than TUNE_INTERVAL_S or a single early "wait" costs a whole day.
+TUNE_RETRY_S = float(os.getenv("TUNE_RETRY_S", "3600"))
 BANKROLL = os.getenv("PAPER_BANKROLL", "").strip()
 BET = os.getenv("PAPER_BET", "").strip()
 LOG_MAX_BYTES = int(os.getenv("BOT_LOG_MAX_BYTES", str(8 * 1024 * 1024)))
@@ -170,6 +173,8 @@ def trading_loop() -> None:
                 break
 
         ran_for = time.time() - started
+        # Whatever ended this run, the child is gone — so its lock must go too.
+        _clear_stale_lock(proc.pid)
         _update(bot_pid=None, last_exit_code=code, recycle_requested=False)
         if _stop.is_set():
             return
@@ -189,8 +194,33 @@ def trading_loop() -> None:
         backoff = min(backoff * 2, BACKOFF_MAX_S)
 
 
+def _clear_stale_lock(pid: int | None) -> None:
+    """Drop the state lock belonging to a bot we just reaped.
+
+    The bot releases its own lock on SIGTERM, but a hard kill (or a crash)
+    skips that. Since we know this child is dead, its lock is by definition
+    stale — leaving it would make the replacement bot refuse to start until
+    the heartbeat aged out, which is exactly the restart loop this avoids.
+    Only ever removes a lock we can prove belongs to that dead child.
+    """
+    lock = os.path.join(STATE_DIR, "bot.lock")
+    try:
+        with open(lock, "r", encoding="utf-8") as f:
+            held = json.load(f)
+    except (OSError, ValueError):
+        return
+    if pid is not None and held.get("pid") != pid:
+        return  # someone else's lock; leave it alone
+    try:
+        os.remove(lock)
+        log(f"cleared the state lock left by bot pid={pid}")
+    except OSError:
+        pass
+
+
 def _terminate(proc, why: str) -> None:
     if proc.poll() is not None:
+        _clear_stale_lock(proc.pid)
         return
     log(f"stopping bot pid={proc.pid} ({why})")
     try:
@@ -205,6 +235,7 @@ def _terminate(proc, why: str) -> None:
             pass
     except Exception:
         pass
+    _clear_stale_lock(proc.pid)
 
 
 # ---------------------------------------------------------------------------
@@ -231,6 +262,7 @@ def learning_loop() -> None:
                 log(f"labeling failed: {e}")
 
         if now >= next_tune:
+            # Provisional; a "wait" result shortens this below.
             next_tune = now + TUNE_INTERVAL_S
             try:
                 import tuner
@@ -242,7 +274,19 @@ def learning_loop() -> None:
                 result = tuner.run()
                 _update(last_tune={"at": now, "action": result.get("action"),
                                    "changes": result.get("changes"),
-                                   "reasons": result.get("reasons")})
+                                   "reasons": result.get("reasons"),
+                                   "labeled_rows": result.get("labeled_rows")})
+                if result.get("action") == "wait":
+                    # "wait" means the dataset was too small to judge, not that
+                    # a judgement was made. Backing off a full day for that is
+                    # how the first deployment reached 24h having never once
+                    # completed a cycle: the first attempt fired an hour after
+                    # boot with ~10 labeled slots, said wait, and then slept
+                    # through the entire window in which the data arrived.
+                    next_tune = now + TUNE_RETRY_S
+                    log(f"tuner needs more data ({result.get('labeled_rows')} "
+                        f"labeled); retrying in {TUNE_RETRY_S / 60:.0f} min "
+                        f"rather than waiting a full cycle")
                 if result.get("action") in ("apply", "revert"):
                     # config is read at import, so the running bot still has the
                     # old values. Recycle it to pick them up.

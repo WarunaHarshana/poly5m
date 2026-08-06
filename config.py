@@ -272,6 +272,11 @@ LATE_MOMENTUM_MAX_EDGE = float(os.getenv("LATE_MOMENTUM_MAX_EDGE", "0.10"))
 # Skip slots where price crossed the strike more than this many times in the
 # recent sample window (lead = noise, not momentum). 0 = off.
 LATE_MOMENTUM_MAX_CHOP = int(os.getenv("LATE_MOMENTUM_MAX_CHOP", "3"))
+# Read the book on every evaluated slot, before the chop/move gates decide.
+# Costs one extra book read per skipped slot; without it those gates produce
+# observations with no price, which no backtest can score — so the tuner can
+# never tell whether they are set too tight. Set 0 only if rate-limited.
+OBSERVE_QUOTE_ALWAYS = _env_bool("OBSERVE_QUOTE_ALWAYS", True)
 
 # --- Sum-to-one arbitrage (runs alongside late_momentum) ---
 # When ask_UP + ask_DOWN < 1 − ARB_MIN_EDGE, buying BOTH sides pays $1/share

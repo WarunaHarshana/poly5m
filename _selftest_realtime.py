@@ -297,4 +297,76 @@ assert abs(stats_e["avg_stake"] - 3.60) < 1e-6, stats_e["avg_stake"]
 print("PHASE_E_OK (ask-rise keeps venue min) orders=",
       [(p, s) for p, s in FakeLiveClientE.calls], "avg_stake=", stats_e["avg_stake"])
 
-print("\nSELFTEST_OK momentum+arb+live+maker+venue-min")
+# ---- Phase F: a SKIPPED slot must still record a priceable observation ----
+# The cheap gates (chop, min-move) used to bail before the book was ever read,
+# so the rows they produced had no ask. A backtest cannot score a trade it has
+# no price for, which left those gates permanently untestable — the tuner could
+# never answer "is this threshold too tight?". Quoting before the gates fixes
+# that, and this asserts it stays fixed.
+class FakeFeedFlat(FakeFeed):
+    """Spot sits exactly ON the strike -> move $0 -> the min-move gate rejects.
+
+    Deliberately not a random walk: FakeFeed's 0.0002 sigma on a $68k price is
+    a ~$13 one-sigma step, which clears the $10 threshold and would trade.
+    """
+    def price(self):
+        self.history.append(self.p)
+        return self.p
+
+    def get_slot_start_price(self, slot_start_ts):
+        return self.p
+
+
+# The loop must land in a 2-second band to skip without retrying: at least
+# late_min (8s) left so the window is open, but no more than late_min+2 or
+# _late_skip retries for ~20s per slot. Real wall-clock timing drifts in and
+# out of that band, so drive a controlled clock instead of racing it.
+_FLAT_BASE = 1_800_000_000.0
+_FLAT_REMAINING = 9.0
+
+
+class FakePubFlat(FakePubMomentum):
+    """One fresh slot per call, always exactly _FLAT_REMAINING seconds from end."""
+    def find_btc_5min_market(self, *args, **kwargs):
+        m = super().find_btc_5min_market()
+        m["end_ts"] = _FLAT_BASE + 300.0 * self.n + _FLAT_REMAINING
+        return m
+
+
+_flat_pub = FakePubFlat()
+bot.LivePriceFeed = FakeFeedFlat
+polymarket_client.PolymarketPublic = lambda *a, **k: _flat_pub
+# Advance the clock one slot at a time so `remaining` is deterministic and each
+# slot has a distinct end_ts (identical end_ts would not count as a new slot).
+_real_now = bot._now
+# find_btc_5min_market bumps .n and sets end_ts = BASE + 300n + REMAINING, so
+# a clock of BASE + 300n leaves exactly REMAINING seconds on every slot.
+bot._now = lambda cl_stream=None: _FLAT_BASE + 300.0 * _flat_pub.n
+config.ARB_TRADE_ENABLED = False
+config.MODE = "paper_live"
+
+if os.path.exists(observations.OBSERVATIONS_JSONL):
+    os.remove(observations.OBSERVATIONS_JSONL)
+
+try:
+    stats_f = asyncio.run(bot.run_realtime(rounds=1, paper=True))
+finally:
+    bot._now = _real_now
+obs_f = observations.load()
+assert stats_f["trades"] == 0, f"flat move should not trade, got {stats_f['trades']}"
+assert obs_f, "a skipped slot must still produce an observation"
+skipped = [r for r in obs_f if r["decision"] == "skip"]
+assert skipped, f"expected skip rows, got {[r['decision'] for r in obs_f]}"
+priced = [r for r in skipped if r.get("ask") is not None]
+assert priced, (
+    "skipped slots recorded NO ask - the tuner cannot score them, so the "
+    "gate that rejected them is untestable. Rows: %r"
+    % [{k: r.get(k) for k in ('decision', 'skip_reason', 'ask', 'side')}
+       for r in skipped[:3]])
+assert all(r.get("side") in ("UP", "DOWN") for r in priced), \
+    "a priced observation needs a side to be scoreable"
+print("PHASE_F_OK (skipped slots are priceable) rows=", len(obs_f),
+      "priced_skips=", len(priced),
+      "ask=", priced[0]["ask"], "reason=", priced[0]["skip_reason"][:40])
+
+print("\nSELFTEST_OK momentum+arb+live+maker+venue-min+observability")

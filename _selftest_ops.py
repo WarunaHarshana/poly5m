@@ -311,6 +311,36 @@ for k, v in _saved.items():
     else:
         os.environ[k] = v
 
+# ---------------------------------------------------------------------------
+print("T10 recycle releases the state lock")
+# The bot is recycled with SIGTERM every few hours. If it leaves its lock
+# behind with a fresh heartbeat, the replacement refuses to start until the
+# heartbeat ages out - which cost 31 restarts in 23h on the first deployment
+# where 4 were expected.
+bot.acquire_lock()
+check("a lock exists while running", os.path.exists(bot.LOCK_PATH))
+
+held_pid = json.load(open(bot.LOCK_PATH, encoding="utf-8"))["pid"]
+supervisor.STATE_DIR = os.path.dirname(bot.LOCK_PATH)
+supervisor._clear_stale_lock(held_pid)
+check("the supervisor clears the lock of a child it reaped",
+      not os.path.exists(bot.LOCK_PATH))
+
+# It must never touch a lock belonging to something else.
+bot.acquire_lock()
+supervisor._clear_stale_lock(999_999)
+check("a lock owned by another pid is left alone",
+      os.path.exists(bot.LOCK_PATH))
+bot.release_lock()
+
+# ---------------------------------------------------------------------------
+print("T11 tuner retry cadence")
+check("a 'wait' retry is far shorter than a full cycle",
+      supervisor.TUNE_RETRY_S < supervisor.TUNE_INTERVAL_S / 4,
+      f"retry={supervisor.TUNE_RETRY_S} interval={supervisor.TUNE_INTERVAL_S}")
+check("retry is at most an hour", supervisor.TUNE_RETRY_S <= 3600,
+      str(supervisor.TUNE_RETRY_S))
+
 print()
 if FAIL:
     raise SystemExit(f"SELFTEST_FAILED ops: {FAIL}")
