@@ -221,14 +221,35 @@ class RiskManager:
             return 0.0
         return stake
 
+    def min_share_stake(self, market_price: float) -> float:
+        """Cost of the smallest order the venue accepts, at this price."""
+        min_sh = float(getattr(config, "MIN_ORDER_SHARES", 0) or 0)
+        if min_sh <= 0 or market_price <= 0:
+            return 0.0
+        return round(min_sh * float(market_price), 2)
+
     def _apply_min_shares(self, stake: float, market_price: float) -> float:
-        """Bump stake so shares >= MIN_ORDER_SHARES (Polymarket CLOB ~5 share min)."""
+        """Reconcile a stake with the venue's minimum order size.
+
+        Normally this only bumps a too-small stake UP to the minimum. With
+        MIN_SHARES_SIZING it also pulls an oversized stake DOWN to it, so every
+        trade is the cheapest valid order instead of a fixed dollar amount.
+        """
         if not getattr(config, "ENFORCE_MIN_SHARES", True):
             return stake
         min_sh = float(getattr(config, "MIN_ORDER_SHARES", 0) or 0)
         if min_sh <= 0 or market_price <= 0:
             return stake
         need_usd = round(min_sh * float(market_price), 2)
+        if getattr(config, "MIN_SHARES_SIZING", False) and stake > need_usd:
+            room = max(0.0, self.bankroll - self.open_exposure)
+            if room + 1e-9 < need_usd:
+                self.last_skip_reason = (
+                    f"need ${need_usd:.2f} for {min_sh:.0f} shares @ "
+                    f"{market_price:.2f} but only ${room:.2f} available"
+                )
+                return 0.0
+            return need_usd
         if stake + 1e-9 >= need_usd:
             return stake
         # Allow exceeding MAX_TRADE_USD so base $1 still works on high favorites

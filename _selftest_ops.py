@@ -341,6 +341,55 @@ check("a 'wait' retry is far shorter than a full cycle",
 check("retry is at most an hour", supervisor.TUNE_RETRY_S <= 3600,
       str(supervisor.TUNE_RETRY_S))
 
+# ---------------------------------------------------------------------------
+print("T12 minimum-share sizing")
+config.MODE = "paper_live"
+config.MIN_ORDER_SHARES = 5.0
+config.ENFORCE_MIN_SHARES = True
+config.MIN_SHARES_SIZING = True
+config.FIXED_STAKE_USD = 5.0
+config.BASE_TRADE_USD = 5.0
+config.MAX_TRADE_USD = 5.0
+config.LATE_SCALP_MAX_STAKE_USD = 5.0
+config.LATE_SCALP_USE_EDGE_SIZING = False
+config.MIN_ENTRY_PRICE, config.MAX_ENTRY_PRICE = 0.0, 1.0
+config.MAX_EXPOSURE_USD = 10.0
+
+rm = RiskManager(100.0)
+for px, want in ((0.59, 2.95), (0.70, 3.50), (0.87, 4.35)):
+    got = rm.size_late_scalp(px, edge=0.0)
+    check(f"ask {px} -> 5 shares costs ${want}", abs(got - want) < 0.01,
+          f"got ${got}")
+    shares = got / px if px else 0
+    check(f"ask {px} -> exactly the venue minimum in shares",
+          abs(shares - 5.0) < 0.02, f"got {shares:.3f} shares")
+
+# The bump-UP behaviour must survive: a tiny stake still reaches the minimum.
+config.FIXED_STAKE_USD = 0.5
+config.BASE_TRADE_USD = 0.5
+config.MAX_TRADE_USD = 0.5
+rm2 = RiskManager(100.0)
+got = rm2.size_late_scalp(0.87, edge=0.0)
+check("a sub-minimum stake is still bumped UP to the venue floor",
+      abs(got - 4.35) < 0.01, f"got ${got}")
+
+# With the flag off, the old fixed-dollar behaviour is unchanged.
+config.MIN_SHARES_SIZING = False
+config.FIXED_STAKE_USD = 5.0
+config.BASE_TRADE_USD = 5.0
+config.MAX_TRADE_USD = 5.0
+rm3 = RiskManager(100.0)
+got = rm3.size_late_scalp(0.70, edge=0.0)
+check("flag off -> fixed $5 stake as before", abs(got - 5.0) < 0.01,
+      f"got ${got}")
+config.MIN_SHARES_SIZING = True
+
+# It must never spend money it does not have.
+rm4 = RiskManager(2.00)
+got = rm4.size_late_scalp(0.87, edge=0.0)
+check("refuses when the bankroll cannot cover the minimum order",
+      got == 0.0, f"got ${got} on a $2 bankroll needing $4.35")
+
 print()
 if FAIL:
     raise SystemExit(f"SELFTEST_FAILED ops: {FAIL}")

@@ -306,6 +306,20 @@ HYBRID_MID_MIN_CONFIDENCE = float(os.getenv("HYBRID_MID_MIN_CONFIDENCE", "0.55")
 # CLOB limit orders usually need ~5 shares. Stake is bumped to max(bet, shares*price).
 MIN_ORDER_SHARES = float(os.getenv("MIN_ORDER_SHARES", "5"))
 ENFORCE_MIN_SHARES = _env_bool("ENFORCE_MIN_SHARES", True)
+# Buy the venue minimum (orderMinSize shares) rather than a fixed dollar stake.
+#
+# A fixed $5 stake buys 8.5 shares at a 0.59 ask and 5.6 at 0.87 — so the cost
+# of a trade is constant while the position size swings with price. Sizing at
+# exactly the minimum inverts that: every trade is the smallest order the venue
+# will accept, costing shares*ask (e.g. $2.95 at 0.59, $4.35 at 0.87).
+#
+# The point is trades-per-dollar, not edge. PnL scales linearly with size, so
+# this shrinks wins as well as losses — it does NOT make a losing strategy
+# profitable. What it buys is runway: on the first 28 live trades it would have
+# deployed 18% less capital for the same 28 labeled outcomes. While the tuner
+# is still gathering data, maximising labeled trades per dollar of bankroll is
+# the right trade-off. Turn off once the strategy is proven and you want size.
+MIN_SHARES_SIZING = _env_bool("MIN_SHARES_SIZING", True)
 
 # --- Risk controls ---
 STARTING_BANKROLL = float(os.getenv("STARTING_BANKROLL", "100.0"))

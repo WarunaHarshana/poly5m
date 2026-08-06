@@ -135,6 +135,18 @@ class PolymarketPublic:
         if fee_rate is None:
             fee_rate = (float(getattr(config, "TAKER_FEE_RATE", 0.07))
                         if m.get("feesEnabled") in (True, None) else 0.0)
+        # Venue order minimums, published per market. Reading them beats the
+        # hard-coded config default: the cheapest valid order is exactly
+        # orderMinSize shares, and if Polymarket ever changes it the bot
+        # follows instead of silently over- or under-sizing.
+        try:
+            min_order_size = float(m.get("orderMinSize"))
+        except (TypeError, ValueError):
+            min_order_size = None
+        try:
+            tick_size = float(m.get("orderPriceMinTickSize"))
+        except (TypeError, ValueError):
+            tick_size = None
         return {
             "question": m.get("question") or "BTC 5-minute Up/Down",
             "tokens": tokens,
@@ -144,6 +156,8 @@ class PolymarketPublic:
             "end_ts": end_ts,
             "slug": slug,
             "fee_rate": fee_rate,
+            "min_order_size": min_order_size,
+            "tick_size": tick_size,
         }
 
     def _open_market_from_event(self, ev: dict, slug: str, slot_start):

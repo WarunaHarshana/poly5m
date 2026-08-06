@@ -1816,6 +1816,13 @@ async def run_realtime(rounds: int = 100, paper: bool = True,
             await _sleep_until_slot_end(end_ts, cl_stream)
             continue
 
+        # Prefer the venue's own published minimum over the config default, so
+        # sizing tracks the market rather than an assumption that could go
+        # stale (verified live: orderMinSize = 5 on the BTC 5m markets).
+        venue_min = market.get("min_order_size")
+        if venue_min and float(venue_min) > 0:
+            config.MIN_ORDER_SHARES = float(venue_min)
+
         stake = risk.size_late_scalp(mkt, edge=max(edge_net, 0.0))
 
         ask_sz = q.get("ask_size")
