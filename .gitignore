@@ -33,3 +33,6 @@ Thumbs.db
 dist/
 build/
 *.egg-info/
+
+# Downloaded deployment data (fetch_data.py) - reproducible, not source
+data/
