@@ -403,6 +403,20 @@ def run(verbose: bool = True) -> dict:
 
     changes = {k: (current[k], best[k]) for k in best if best[k] != current[k]}
     if not changes:
+        # Distinguish "nothing was better" from "nothing could be judged".
+        # With too few trades in a slice, _eligible() rejects every candidate
+        # and the search returns the incumbent unchanged — which looks exactly
+        # like a considered decision but is not one. Reporting it as such made
+        # the supervisor back off a full day on a holdout of 9 trades.
+        starved = not _eligible(cur_train, cur_holdout)
+        if starved:
+            msg = (f"not enough trades to judge yet "
+                   f"(train {cur_train['trades']}/{MIN_TRAIN_TRADES}, "
+                   f"holdout {cur_holdout['trades']}/{MIN_HOLDOUT_TRADES})")
+            say(msg)
+            return {"action": "wait", "params": current, "reason": msg,
+                    "labeled_rows": len(rows),
+                    "train": cur_train, "holdout": cur_holdout}
         say("no parameter change clears the guardrails — keeping current set")
         _journal({"action": "hold", "params": current,
                   "train": cur_train, "holdout": cur_holdout})

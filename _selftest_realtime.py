@@ -365,6 +365,19 @@ assert priced, (
        for r in skipped[:3]])
 assert all(r.get("side") in ("UP", "DOWN") for r in priced), \
     "a priced observation needs a side to be scoreable"
+# The edge floor/ceiling are gates too, and they were only ever recorded for
+# rows that had already cleared the entry band being questioned — 3.6% of a
+# day's rows. fair_value is local arithmetic, so there is no excuse for it.
+scored = [r for r in priced if r.get("edge") is not None
+          and r.get("edge_net") is not None and r.get("model_prob") is not None]
+assert scored, (
+    "skipped slots recorded no model edge - the edge thresholds are then as "
+    "untestable as the chop filter was. Rows: %r"
+    % [{k: r.get(k) for k in ('skip_reason', 'ask', 'edge', 'model_prob')}
+       for r in priced[:3]])
+print("PHASE_F_EDGE_OK scored_skips=", len(scored),
+      "edge=", round(scored[0]["edge"], 4),
+      "model=", round(scored[0]["model_prob"], 4))
 print("PHASE_F_OK (skipped slots are priceable) rows=", len(obs_f),
       "priced_skips=", len(priced),
       "ask=", priced[0]["ask"], "reason=", priced[0]["skip_reason"][:40])

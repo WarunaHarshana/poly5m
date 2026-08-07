@@ -152,7 +152,14 @@ for row in rows:          # every slot below any tradeable move threshold
     row["abs_move"] = 0.5
 write_rows(rows)
 r = tuner.run(verbose=False)
-check("no eligible candidate -> hold", r["action"] == "hold", str(r)[:200])
+# Starved of trades is "wait", NOT "hold". They look identical from outside —
+# both leave parameters untouched — but only "hold" is a real judgement, and
+# reporting a starved run as one made the supervisor sleep a full day on a
+# holdout of 9 trades.
+check("no eligible candidate -> wait, not a considered hold",
+      r["action"] == "wait", str(r)[:200])
+check("the starved result says why", "not enough trades" in (r.get("reason") or ""),
+      str(r.get("reason"))[:160])
 
 # ---------------------------------------------------------------------------
 # T5: auto-revert

@@ -1658,6 +1658,36 @@ async def run_realtime(rounds: int = 100, paper: bool = True,
                 print(f"  [obs] quote for {side_hint} unavailable: {e}")
                 q = None
 
+        # Score the model edge for every priced slot, not just the ones that
+        # survive the entry band. fair_value is local arithmetic — no API call —
+        # and without this the edge floor/ceiling are exactly as untestable as
+        # the chop filter was: only 3.6% of rows carried an edge, all of them
+        # rows that had already passed the band being questioned.
+        fee_rate_obs = float(market.get("fee_rate")
+                             if market.get("fee_rate") is not None
+                             else getattr(config, "TAKER_FEE_RATE", 0.07))
+        fv_obs = None
+        if mkt is not None and slot_open_ref:
+            try:
+                fv_obs = fair_value(
+                    spot=float(price_now),
+                    strike=float(slot_open_ref),
+                    remaining_seconds=float(remaining or 1.0),
+                    volatility_daily=float(getattr(config, "VOLATILITY_DAILY", 0.045)),
+                    realized_vol_daily=rv,
+                    vol_blend=float(getattr(config, "VOL_BLEND", 0.5)),
+                )
+                prob_obs = (fv_obs.fair_prob_up if side_hint == "UP"
+                            else 1.0 - fv_obs.fair_prob_up)
+                fee_ps_obs = config.taker_fee_per_share(mkt, fee_rate_obs)
+                slot_obs.update(model_prob=prob_obs,
+                                edge=prob_obs - mkt,
+                                edge_net=prob_obs - mkt - fee_ps_obs,
+                                fee_per_share=fee_ps_obs)
+            except Exception as e:
+                print(f"  [obs] fair value unavailable: {e}")
+                fv_obs = None
+
         # Chop filter: if price flip-flopped across the strike WITHIN this
         # slot, a "lead" is noise, not momentum — skip.
         if max_chop > 0 and slot_open_ref and len(slot_prices) >= 4:
@@ -1902,12 +1932,28 @@ async def run_realtime(rounds: int = 100, paper: bool = True,
             slip = float(getattr(config, "PAPER_FILL_SLIPPAGE", 0.01) or 0.0)
             if slip > 0:
                 fill_px = min(0.99, float(mkt) + slip)
-                if fill_px != mkt:
-                    shares = round(stake / fill_px, 4) if fill_px > 0 else shares
-                    stake = round(shares * fill_px, 2)
+                if fill_px != mkt and fill_px > 0:
+                    # An order is placed for a SIZE, so slippage makes you pay
+                    # more per share — it does not hand you fewer shares.
+                    # Holding the dollar amount fixed and dividing by the worse
+                    # price silently shrank the order below the venue minimum
+                    # (5 shares became 4.94), simulating a fill that the CLOB
+                    # would have rejected outright. Keep the size, raise the
+                    # cost, and only fall back to the dollar-fixed behaviour
+                    # when we are not sizing off the venue minimum.
+                    min_sh = float(getattr(config, "MIN_ORDER_SHARES", 0) or 0)
+                    hold_size = (getattr(config, "MIN_SHARES_SIZING", False)
+                                 and min_sh > 0
+                                 and shares <= min_sh + 1e-6)
+                    if hold_size:
+                        stake = round(shares * fill_px, 2)
+                    else:
+                        shares = round(stake / fill_px, 4)
+                        stake = round(shares * fill_px, 2)
                     print(f"  [paper] pessimistic fill ask {mkt:.3f} + "
                           f"slip {slip:.3f} -> {fill_px:.3f} "
-                          f"(shares={shares:.2f} stake=${stake:.2f})")
+                          f"(shares={shares:.2f} stake=${stake:.2f}"
+                          f"{'; size held at venue min' if hold_size else ''})")
         elif is_maker:
             # Keep the share count the depth cap approved and spend LESS —
             # recomputing shares from the cheaper maker price would push size
