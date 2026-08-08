@@ -878,6 +878,13 @@ async def run_realtime(rounds: int = 100, paper: bool = True,
     print(f"  [arb] sum-to-one scanner: {'ON' if arb_on else 'off'}  "
           f"min_edge={arb_min_edge:.3f}  max_stake=${arb_max_stake:.2f}  "
           f"{'PAPER exec' if paper else 'LIVE: log-only (leg risk)'}")
+    # Print the modes that change WHETHER we trade, not just how. Without this
+    # the only evidence that observe-only is live is the absence of trades,
+    # which is indistinguishable from a quiet market.
+    print(f"  [modes] momentum_observe_only="
+          f"{'ON (recording only, no momentum trades)' if getattr(config, 'MOMENTUM_OBSERVE_ONLY', False) else 'off'}"
+          f"  min_shares_sizing={'ON' if getattr(config, 'MIN_SHARES_SIZING', False) else 'off'}"
+          f"  quote_every_slot={'ON' if getattr(config, 'OBSERVE_QUOTE_ALWAYS', True) else 'off'}")
 
     label = "PAPER-LIVE (real data, simulated fills)" if paper else "LIVE (REAL MONEY)"
     strat_tag = config.strategy_name()
