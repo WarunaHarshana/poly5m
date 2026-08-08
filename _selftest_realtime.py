@@ -382,4 +382,33 @@ print("PHASE_F_OK (skipped slots are priceable) rows=", len(obs_f),
       "priced_skips=", len(priced),
       "ask=", priced[0]["ask"], "reason=", priced[0]["skip_reason"][:40])
 
+# ---- Phase G: MOMENTUM_OBSERVE_ONLY records but never trades ----
+# Momentum can be studied entirely from counterfactuals, so a strategy with no
+# demonstrated edge need not be traded to be learned from. This must hold in
+# GOOD/OK hours too - an earlier version blanked the flag whenever the time
+# guard passed, which silently limited it to the avoided hours.
+bot.LivePriceFeed = FakeFeed          # a real $15 move: would normally TRADE
+polymarket_client.PolymarketPublic = FakePubMomentum
+config.get_time_suitability = lambda ts=None: ("GOOD", "selftest")
+config.MOMENTUM_OBSERVE_ONLY = True
+config.ARB_TRADE_ENABLED = False
+
+if os.path.exists(observations.OBSERVATIONS_JSONL):
+    os.remove(observations.OBSERVATIONS_JSONL)
+stats_g = asyncio.run(bot.run_realtime(rounds=3, paper=True))
+obs_g = observations.load()
+config.MOMENTUM_OBSERVE_ONLY = False
+
+assert stats_g["trades"] == 0, \
+    f"observe-only must place no momentum trades, got {stats_g['trades']}"
+assert obs_g, "observe-only must still record the slots it declined"
+reasons = {r.get("skip_reason", "")[:24] for r in obs_g}
+assert any("momentum_observe" in r for r in reasons), \
+    f"expected the observe-only reason on the rows, got {reasons}"
+scored_g = [r for r in obs_g
+            if r.get("ask") is not None and r.get("edge") is not None]
+assert scored_g, "observe-only rows must still be scoreable by the tuner"
+print("PHASE_G_OK (observe-only) trades=", stats_g["trades"],
+      "rows=", len(obs_g), "scoreable=", len(scored_g))
+
 print("\nSELFTEST_OK momentum+arb+live+maker+venue-min+observability")

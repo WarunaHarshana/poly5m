@@ -277,6 +277,20 @@ LATE_MOMENTUM_MAX_CHOP = int(os.getenv("LATE_MOMENTUM_MAX_CHOP", "3"))
 # observations with no price, which no backtest can score — so the tuner can
 # never tell whether they are set too tight. Set 0 only if rate-limited.
 OBSERVE_QUOTE_ALWAYS = _env_bool("OBSERVE_QUOTE_ALWAYS", True)
+# Evaluate and record momentum slots, but place no momentum trades.
+#
+# The tuner learns from counterfactuals: every evaluated slot carries an ask,
+# a model edge and the outcome that actually occurred, so a parameter set can
+# be scored over slots the bot never took. Real trades add fill realism and
+# nothing else to the learning. That makes trading a strategy with no
+# demonstrated edge purely a cost.
+#
+# Turned on 2026-08-08 after 41 venue-confirmed momentum trades came in at
+# -$16.57 (75.6% against an 81.1% breakeven, t=-1.03 — losing, though not yet
+# significantly so). ARB is unaffected and keeps trading: at t=+5.58 its edge
+# is structural, not luck. Turn this off once the tuner validates a momentum
+# configuration on data it did not fit to.
+MOMENTUM_OBSERVE_ONLY = _env_bool("MOMENTUM_OBSERVE_ONLY", False)
 
 # --- Sum-to-one arbitrage (runs alongside late_momentum) ---
 # When ask_UP + ask_DOWN < 1 − ARB_MIN_EDGE, buying BOTH sides pays $1/share

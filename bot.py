@@ -1406,7 +1406,11 @@ async def run_realtime(rounds: int = 100, paper: bool = True,
             continue
         rem_txt = f"{remaining:.0f}s left" if remaining is not None else "no end time"
         print(f"\nslot: {question}  ({rem_txt})")
-        observe_only = ""   # non-empty => evaluate + record, but never trade
+        # non-empty => walk the full gate stack and record, but never trade
+        observe_only = ("momentum_observe_only: recording for the tuner, "
+                        "not trading"
+                        if getattr(config, "MOMENTUM_OBSERVE_ONLY", False)
+                        else "")
         try:
             from config import get_time_suitability
             suitability, reason = get_time_suitability()
@@ -1426,10 +1430,11 @@ async def run_realtime(rounds: int = 100, paper: bool = True,
                 if first_look:
                     print(f"  [Time Guard] observe-only for this slot "
                           f"(recording features, placing no trade)")
-            else:
-                observe_only = ""
+            # A passing time guard must not clear an observe-only mode set for
+            # another reason — blanking it here would have quietly limited
+            # MOMENTUM_OBSERVE_ONLY to the avoided hours only.
         except Exception:
-            observe_only = ""
+            pass
         write_status(phase="analyzing", question=question, slug=market.get("slug"),
                      end_ts=end_ts, side=None, edge=None, mkt=None)
 
