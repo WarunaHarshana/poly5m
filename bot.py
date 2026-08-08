@@ -1233,8 +1233,9 @@ async def run_realtime(rounds: int = 100, paper: bool = True,
             )
         except Exception:
             pass
-        if not paper:
-            print("  [arb] live execution not supported (leg risk) — logged only")
+        if not paper and not bool(getattr(config, "ARB_LIVE_ENABLED", False)):
+            print("  [arb] live execution disabled (ARB_LIVE_ENABLED=0) — "
+                  "logged only")
             return False
         if risk.halted or not risk.daily_loss_ok():
             return False
@@ -1305,6 +1306,39 @@ async def run_realtime(rounds: int = 100, paper: bool = True,
             end_ts=end_ts,
         )
         stamp_trade_times(trade)
+
+        # --- LIVE: both legs FOK, or hold nothing ---
+        # Paper cannot answer the only question that matters here (does the
+        # second leg actually fill?), because it assumes both do. Live runs
+        # measure it; arb_executor bounds the downside while they do.
+        if not paper:
+            import arb_executor
+            live_res = await asyncio.to_thread(
+                arb_executor.execute,
+                live_client, market,
+                float(arb["ask_up"]), float(arb["ask_down"]), shares,
+                arb.get("up_size"), arb.get("down_size"),
+                arb.get("bid_up"), arb.get("bid_down"),
+            )
+            print(f"  [arb/live] {live_res.reason}")
+            if not live_res.ok:
+                # Either nothing was bought, or the stranded leg was unwound.
+                # Book the realised unwind cost (0 when no leg filled) and
+                # move on — there is no pair to settle.
+                if live_res.realized_pnl:
+                    risk.on_close(0.0, live_res.realized_pnl)
+                    print(f"  [arb/live] unwind cost "
+                          f"{live_res.realized_pnl:+.2f}; "
+                          f"bankroll ${risk.bankroll:.2f}")
+                st = arb_executor.stats()
+                print(f"  [arb/live] execution record: "
+                      f"{st['both_legs_locked']}/{st['attempts']} locked "
+                      f"({st['lock_rate_pct']}%), "
+                      f"{st['second_leg_killed_and_unwound']} unwound, "
+                      f"net {st['net_pnl']:+.2f}")
+                skips["arb_thin"] = skips.get("arb_thin", 0) + 1
+                return False
+
         risk.on_open(stake)
         _register_open(trade, end_ts)
         placed += 1

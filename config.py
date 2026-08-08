@@ -306,6 +306,17 @@ ARB_MIN_LOCKED_EDGE = float(os.getenv("ARB_MIN_LOCKED_EDGE", "0.02"))
 ARB_MAX_EDGE = float(os.getenv("ARB_MAX_EDGE", "0.15"))
 # Only scan when at least this many seconds remain (books settle, time to fill).
 ARB_MIN_REMAINING = int(os.getenv("ARB_MIN_REMAINING", "20"))
+# Execute arbs with real money. OFF by default and independent of MODE=live,
+# so live momentum and live arb are separate decisions.
+#
+# Arb is the only strategy here with a demonstrated edge (15/15, +4.57% ROI,
+# t=+5.58) and the only one that predicts nothing. What is NOT yet known is the
+# real second-leg fill rate: paper assumes both legs fill, so it reports a
+# perfect lock rate by construction and cannot measure this. Turning this on is
+# how that number gets measured — treat the first few hundred attempts as
+# buying information at the venue minimum, not as an investment.
+# arb_executor.stats() reports the lock rate as it accumulates.
+ARB_LIVE_ENABLED = _env_bool("ARB_LIVE_ENABLED", False)
 
 # --- Hybrid (STRATEGY=hybrid): prefer late; mid only if exceptional ---
 # When true (default), mid must clear HYBRID_MID_* bars on top of normal mid filters;
