@@ -810,18 +810,30 @@ class PolymarketClient:
             "error": None if bal is not None else "Could not parse balance response",
         }
 
-    def buy(self, token_id: str, price: float, size: float, condition_id: str):
-        """Post a GTC *limit* buy at `price` (never a market order).
+    def buy(self, token_id: str, price: float, size: float, condition_id: str,
+            order_type: str = "GTC"):
+        """Post a limit buy at `price` (never a market order).
 
         Limit orders cap slippage: we only pay up to `price` (best ask at
         decision time, rounded to tick). Market orders are intentionally
         avoided — they can fill far above fair value in thin 5m books.
+
+        ``order_type``:
+          GTC  rests on the book until filled or cancelled (the default).
+          FOK  fills the WHOLE size immediately or is killed. This is what
+               makes a two-leg arb safe: a partial fill on one leg leaves a
+               naked directional position, which is exactly the leg risk that
+               kept arb paper-only.
+          FAK  fills what it can immediately and kills the rest (used to
+               unwind a stranded leg).
 
         Size is in shares. Resting leftovers are cancelled at slot end.
         """
         from py_clob_client_v2 import (OrderArgs, OrderType,
                                        PartialCreateOrderOptions)
         from py_clob_client_v2.order_builder.constants import BUY
+
+        ot = getattr(OrderType, str(order_type).upper(), OrderType.GTC)
 
         def _post(c):
             market = c.get_market(condition_id)
@@ -838,11 +850,11 @@ class PolymarketClient:
                 tick = 0.01
             if tick > 0:
                 px = max(tick, round(round(px / tick) * tick, 6))
-            # GTC limit — NOT market. Protects against adverse fill/slippage.
+            # Limit — NOT market. Protects against adverse fill/slippage.
             return c.create_and_post_order(
                 OrderArgs(token_id=token_id, price=px, size=float(size),
                           side=BUY),
-                options=opts, order_type=OrderType.GTC,
+                options=opts, order_type=ot,
             )
 
         c = self._client()
@@ -865,6 +877,42 @@ class PolymarketClient:
                 c2 = self._client()
                 return _post(c2)
             raise
+
+    def sell(self, token_id: str, price: float, size: float, condition_id: str,
+             order_type: str = "FAK"):
+        """Post a limit SELL — used to unwind a stranded arb leg.
+
+        Defaults to FAK: take whatever liquidity is there right now and kill
+        the rest. A resting sell is no use here, because the position being
+        unwound is naked directional in a market that resolves in minutes;
+        getting most of it off immediately beats getting all of it off later.
+        """
+        from py_clob_client_v2 import (OrderArgs, OrderType,
+                                       PartialCreateOrderOptions)
+        from py_clob_client_v2.order_builder.constants import SELL
+
+        ot = getattr(OrderType, str(order_type).upper(), OrderType.FAK)
+
+        def _post(c):
+            market = c.get_market(condition_id)
+            opts = PartialCreateOrderOptions(
+                tick_size=str(market["minimum_tick_size"]),
+                neg_risk=market["neg_risk"],
+            )
+            px = float(price)
+            try:
+                tick = float(market["minimum_tick_size"])
+            except Exception:
+                tick = 0.01
+            if tick > 0:
+                px = max(tick, round(round(px / tick) * tick, 6))
+            return c.create_and_post_order(
+                OrderArgs(token_id=token_id, price=px, size=float(size),
+                          side=SELL),
+                options=opts, order_type=ot,
+            )
+
+        return _post(self._client())
 
     def cancel_all(self):
         """Cancel open orders so a missed fill doesn't rest into the next slot."""
