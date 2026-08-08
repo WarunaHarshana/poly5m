@@ -1110,9 +1110,13 @@ async def run_realtime(rounds: int = 100, paper: bool = True,
                           f"before next slots so Chainlink open is recorded.")
                 else:
                     src = "chainlink-stream" if cl_stream.ready else "local-estimate"
-                    print(f"  [resolve] no Gamma outcome yet; {src} "
-                          f"{'UP' if local_up else 'DOWN'} "
-                          f"end=${price_after:,.2f} vs start=${slot_open_ref:,.2f}")
+                    print(f"  [resolve] no Gamma outcome yet; PROVISIONAL "
+                          f"{src} {'UP' if local_up else 'DOWN'} "
+                          f"end=${price_after:,.2f} vs start=${slot_open_ref:,.2f}"
+                          f"\n            local resolution disagreed with "
+                          f"Polymarket on 7 of the first 56 trades (near-ties "
+                          f"especially) — reconcile.py re-checks this later and "
+                          f"corrects the trade and bankroll if it is wrong.")
 
             trade = executor.open_and_resolve(trade, resolved_up)
             trade.resolve_source = src

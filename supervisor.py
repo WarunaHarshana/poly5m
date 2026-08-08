@@ -261,6 +261,30 @@ def learning_loop() -> None:
             except Exception as e:
                 log(f"labeling failed: {e}")
 
+            # Trades booked from the local Chainlink estimate (because Gamma
+            # had not published when the slot closed) are provisional. Confirm
+            # them against Polymarket and correct the ones that are wrong —
+            # 7 of the first 56 were, including one fabricated win.
+            try:
+                import reconcile
+                rec = reconcile.reconcile(verbose=False)
+                if rec.get("corrected"):
+                    log(f"reconciled {rec['corrected']} trade(s) against "
+                        f"Polymarket; bankroll adjusted {rec['pnl_delta']:+.2f}")
+                    for ch in rec.get("changes", [])[:5]:
+                        log(f"  R{ch['round_id']} {ch['side']}: "
+                            f"{ch['was']['outcome']}/{ch['was']['won']} -> "
+                            f"{ch['now']['outcome']}/{ch['now']['won']} "
+                            f"({ch['pnl_delta']:+.2f})")
+                    # The running bot holds the pre-correction bankroll in
+                    # memory; recycle so it resumes from the corrected one.
+                    _update(recycle_requested=True)
+                _update(last_reconcile={"at": now,
+                                        **{k: v for k, v in rec.items()
+                                           if k != "changes"}})
+            except Exception as e:
+                log(f"reconciliation failed: {e}")
+
         if now >= next_tune:
             # Provisional; a "wait" result shortens this below.
             next_tune = now + TUNE_INTERVAL_S

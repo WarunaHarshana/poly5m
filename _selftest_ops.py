@@ -390,6 +390,91 @@ got = rm4.size_late_scalp(0.87, edge=0.0)
 check("refuses when the bankroll cannot cover the minimum order",
       got == 0.0, f"got ${got} on a $2 bankroll needing $4.35")
 
+# ---------------------------------------------------------------------------
+print("T13 reconciliation against Polymarket")
+import reconcile  # noqa: E402
+
+# Rebuild a clean state dir for the reconciler.
+for _p in (reconcile.HISTORY_JSONL, reconcile.TRADES_PATH,
+           reconcile.STATS_PATH, reconcile.CORRECTIONS_LOG):
+    if os.path.exists(_p):
+        os.remove(_p)
+
+OLD = time.time() - 3600  # comfortably past MIN_AGE_S
+
+
+def rec_trade(rid, side, outcome, won, pnl, src, shares=5.0, stake=3.05):
+    return {"round_id": rid, "slug": f"slot-{rid}", "side": side,
+            "outcome": outcome, "won": won, "pnl": pnl, "shares": shares,
+            "stake_usd": stake, "fee_usd": 0.0, "entry_price": stake / shares,
+            "end_ts": OLD, "resolve_source": src}
+
+
+seed = [
+    # A fabricated win: booked UP/won from a local guess, really DOWN.
+    rec_trade(55, "UP", "UP", True, 1.95, "chainlink-stream"),
+    # The mirror image: booked a loss that was really a win.
+    rec_trade(56, "DOWN", "UP", False, -2.80, "local-estimate"),
+    # An ARB whose label is wrong but whose PnL is right either way - this is
+    # the shape that hid the bug, since the money looked correct.
+    rec_trade(41, "ARB", "UP", True, 1.01, "chainlink-stream",
+              shares=5.0, stake=3.99),
+    # Already confirmed: must not be touched.
+    rec_trade(30, "UP", "UP", True, 1.50, "polymarket-official"),
+]
+with open(reconcile.HISTORY_JSONL, "w", encoding="utf-8") as f:
+    for t in seed:
+        f.write(json.dumps(t) + "\n")
+with open(reconcile.TRADES_PATH, "w", encoding="utf-8") as f:
+    json.dump(seed, f)
+with open(reconcile.STATS_PATH, "w", encoding="utf-8") as f:
+    json.dump({"bankroll": 100.0}, f)
+
+
+class _FakePub:
+    """Polymarket says DOWN for every slot in this fixture."""
+    def __init__(self):
+        self.lookups = 0
+
+    def get_official_btc_updown_outcome(self, slug):
+        self.lookups += 1
+        return "DOWN"
+
+
+fake = _FakePub()
+res = reconcile.reconcile(pub=fake, verbose=False)
+fixed = {t["round_id"]: t for t in reconcile._read_jsonl(reconcile.HISTORY_JSONL)}
+
+check("the fabricated win becomes a loss",
+      fixed[55]["won"] is False and fixed[55]["outcome"] == "DOWN",
+      str(fixed[55]))
+check("its pnl becomes the lost stake",
+      abs(fixed[55]["pnl"] + 3.05) < 0.01, str(fixed[55]["pnl"]))
+check("the mistaken loss becomes a win",
+      fixed[56]["won"] is True and fixed[56]["pnl"] > 0, str(fixed[56]))
+check("an ARB label is corrected but its pnl is not",
+      fixed[41]["outcome"] == "DOWN" and abs(fixed[41]["pnl"] - 1.01) < 0.01,
+      str(fixed[41]))
+check("an already-official trade is left untouched",
+      fixed[30]["resolve_source"] == "polymarket-official"
+      and abs(fixed[30]["pnl"] - 1.50) < 1e-9, str(fixed[30]))
+check("a lookup is not wasted on confirmed trades", fake.lookups == 3,
+      f"{fake.lookups} lookups for 3 provisional slugs")
+
+with open(reconcile.STATS_PATH, encoding="utf-8") as f:
+    bank = json.load(f)["bankroll"]
+check("the bankroll moves by the net correction",
+      abs(bank - (100.0 + res["pnl_delta"])) < 0.01,
+      f"bankroll {bank}, delta {res['pnl_delta']}")
+
+check("every correction is journalled",
+      len(reconcile._read_jsonl(reconcile.CORRECTIONS_LOG)) == res["corrected"],
+      str(res["corrected"]))
+
+again = reconcile.reconcile(pub=_FakePub(), verbose=False)
+check("re-running corrects nothing further (idempotent)",
+      again["corrected"] == 0, str(again))
+
 print()
 if FAIL:
     raise SystemExit(f"SELFTEST_FAILED ops: {FAIL}")
