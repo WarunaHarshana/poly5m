@@ -285,12 +285,26 @@ OBSERVE_QUOTE_ALWAYS = _env_bool("OBSERVE_QUOTE_ALWAYS", True)
 # nothing else to the learning. That makes trading a strategy with no
 # demonstrated edge purely a cost.
 #
-# Turned on 2026-08-08 after 41 venue-confirmed momentum trades came in at
-# -$16.57 (75.6% against an 81.1% breakeven, t=-1.03 — losing, though not yet
-# significantly so). ARB is unaffected and keeps trading: at t=+5.58 its edge
-# is structural, not luck. Turn this off once the tuner validates a momentum
-# configuration on data it did not fit to.
-MOMENTUM_OBSERVE_ONLY = _env_bool("MOMENTUM_OBSERVE_ONLY", False)
+# DEFAULT ON as of 2026-08-11. Momentum is retired from the trade path and kept
+# as a research stream only. The evidence, from this bot's own data:
+#
+#   * 41 venue-confirmed trades: -$16.57, 75.6% against an 81.1% breakeven
+#   * across 740+ priced, labeled slots the book prices the signal correctly —
+#     win rate matches the ask to within ~1pp BEFORE fees, in every move bucket
+#   * no entry band is significantly positive net of fees; the largest (0.95+,
+#     n=621) is +0.15pp at t=+0.52, i.e. nothing
+#   * the tuner has never found a configuration clearing its guardrails, and
+#     with under 1% of slots qualifying it is structurally starved — which is
+#     the same finding, not a separate problem
+#
+# A taker on an efficiently-priced signal simply pays the fee. There is nothing
+# to tune, so trading it is a cost with no expected return. Observation costs
+# nothing and keeps the counterfactual dataset growing at full rate, which is
+# what would let the tuner change this verdict if the market ever changes.
+#
+# Set MOMENTUM_OBSERVE_ONLY=0 to trade it again — but only on the back of a
+# validated tuner result, not a hunch.
+MOMENTUM_OBSERVE_ONLY = _env_bool("MOMENTUM_OBSERVE_ONLY", True)
 
 # --- Sum-to-one arbitrage (runs alongside late_momentum) ---
 # When ask_UP + ask_DOWN < 1 − ARB_MIN_EDGE, buying BOTH sides pays $1/share

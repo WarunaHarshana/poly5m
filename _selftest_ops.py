@@ -562,6 +562,38 @@ acc = [e for e in ostate.trail(1) if e["state"] == "ACCEPTED"][0]
 check("the venue response is kept with the event",
       "orderID" in (acc.get("venue_response") or ""), str(acc.get("venue_response")))
 
+# ---------------------------------------------------------------------------
+print("T16 shipped defaults are the safe ones")
+# These four decide whether the bot can spend money and on what. A regression
+# in any of them is the kind that is only noticed after it has cost something.
+import subprocess  # noqa: E402  (already imported above; harmless)
+
+probe = subprocess.run(
+    [sys.executable, "-c",
+     "import config, json; print(json.dumps({"
+     "'momentum_observe_only': config.MOMENTUM_OBSERVE_ONLY,"
+     "'arb_trade': config.ARB_TRADE_ENABLED,"
+     "'arb_live': config.ARB_LIVE_ENABLED,"
+     "'mode': config.MODE}))"],
+    capture_output=True, text=True,
+    cwd=tempfile.mkdtemp(),                       # no .env in scope
+    env={**os.environ, "PYTHONPATH": os.path.dirname(os.path.abspath(__file__))})
+try:
+    defaults = json.loads(probe.stdout.strip().splitlines()[-1])
+except Exception:
+    defaults = {}
+    check("defaults are readable", False, probe.stdout + probe.stderr)
+
+if defaults:
+    check("momentum ships observe-only (no demonstrated edge)",
+          defaults["momentum_observe_only"] is True, str(defaults))
+    check("arb still trades (the only demonstrated edge)",
+          defaults["arb_trade"] is True, str(defaults))
+    check("LIVE arb is opt-in, never a default",
+          defaults["arb_live"] is False, str(defaults))
+    check("mode never defaults to live",
+          defaults["mode"] != "live", str(defaults))
+
 print()
 if FAIL:
     raise SystemExit(f"SELFTEST_FAILED ops: {FAIL}")

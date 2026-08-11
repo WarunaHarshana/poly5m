@@ -148,6 +148,29 @@ check("a no-risk first-leg kill is not counted as a loss",
       s["first_leg_killed_no_risk"] >= 1, str(s))
 check("unwind failures are surfaced", s["unwind_failures"] >= 1, str(s))
 
+# ---------------------------------------------------------------------------
+print("T8 naked-position alerting")
+alerts = ax.open_alerts()
+check("the unwind failure raises an open alert", len(alerts) == 1, str(len(alerts)))
+a = alerts[0]
+held = [l for l in (a.get("legs") or []) if l.get("filled")]
+check("the alert says which leg is actually held", len(held) == 1, str(a.get("legs")))
+check("it carries the size and price to close",
+      held[0].get("size") == 5.0 and held[0].get("price") == 0.44, str(held))
+
+# A resolved one must stop nagging, but only once acknowledged.
+still = ax.open_alerts()
+check("it keeps alerting until acknowledged", len(still) == 1, str(len(still)))
+ax.acknowledge(a["ts"])
+check("acknowledging clears it", ax.open_alerts() == [], str(ax.open_alerts()))
+
+# A clean run must never raise a false alarm.
+c = FakeClient({"TOK_UP": True, "TOK_DN": True})
+ax.execute(c, MARKET, 0.44, 0.44, 5.0, depth_up=500.0, depth_down=7.0,
+           bid_up=0.43, bid_down=0.43)
+check("a successful lock raises no alert", ax.open_alerts() == [],
+      str(ax.open_alerts()))
+
 print()
 if FAIL:
     raise SystemExit(f"SELFTEST_FAILED arb_exec: {FAIL}")

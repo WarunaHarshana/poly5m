@@ -1103,6 +1103,12 @@ body::before {
   transition: background 0.3s, box-shadow 0.3s;
 }
 .conn-dot.stale { background: var(--red); box-shadow: 0 0 8px var(--red); }
+/* Naked-position alert. Deliberately the loudest thing on the page. */
+.arb-alert { background: rgba(239,68,68,0.14);
+  border: 1px solid rgba(239,68,68,0.6); border-left: 4px solid #ef4444;
+  border-radius: 8px; padding: 10px 14px; margin-bottom: 12px;
+  color: #fca5a5; font-size: 12.5px; line-height: 1.6; }
+
 /* Venue-confirmation badge. SIM must never look like a confirmed fill, and
    UNVERIFIED must be impossible to miss. */
 .fill-tag { font-size: 9px; font-weight: 700; letter-spacing: 0.4px;
@@ -1859,6 +1865,7 @@ body.trade-flash-lose { animation: page-flash-down 1.6s ease-out; }
       </span>
     </div>
     <div class="pbody">
+      <div id="ln-alert" class="arb-alert" style="display:none"></div>
       <div id="ln-summary" class="an-verdict">Loading learning state…</div>
       <div style="display:flex;gap:10px;flex-wrap:wrap;margin:12px 0 4px">
         <a class="btn-save" id="ln-dl" href="/api/export" download
@@ -3111,6 +3118,26 @@ function renderLearning(d) {
   const need = d.needed_to_tune || 0;
   const pct = need ? Math.min(100, Math.round(100 * d.labeled / need)) : 0;
   const sup = d.supervisor || {};
+  // An unwind failure means real directional exposure may be sitting on the
+  // book unhedged. Nothing else on this page outranks it.
+  const alerts = d.arb_alerts || [];
+  const banner = document.getElementById('ln-alert');
+  if (banner) {
+    if (alerts.length) {
+      banner.style.display = 'block';
+      banner.innerHTML = `<strong>&#9888; ${alerts.length} UNRESOLVED ARB UNWIND `
+        + `FAILURE(S)</strong><br>A naked directional position may be open on `
+        + `Polymarket. Check the position and close it by hand.<br>`
+        + alerts.slice(0, 3).map(a => {
+            const held = (a.legs || []).find(l => l.filled) || {};
+            return `<span class="mono">${a.time_utc || ''} — ${held.side || '?'} `
+                 + `${held.size || '?'} @ ${held.price || '?'}</span>`;
+          }).join('<br>');
+    } else {
+      banner.style.display = 'none';
+    }
+  }
+
   let s = '';
   // A deploy with no volume looks perfectly healthy until the next redeploy
   // wipes it, so say so where it cannot be missed.
@@ -3442,8 +3469,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         sup = json.load(f)
                 except (OSError, ValueError):
                     pass
+                try:
+                    import arb_executor
+                    arb_alerts = arb_executor.open_alerts()
+                    arb_exec = arb_executor.stats()
+                except Exception:
+                    arb_alerts, arb_exec = [], {}
                 return self._json({
                     "ok": True,
+                    "arb_alerts": arb_alerts,
+                    "arb_exec": arb_exec,
                     "observations": len(rows),
                     "labeled": len(labeled),
                     "needed_to_tune": tuner.MIN_LABELED_ROWS,

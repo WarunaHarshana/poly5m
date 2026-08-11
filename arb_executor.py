@@ -231,6 +231,37 @@ def execute(client, market: dict, ask_up: float, ask_down: float,
     return res
 
 
+def open_alerts() -> list[dict]:
+    """Unresolved unwind failures — each is a naked position, or was.
+
+    This is the only path in the design that can leave real directional
+    exposure on the book: the second leg was killed AND the unwind order also
+    failed. It must never be something you discover later in a log file.
+    """
+    rows = []
+    if os.path.isfile(ARB_LOG):
+        try:
+            with open(ARB_LOG, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        try:
+                            rows.append(json.loads(line))
+                        except ValueError:
+                            continue
+        except OSError:
+            return []
+    acked = {r.get("acked_ts") for r in rows if r.get("action") == "ack"}
+    return [r for r in rows
+            if r.get("action") == "unwind_failed" and r.get("ts") not in acked]
+
+
+def acknowledge(ts: float) -> None:
+    """Mark one unwind failure as handled (position closed by hand)."""
+    _log({"action": "ack", "acked_ts": ts,
+          "note": "operator confirmed the naked position is resolved"})
+
+
 def stats() -> dict:
     """Measured execution record — the numbers that decide if this is fundable."""
     rows = []

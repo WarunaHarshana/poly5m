@@ -67,6 +67,11 @@ config.DECISION_JOURNAL = False
 config.MIN_ORDER_SHARES = 5.0
 config.ENFORCE_MIN_SHARES = True
 config.get_time_suitability = lambda ts=None: ("OK", "selftest")
+# Momentum now ships observe-only (retired from the trade path — no measured
+# edge). Phases A/C/D/E exercise the momentum ORDER path, so they pin it off
+# explicitly rather than inheriting a shipped default that would silently make
+# them assert against zero trades. Phase G turns it back on to test the mode.
+config.MOMENTUM_OBSERVE_ONLY = False
 
 rng = random.Random(7)
 

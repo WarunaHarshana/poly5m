@@ -347,6 +347,33 @@ def learning_loop() -> None:
             except Exception as e:
                 log(f"reconciliation failed: {e}")
 
+            # An unwind failure means a naked directional position was left on
+            # the book. It is the single worst state this system can reach, so
+            # it is repeated on EVERY cycle until a human acknowledges it -
+            # a one-time log line is exactly how something like this gets
+            # missed.
+            try:
+                import arb_executor
+                alerts = arb_executor.open_alerts()
+                if alerts:
+                    log("!" * 68)
+                    log(f"ALERT: {len(alerts)} unresolved arb unwind failure(s).")
+                    log("A naked directional position may be open on Polymarket.")
+                    for a in alerts[:5]:
+                        legs = a.get("legs") or []
+                        held = next((l for l in legs if l.get("filled")), {})
+                        log(f"  {a.get('time_utc')}  {held.get('side', '?')} "
+                            f"{held.get('size', '?')} shares @ "
+                            f"{held.get('price', '?')} — {a.get('reason', '')[:90]}")
+                    log("Check the Polymarket position and close it by hand,")
+                    log("then run: python -c \"import arb_executor as a; "
+                        "a.acknowledge(<ts>)\"")
+                    log("!" * 68)
+                _update(arb_alerts=len(alerts),
+                        arb_exec=arb_executor.stats())
+            except Exception as e:
+                log(f"arb alert check failed: {e}")
+
         if now >= next_tune:
             # Provisional; a "wait" result shortens this below.
             next_tune = now + TUNE_INTERVAL_S
