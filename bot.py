@@ -366,6 +366,37 @@ def _rewrite_history_csv() -> None:
             w.writerow(r)
 
 
+def _prune_copies(copies_root: str, keep: int) -> None:
+    """Keep only the newest `keep` backup folders; delete the rest.
+
+    Unbounded backups on a fixed volume is a slow-motion outage: the bot fills
+    the disk, then every state write raises OSError 28 and it crash-loops.
+    """
+    import shutil
+    try:
+        entries = [os.path.join(copies_root, d) for d in os.listdir(copies_root)]
+        dirs = [d for d in entries if os.path.isdir(d)]
+    except OSError:
+        return
+    if len(dirs) <= keep:
+        return
+    dirs.sort(key=lambda d: os.path.basename(d))   # names are session_stamp
+    for old in dirs[:-keep]:
+        try:
+            shutil.rmtree(old, ignore_errors=True)
+        except OSError:
+            pass
+
+
+def free_disk_mb(path: str) -> float | None:
+    """Free space in MB for the filesystem holding `path` (None if unknown)."""
+    try:
+        import shutil
+        return shutil.disk_usage(path).free / (1024 * 1024)
+    except Exception:
+        return None
+
+
 def _copy_file_safe(src: str, dst: str) -> None:
     import shutil
     try:
@@ -431,22 +462,36 @@ def archive_records(trades, stats: dict) -> int:
         _copy_file_safe(STATS_PATH, os.path.join(ARCHIVE_DIR, "latest_stats.json"))
         _copy_file_safe(HISTORY_CSV, os.path.join(ARCHIVE_DIR, "latest_trades.csv"))
 
-        # Timestamped backup folder (never overwritten)
-        from datetime import datetime, timezone
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        copy_dir = os.path.join(ARCHIVE_DIR, "copies", f"{sid}_{stamp}")
-        os.makedirs(copy_dir, exist_ok=True)
-        _copy_file_safe(TRADES_PATH, os.path.join(copy_dir, "trades.json"))
-        _copy_file_safe(STATS_PATH, os.path.join(copy_dir, "stats.json"))
-        _copy_file_safe(HISTORY_JSONL, os.path.join(copy_dir, "trades_history.jsonl"))
-        _copy_file_safe(HISTORY_CSV, os.path.join(copy_dir, "trades_history.csv"))
-        _copy_file_safe(snap_path, os.path.join(copy_dir, "session.json"))
-        _copy_file_safe(os.path.join(STATE_DIR, "bot.log"), os.path.join(copy_dir, "bot.log"))
-        with open(os.path.join(copy_dir, "readme.txt"), "w", encoding="utf-8") as f:
-            f.write(
-                f"Session {sid}\nSaved {stamp} UTC\nMode={config.MODE} strategy={strat}\n"
-                f"Master history: {HISTORY_JSONL}\nMaster CSV: {HISTORY_CSV}\n"
-            )
+        # Timestamped backup folder.
+        #
+        # This used to be written on EVERY settled trade and never pruned, and
+        # each copy contained the whole history plus bot.log. That is O(n^2)
+        # growth against a fixed volume: on Railway it reached "No space left
+        # on device" and crash-looped the bot 19 times. The master JSONL/CSV
+        # are the real archive and are appended in place; these copies are a
+        # convenience, so they are now capped and never include the log.
+        keep = int(getattr(config, "ARCHIVE_COPIES_KEEP", 3) or 0)
+        if keep > 0:
+            from datetime import datetime, timezone
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            copies_root = os.path.join(ARCHIVE_DIR, "copies")
+            copy_dir = os.path.join(copies_root, f"{sid}_{stamp}")
+            os.makedirs(copy_dir, exist_ok=True)
+            _copy_file_safe(TRADES_PATH, os.path.join(copy_dir, "trades.json"))
+            _copy_file_safe(STATS_PATH, os.path.join(copy_dir, "stats.json"))
+            _copy_file_safe(HISTORY_JSONL,
+                            os.path.join(copy_dir, "trades_history.jsonl"))
+            _copy_file_safe(HISTORY_CSV,
+                            os.path.join(copy_dir, "trades_history.csv"))
+            _copy_file_safe(snap_path, os.path.join(copy_dir, "session.json"))
+            with open(os.path.join(copy_dir, "readme.txt"), "w",
+                      encoding="utf-8") as f:
+                f.write(
+                    f"Session {sid}\nSaved {stamp} UTC\n"
+                    f"Mode={config.MODE} strategy={strat}\n"
+                    f"Master history: {HISTORY_JSONL}\nMaster CSV: {HISTORY_CSV}\n"
+                )
+            _prune_copies(copies_root, keep)
 
         if new_n:
             print(f"  [archive] +{new_n} trade(s) -> {HISTORY_JSONL}")

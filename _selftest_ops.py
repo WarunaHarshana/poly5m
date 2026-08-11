@@ -475,6 +475,46 @@ again = reconcile.reconcile(pub=_FakePub(), verbose=False)
 check("re-running corrects nothing further (idempotent)",
       again["corrected"] == 0, str(again))
 
+# ---------------------------------------------------------------------------
+print("T14 archive copies are bounded")
+# Unbounded per-trade backups each containing the whole history is O(n^2)
+# growth against a fixed volume. On Railway it reached "No space left on
+# device" and crash-looped the bot 19 times.
+copies_root = os.path.join(bot.ARCHIVE_DIR, "copies")
+os.makedirs(copies_root, exist_ok=True)
+for i in range(12):
+    d = os.path.join(copies_root, f"sess_{i:04d}")
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, "trades_history.jsonl"), "w") as f:
+        f.write("x" * 1000)
+
+bot._prune_copies(copies_root, keep=3)
+left = sorted(os.listdir(copies_root))
+check("only the newest N copies survive", len(left) == 3, str(left))
+check("the ones kept are the newest",
+      left == ["sess_0009", "sess_0010", "sess_0011"], str(left))
+
+bot._prune_copies(copies_root, keep=3)
+check("pruning again is stable", len(os.listdir(copies_root)) == 3)
+
+# The supervisor must reclaim BEFORE the bot writes, or a full volume is a
+# deadlock: the copy fails, so the prune that would free space never runs.
+for i in range(12, 20):
+    d = os.path.join(copies_root, f"sess_{i:04d}")
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, "big.bin"), "w") as f:
+        f.write("y" * 5000)
+supervisor.STATE_DIR = bot.STATE_DIR
+os.environ["ARCHIVE_COPIES_KEEP"] = "3"
+supervisor._reclaim_disk()
+check("the supervisor reclaims space up front",
+      len(os.listdir(copies_root)) == 3, str(sorted(os.listdir(copies_root))))
+
+check("a free-space reading is available",
+      bot.free_disk_mb(bot.STATE_DIR) is not None)
+check("the disk warning threshold is set",
+      supervisor.DISK_WARN_MB > 0, str(supervisor.DISK_WARN_MB))
+
 print()
 if FAIL:
     raise SystemExit(f"SELFTEST_FAILED ops: {FAIL}")

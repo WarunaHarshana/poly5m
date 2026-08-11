@@ -318,6 +318,13 @@ ARB_MIN_REMAINING = int(os.getenv("ARB_MIN_REMAINING", "20"))
 # arb_executor.stats() reports the lock rate as it accumulates.
 ARB_LIVE_ENABLED = _env_bool("ARB_LIVE_ENABLED", False)
 
+# How many timestamped backup folders to keep under archive/copies/ (0 = none).
+# Each one holds a full copy of the trade history, written on every settled
+# trade, so leaving this unbounded grows the volume quadratically — it filled
+# the Railway disk and crash-looped the bot. The master JSONL/CSV are the real
+# archive; these are only a convenience.
+ARCHIVE_COPIES_KEEP = int(os.getenv("ARCHIVE_COPIES_KEEP", "3"))
+
 # --- Hybrid (STRATEGY=hybrid): prefer late; mid only if exceptional ---
 # When true (default), mid must clear HYBRID_MID_* bars on top of normal mid filters;
 # otherwise the slot is queued for late_scalp. Set HYBRID_PREFER_LATE=0 for old

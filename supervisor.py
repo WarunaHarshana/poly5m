@@ -130,10 +130,72 @@ def _rotate_log() -> None:
         pass
 
 
+DISK_WARN_MB = float(os.getenv("DISK_WARN_MB", "200"))
+
+
+def _check_disk() -> float | None:
+    """Warn (loudly) before the volume fills.
+
+    A full volume is not a graceful failure: every state write raises
+    OSError 28 and the bot crash-loops, which is exactly what happened once
+    unbounded archive copies ate the disk. Cheap to check, so check often.
+    """
+    try:
+        import shutil
+        free_mb = shutil.disk_usage(STATE_DIR).free / (1024 * 1024)
+    except Exception:
+        return None
+    if free_mb < DISK_WARN_MB:
+        log("=" * 68)
+        log(f"WARNING: only {free_mb:.0f} MB free on the state volume.")
+        log("When this hits zero the bot cannot write state and will")
+        log("crash-loop. Check archive/copies and bot.log, or grow the volume.")
+        log("=" * 68)
+    return free_mb
+
+
+def _reclaim_disk() -> None:
+    """Prune old archive copies BEFORE the bot starts writing.
+
+    Pruning only after a successful copy is useless once the volume is already
+    full: the copy itself fails, so the prune never runs and the bot stays
+    wedged. Reclaiming up front is what breaks that deadlock.
+    """
+    import shutil
+    copies = os.path.join(STATE_DIR, "archive", "copies")
+    if not os.path.isdir(copies):
+        return
+    try:
+        dirs = sorted(os.path.join(copies, d) for d in os.listdir(copies)
+                      if os.path.isdir(os.path.join(copies, d)))
+    except OSError:
+        return
+    keep = int(os.getenv("ARCHIVE_COPIES_KEEP", "3") or 0)
+    doomed = dirs[:-keep] if keep > 0 else dirs
+    if not doomed:
+        return
+    freed = 0
+    for d in doomed:
+        try:
+            for root, _sub, files in os.walk(d):
+                for fn in files:
+                    try:
+                        freed += os.path.getsize(os.path.join(root, fn))
+                    except OSError:
+                        pass
+            shutil.rmtree(d, ignore_errors=True)
+        except OSError:
+            pass
+    log(f"reclaimed {freed / (1024 * 1024):.0f} MB by pruning "
+        f"{len(doomed)} old archive copies (keeping {keep})")
+
+
 def trading_loop() -> None:
     backoff = BACKOFF_START_S
     while not _stop.is_set():
         _rotate_log()
+        _reclaim_disk()
+        _check_disk()
         cmd = _bot_command()
         log(f"starting bot: {' '.join(cmd[1:])}")
         started = time.time()
