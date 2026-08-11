@@ -202,6 +202,29 @@ def load_session() -> tuple[list, float, str | None]:
         bankroll = float(settled[-1].bankroll_after) if settled \
             else float(config.STARTING_BANKROLL)
     session_id = stats.get("session_id") or None
+
+    # Fold in any bankroll correction the reconciler owes us. It lives in its
+    # own file precisely because persist() rewrites stats.json wholesale from
+    # the in-memory bankroll and would otherwise erase the adjustment between
+    # two trades. Cleared only after it has been applied here, so it can be
+    # neither lost nor double-counted.
+    pending_path = os.path.join(STATE_DIR, "pending_adjustment.json")
+    pend = read_json_safe(pending_path, default=None)
+    if isinstance(pend, dict):
+        try:
+            delta = float(pend.get("delta") or 0.0)
+        except (TypeError, ValueError):
+            delta = 0.0
+        if abs(delta) > 1e-9:
+            bankroll = round(bankroll + delta, 2)
+            print(f"[resume] applied a {delta:+.2f} reconciliation adjustment "
+                  f"from {len(pend.get('entries') or [])} correction batch(es); "
+                  f"bankroll is now ${bankroll:.2f}")
+        try:
+            os.remove(pending_path)
+        except OSError:
+            pass
+
     if len(trades) > LIVE_BLOTTER_MAX:
         trades = trades[-LIVE_BLOTTER_MAX:]
     return trades, bankroll, session_id

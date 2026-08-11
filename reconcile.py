@@ -39,6 +39,10 @@ HISTORY_JSONL = os.path.join(ARCHIVE_DIR, "trades_history.jsonl")
 TRADES_PATH = os.path.join(STATE_DIR, "trades.json")
 STATS_PATH = os.path.join(STATE_DIR, "stats.json")
 CORRECTIONS_LOG = os.path.join(ARCHIVE_DIR, "corrections.jsonl")
+# Bankroll deltas owed but not yet folded into the running bot's account.
+# Deliberately a separate file from stats.json, which the bot rewrites wholesale
+# on every trade and would otherwise clobber.
+PENDING_ADJUSTMENT = os.path.join(STATE_DIR, "pending_adjustment.json")
 
 # Anything other than these was a guess, however confident the log line looked.
 TRUSTED_SOURCES = ("polymarket-official", "polymarket-official-corrected")
@@ -209,8 +213,43 @@ def reconcile(pub=None, max_lookups: int = 300, verbose: bool = True) -> dict:
         except (OSError, ValueError) as e:
             say(f"could not update the live blotter: {e}")
 
-        # The bankroll was built on the wrong numbers; move it by the delta so
-        # the next --resume picks up the corrected account.
+        # The bankroll was built on the wrong numbers and must move by the
+        # delta. Writing it straight into stats.json is NOT enough: the running
+        # bot rewrites that whole file from its own in-memory bankroll on every
+        # trade, so an adjustment made between two trades is silently clobbered.
+        # (Observed: reconciled_at absent from stats.json after a run that
+        # corrected 7 trades. It only went unnoticed because that delta happened
+        # to be exactly $0.00.)
+        #
+        # So the durable record is a separate pending-adjustment file that the
+        # bot applies on resume and then clears. Clobbering stats.json cannot
+        # lose it, and applying it twice cannot happen because the bot deletes
+        # it only after the value is in the resumed bankroll.
+        if abs(pnl_delta) > 1e-9:
+            try:
+                pend = {"delta": 0.0, "entries": []}
+                if os.path.isfile(PENDING_ADJUSTMENT):
+                    try:
+                        with open(PENDING_ADJUSTMENT, "r", encoding="utf-8") as f:
+                            pend = json.load(f)
+                    except (OSError, ValueError):
+                        pass
+                pend["delta"] = round(float(pend.get("delta") or 0.0) + pnl_delta, 4)
+                pend.setdefault("entries", []).append({
+                    "ts": now, "delta": round(pnl_delta, 4),
+                    "corrected": corrected,
+                })
+                _atomic_write(PENDING_ADJUSTMENT,
+                              json.dumps(pend, indent=2, default=str))
+                say(f"queued a {pnl_delta:+.2f} bankroll adjustment "
+                    f"(pending total {pend['delta']:+.2f}); the bot applies it "
+                    f"on its next resume")
+            except OSError as e:
+                say(f"could not queue the bankroll adjustment: {e}")
+
+        # Also reflect it in stats.json so the dashboard is right immediately.
+        # This may be overwritten by the running bot; the pending file above is
+        # what actually guarantees the correction survives.
         try:
             with open(STATS_PATH, "r", encoding="utf-8") as f:
                 stats = json.load(f)

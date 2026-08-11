@@ -594,6 +594,59 @@ if defaults:
     check("mode never defaults to live",
           defaults["mode"] != "live", str(defaults))
 
+# ---------------------------------------------------------------------------
+print("T17 a reconciliation adjustment survives the bot clobbering stats.json")
+# The running bot rewrites stats.json wholesale from its in-memory bankroll on
+# every trade. An adjustment written straight into that file between two trades
+# is silently erased — observed in production, where reconciled_at was missing
+# after a run that corrected 7 trades. It only went unnoticed because that
+# particular delta was exactly $0.00.
+for _p in (reconcile.HISTORY_JSONL, reconcile.TRADES_PATH,
+           reconcile.STATS_PATH, reconcile.CORRECTIONS_LOG,
+           reconcile.PENDING_ADJUSTMENT):
+    if os.path.exists(_p):
+        os.remove(_p)
+
+# One trade booked as a WIN from a local guess; the venue says it lost.
+seed = [rec_trade(70, "UP", "UP", True, 1.95, "chainlink-stream")]
+with open(reconcile.HISTORY_JSONL, "w", encoding="utf-8") as f:
+    for t in seed:
+        f.write(json.dumps(t) + "\n")
+with open(reconcile.TRADES_PATH, "w", encoding="utf-8") as f:
+    json.dump(seed, f)
+with open(reconcile.STATS_PATH, "w", encoding="utf-8") as f:
+    json.dump({"bankroll": 100.0, "session_id": "S1"}, f)
+
+res = reconcile.reconcile(pub=_FakePub(), verbose=False)
+check("the correction produced a real bankroll delta",
+      abs(res["pnl_delta"] - (-5.0)) < 0.01, str(res["pnl_delta"]))
+check("the delta is queued in its own file",
+      os.path.exists(reconcile.PENDING_ADJUSTMENT))
+
+# Now the running bot persists, overwriting stats.json from ITS bankroll —
+# exactly the clobber that used to lose the correction.
+with open(reconcile.STATS_PATH, "w", encoding="utf-8") as f:
+    json.dump({"bankroll": 100.0, "session_id": "S1"}, f)
+clobbered = json.load(open(reconcile.STATS_PATH, encoding="utf-8"))
+check("stats.json really was clobbered back to the stale value",
+      clobbered["bankroll"] == 100.0, str(clobbered))
+
+# On resume the adjustment must still be applied.
+bot.TRADES_PATH = reconcile.TRADES_PATH
+bot.STATS_PATH = reconcile.STATS_PATH
+_, resumed_bankroll, _ = bot.load_session()
+check("the correction survives and is applied on resume",
+      abs(resumed_bankroll - 95.0) < 0.01,
+      f"expected $95.00, got ${resumed_bankroll}")
+check("the pending file is cleared once applied",
+      not os.path.exists(reconcile.PENDING_ADJUSTMENT))
+
+# ...and must never be applied a second time.
+_, again_bankroll, _ = bot.load_session()
+check("it is not double-counted on the next resume",
+      abs(again_bankroll - 100.0) < 0.01,
+      f"expected the clobbered $100.00 with no second adjustment, got ${again_bankroll}")
+
 print()
 if FAIL:
     raise SystemExit(f"SELFTEST_FAILED ops: {FAIL}")
