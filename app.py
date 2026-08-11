@@ -1590,6 +1590,7 @@ body.trade-flash-lose { animation: page-flash-down 1.6s ease-out; }
       <span class="badge mode" id="mode">MODE: —</span>
       <div class="conn-dot" id="conn"></div>
       <span class="badge conn-badge" id="conntxt">CONNECTING…</span>
+      <span class="badge" id="bookfeed" title="Order-book source. WS means pushed real-time quotes; REST means the socket is down and the bot is polling, which is ~300x slower.">BOOK: —</span>
       <span class="badge clk mono" id="clk">--:--:--</span>
     </div>
   </div>
@@ -1943,6 +1944,7 @@ const REFRESH_MS = 2000;
 let lastTopRound = null;
 let slotEndTs = null;
 let lastStatusTs = 0;
+let lastStatus = null;   // most recent status.json, for the book-feed badge
 let botBtcPrice = null;
 let currentPhase = '';
 let serverTimeOffset = 0;
@@ -2059,6 +2061,28 @@ function everySecond() {
   } else {
     dot.classList.remove('stale');
     ct.textContent = 'LIVE';
+  }
+
+  // Book source. A socket that has silently fallen back to REST looks
+  // identical from outside, and REST is ~300x slower, so state it.
+  const bf = document.getElementById('bookfeed');
+  if (bf) {
+    const st = (lastStatus && lastStatus.book_feed) || null;
+    if (!st) {
+      bf.textContent = 'BOOK: REST';
+      bf.style.color = 'var(--dim)';
+      bf.title = 'No websocket feed — the bot is polling the book over REST.';
+    } else if (st.connected) {
+      bf.textContent = `BOOK: WS ${st.books || 0}/${st.tracked_tokens || 0}`;
+      bf.style.color = 'var(--won, #22c55e)';
+      bf.title = `Pushed real-time book. ${st.messages || 0} messages, `
+               + `${st.reconnects || 0} reconnects.`;
+    } else {
+      bf.textContent = 'BOOK: WS DOWN';
+      bf.style.color = '#f87171';
+      bf.title = `Socket disconnected — falling back to REST polling. `
+               + `${st.reconnects || 0} reconnects. ${st.last_error || ''}`;
+    }
   }
 }
 setInterval(everySecond, 1000);
@@ -2234,6 +2258,7 @@ function renderOpenPositions() {
 /* ===== STATUS RENDER ===== */
 function renderStatus(st) {
   if (!st) return;
+  lastStatus = st;
   lastStatusTs = st.updated_at || 0;
   const phase = st.phase || '—';
   currentPhase = phase;

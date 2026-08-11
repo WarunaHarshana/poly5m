@@ -238,6 +238,9 @@ def read_json_safe(path: str, default=None):
 
 
 _status: dict = {}
+# Set by run_realtime once the book feed exists, so write_status can report its
+# health without threading the object through every call site.
+_book_feed_ref: dict = {"feed": None}
 # Trades placed but not yet settled. Since settlement moved to background
 # tasks the main loop keeps writing status for the NEXT slot, which clobbered
 # the "holding" snapshot — the dashboard showed phase=waiting/side=None while
@@ -274,6 +277,13 @@ def write_status(**kw):
     # Always current, never stale-merged like the rest of the snapshot.
     _status["open_positions"] = list(_open_positions.values())
     _status["updated_at"] = time.time()
+    # Publish the book feed's health. A socket that has silently fallen back to
+    # REST behaves identically from the outside, so it has to be stated.
+    if _book_feed_ref.get("feed") is not None:
+        try:
+            _status["book_feed"] = _book_feed_ref["feed"].status()
+        except Exception:
+            pass
     try:
         from config import get_time_suitability
         suitability, reason = get_time_suitability()
@@ -1039,6 +1049,7 @@ async def run_realtime(rounds: int = 100, paper: bool = True,
             book_feed_client = BookFeed(
                 max_age_s=float(getattr(config, "BOOK_FEED_MAX_AGE_S", 2.0)))
             book_feed_client.start()
+            _book_feed_ref["feed"] = book_feed_client
             print(f"  [book] websocket feed starting "
                   f"(max age {book_feed_client.max_age_s:.1f}s; "
                   f"REST fallback stays active)")
@@ -1346,9 +1357,12 @@ async def run_realtime(rounds: int = 100, paper: bool = True,
         if not arb:
             return False
         arb_done_end_ts = end_ts  # one attempt per slot (signal seen)
+        # Say WHERE the quote came from. Without this there is no way to tell a
+        # socket read from a REST fallback, which is the whole point of the
+        # feed — and a silently-degraded feed looks exactly like a working one.
         print(f"  [arb] sum-to-one edge={arb['edge']:+.3f} "
               f"UP@{arb['ask_up']:.3f}+DOWN@{arb['ask_down']:.3f}="
-              f"{arb['sum']:.3f}")
+              f"{arb['sum']:.3f}  [{arb.get('src', 'rest')}]")
         # Too-good-to-be-true gate: a 15c+ "free" gap is makers pulling quotes
         # (dust levels), not a real fill. R8-style +$5.87 outliers were paper
         # fiction — a live taker would catch pennies of it.
