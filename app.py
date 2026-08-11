@@ -1103,6 +1103,10 @@ body::before {
   transition: background 0.3s, box-shadow 0.3s;
 }
 .conn-dot.stale { background: var(--red); box-shadow: 0 0 8px var(--red); }
+/* Marks an ARB entry price as a PAIR cost, not a single-share ask. */
+.pair-tag { font-size: 8.5px; font-weight: 700; letter-spacing: 0.5px;
+  text-transform: uppercase; opacity: 0.6; margin-left: 4px;
+  vertical-align: middle; }
 .badge {
   display: inline-flex; align-items: center; gap: 6px;
   font-size: 11px; font-weight: 500; letter-spacing: 0.4px;
@@ -2376,7 +2380,19 @@ function render(stats, trades) {
     return `<tr class="${flash}">` +
       `<td class="mono" title="${t.time_utc || ''}">${timeEt || '—'}</td>` +
       `<td>R${t.round_id}</td><td class="${sideCls}">${t.side}</td>` +
-      `<td>${Number(t.entry_price).toFixed(2)}</td><td>${fmtUsd(t.stake_usd)}</td>` +
+      // The Entry column means different things per row type, and showing the
+      // bare number made an ARB look like a single-sided buy: for momentum it
+      // is the price of ONE share, for ARB it is the combined cost of a PAIR
+      // (5 UP + 5 DOWN at 0.87 = $4.35, which is why arb stakes sit under $5).
+      `<td title="${t.side === 'ARB'
+          ? `pair cost: ${Number(t.entry_price).toFixed(2)} = ask_UP + ask_DOWN. `
+            + `${Number(t.shares).toFixed(2)} UP + ${Number(t.shares).toFixed(2)} DOWN `
+            + `for ${fmtUsd(t.stake_usd)}; one side pays $1/share whichever way it resolves`
+          : `ask paid per share`}">${Number(t.entry_price).toFixed(2)}`
+        + (t.side === 'ARB' ? '<span class="pair-tag">pair</span>' : '') +
+      `</td><td title="${t.side === 'ARB'
+          ? `both legs combined (${Number(t.shares).toFixed(2)} shares each side)`
+          : `${Number(t.shares).toFixed(2)} shares`}">${fmtUsd(t.stake_usd)}</td>` +
       `<td>${(t.edge >= 0 ? '+' : '') + Number(t.edge).toFixed(2)}</td>` +
       `<td class="${outCls}">${t.outcome || '—'}</td>` +
       `<td class="${wl}">${t.won ? 'WON' : 'LOST'}</td>` +
