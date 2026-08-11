@@ -87,6 +87,10 @@ class Trade:
     resolve_source: str = ""     # polymarket-official / chainlink-stream / ...
     fee_usd: float = 0.0         # taker fee (crypto_fees_v2); deducted from pnl
     is_maker: bool = False       # resting fill -> zero fee (takerOnly venue)
+    # True when a LIVE order's fill could not be confirmed against the venue.
+    # Submitted, accepted and filled are three different states; anything the
+    # exchange did not confirm is booked as unfilled and flagged here.
+    fill_unverified: bool = False
 
     def to_dict(self):
         # Ensure times are populated even if older code paths skipped stamping.

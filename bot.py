@@ -1046,8 +1046,11 @@ async def run_realtime(rounds: int = 100, paper: bool = True,
             if config.ROUND_SECONDS > 0 and hold and hold > 0:
                 await asyncio.sleep(hold)
 
-            # Live: cancel resting leftovers and check the matched fill amount
-            matched_shares = float(shares)
+            # Live: cancel resting leftovers and check the matched fill amount.
+            # Starts at 0 for live: a fill has to be PROVEN against the venue,
+            # not assumed from the fact that we sent an order. (Paper keeps the
+            # requested size — its fills are simulated by definition.)
+            matched_shares = float(shares) if paper else 0.0
             if not paper and live_client is not None:
                 try:
                     if order_id:
@@ -1072,10 +1075,43 @@ async def run_realtime(rounds: int = 100, paper: bool = True,
                                   f"(requested: {shares:.4f})")
                             matched_shares = filled
                         except Exception as fe:
-                            print(f"  [live fill check error] {fe}. "
-                                  f"Defaulting to full size.")
+                            # NEVER assume a fill we could not confirm. This
+                            # used to "default to full size", which books a
+                            # position — and its PnL — off a failed API call:
+                            # a submitted order and a filled order are not the
+                            # same thing. Retry once, then treat as unfilled.
+                            print(f"  [live fill check error] {fe}; retrying "
+                                  f"once before assuming NOTHING filled")
+                            await asyncio.sleep(2.0)
+                            try:
+                                c = live_client._client()
+                                trades_list = await asyncio.to_thread(c.get_trades)
+                                filled = 0.0
+                                for tr in (trades_list or []):
+                                    if tr.get("taker_order_id") == order_id:
+                                        filled += float(tr.get("size") or 0.0)
+                                    else:
+                                        for mo in (tr.get("maker_orders") or []):
+                                            if mo.get("order_id") == order_id:
+                                                filled += float(
+                                                    mo.get("matched_amount") or 0.0)
+                                matched_shares = filled
+                                print(f"  [live fill] retry matched: {filled:.4f}")
+                            except Exception as fe2:
+                                matched_shares = 0.0
+                                print(f"  [live fill] UNVERIFIED after retry "
+                                      f"({fe2}) — booking as UNFILLED. The "
+                                      f"order may still be live; reconcile.py "
+                                      f"and cancel_all cover the residue.")
+                                trade.fill_unverified = True
                     else:
+                        # No order id came back, so there is nothing to verify
+                        # against. Cancel everything and book nothing.
                         await asyncio.to_thread(live_client.cancel_all)
+                        matched_shares = 0.0
+                        trade.fill_unverified = True
+                        print("  [live fill] no order id returned — treating as "
+                              "UNFILLED rather than assuming the full size")
                 except Exception as e:
                     print(f"  cancel cleanup: {e}")
 

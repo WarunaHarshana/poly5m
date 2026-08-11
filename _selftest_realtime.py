@@ -411,4 +411,47 @@ assert scored_g, "observe-only rows must still be scoreable by the tuner"
 print("PHASE_G_OK (observe-only) trades=", stats_g["trades"],
       "rows=", len(obs_g), "scoreable=", len(scored_g))
 
+# ---- Phase H: a LIVE fill that cannot be verified is NOT booked ----
+# Regression test. The fill check used to say "Defaulting to full size" when
+# the venue lookup raised, which books a position and its PnL off a FAILED API
+# call. Submitted, accepted and filled are three different states; only the
+# venue can promote one to the next.
+class FakeClobBroken:
+    def get_trades(self):
+        raise RuntimeError("CLOB unreachable")
+
+
+class FakeLiveClientBroken(FakeLiveClient):
+    def _client(self):
+        return FakeClobBroken()
+
+
+polymarket_client.PolymarketClient = FakeLiveClientBroken
+polymarket_client.PolymarketPublic = FakePubMomentum
+bot.LivePriceFeed = FakeFeed
+config.get_time_suitability = lambda ts=None: ("OK", "selftest")
+config.MODE = "live"
+config.MOMENTUM_OBSERVE_ONLY = False
+config.ARB_TRADE_ENABLED = False
+config.LATE_MOMENTUM_MIN_MOVE = 10.0
+config.MAKER_FIRST_ENABLED = False
+
+stats_h = asyncio.run(bot.run_realtime(rounds=2, paper=False))
+config.MODE = "paper_live"
+
+# The orders went out, but no fill was ever confirmed, so nothing may be
+# booked as a filled position.
+import json as _json  # noqa: E402
+with open(bot.TRADES_PATH, encoding="utf-8") as _f:
+    booked = [t for t in _json.load(_f) if t.get("shares", 0) > 0]
+assert not booked, (
+    "an unverifiable fill was booked as a real position: %r"
+    % [{k: t.get(k) for k in ('side', 'shares', 'stake_usd', 'pnl')}
+       for t in booked[:3]])
+assert stats_h["skips"].get("unfilled", 0) >= 1, \
+    f"unverified fills should count as unfilled, got {stats_h['skips']}"
+print("PHASE_H_OK (unverified live fill is not booked) "
+      "booked_positions=", len(booked),
+      "unfilled_skips=", stats_h["skips"].get("unfilled"))
+
 print("\nSELFTEST_OK momentum+arb+live+maker+venue-min+observability")
