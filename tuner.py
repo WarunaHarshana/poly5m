@@ -167,9 +167,14 @@ def read_journal() -> list[dict]:
 # Strategy replay
 # ---------------------------------------------------------------------------
 def _taker_fee_per_share(price: float, rate: float = FEE_RATE) -> float:
-    """Polymarket's crypto_fees_v2 shape: rate * min(p, 1-p) per share."""
-    p = max(0.0, min(1.0, float(price)))
-    return rate * min(p, 1.0 - p)
+    """Polymarket's documented shape: rate * price * (1 - price) per share.
+
+    Delegates to config so the backtest prices trades exactly the way the live
+    gate does. A tuner that scores candidates on a different fee curve than the
+    bot pays is optimising the wrong problem.
+    """
+    import config as _c
+    return _c.taker_fee_per_share(price, rate)
 
 
 def would_trade(row: dict, p: dict) -> bool:

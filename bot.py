@@ -1345,9 +1345,9 @@ async def run_realtime(rounds: int = 100, paper: bool = True,
         leg_up = float(arb["ask_up"]) + slip
         leg_dn = float(arb["ask_down"]) + slip
         pair_cost = leg_up + leg_dn
-        # REAL taker fees (verified live: crypto_fees_v2, rate*min(p,1-p) per
-        # share, per leg). Near 0.5/0.5 books this is ~6.6c/pair — it kills
-        # thin arbs, so it must be inside the gate, not discovered live.
+        # REAL taker fees, per leg: rate * p * (1-p) per share, the venue's
+        # documented curve. Near 0.5/0.5 this is ~3.5c/pair — it kills thin
+        # arbs, so it must be inside the gate, not discovered live.
         fee_rate = float(market.get("fee_rate")
                          if market.get("fee_rate") is not None
                          else getattr(config, "TAKER_FEE_RATE", 0.07))
@@ -1952,8 +1952,8 @@ async def run_realtime(rounds: int = 100, paper: bool = True,
         )
         model_side_prob = fv.fair_prob_up if side == "UP" else (1.0 - fv.fair_prob_up)
         edge = model_side_prob - mkt
-        # Net edge after the REAL taker fee (rate*min(p,1-p)/share). At 0.85
-        # that's ~1c/share; at 0.60 it's ~2.8c — cheap entries pay the most.
+        # Net edge after the REAL taker fee (rate*p*(1-p)/share). At 0.85
+        # that's ~0.9c/share; at 0.60 it's ~1.7c — mid prices pay the most.
         fee_rate = float(market.get("fee_rate")
                          if market.get("fee_rate") is not None
                          else getattr(config, "TAKER_FEE_RATE", 0.07))

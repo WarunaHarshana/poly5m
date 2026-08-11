@@ -69,8 +69,10 @@ check("the refusal explains itself", "locked" in why, why)
 
 ok, locked, _ = ax.evaluate(0.44, 0.44, 5.0)
 check("a genuinely profitable pair is accepted", ok, f"locked={locked:.4f}")
+# Polymarket's documented curve: rate * p * (1 - p) per share, per leg.
+FEE_44 = 0.07 * 0.44 * 0.56
 check("locked edge is net of both fees",
-      abs(locked - (1 - 0.88 - 2 * 0.07 * 0.44)) < 1e-9, f"{locked}")
+      abs(locked - (1 - 0.88 - 2 * FEE_44)) < 1e-9, f"{locked}")
 
 ok, _, why = ax.evaluate(0.40, 0.40, 5.0)
 check("an implausibly wide gap is refused as unfillable", not ok, why)
@@ -108,10 +110,11 @@ check("the unwind sells the leg that actually filled",
 check("the unwind is FAK, not a resting order",
       c.sells[0][3] == "FAK", str(c.sells))
 # Bought 5 @ 0.44, sold 5 @ 0.43, plus the entry fee already paid.
-expected = 5 * (0.43 - 0.44) - 5 * 0.07 * 0.44
+# The executor rounds booked figures to 4dp, so compare on the same basis.
+expected = round(5 * (0.43 - 0.44) - 5 * FEE_44, 4)
 check("the loss is the spread plus the entry fee",
-      abs(r.unwind_pnl - expected) < 1e-6,
-      f"got {r.unwind_pnl}, expected {expected:.4f}")
+      abs(r.unwind_pnl - expected) < 1e-9,
+      f"got {r.unwind_pnl}, expected {expected}")
 check("the bounded loss is small versus the locked edge it chased",
       abs(r.unwind_pnl) < 1.0, str(r.unwind_pnl))
 
@@ -133,7 +136,8 @@ r = ax.execute(c, MARKET, 0.44, 0.44, 5.0, depth_up=500.0, depth_down=7.0,
                bid_up=0.43, bid_down=0.43)
 check("both legs filled", r.ok, r.reason)
 check("profit is locked at entry, not predicted",
-      abs(r.realized_pnl - 5.0 * r.locked_edge) < 1e-6, str(r.realized_pnl))
+      abs(r.realized_pnl - round(5.0 * r.locked_edge, 4)) < 1e-9,
+      f"{r.realized_pnl} vs {round(5.0 * r.locked_edge, 4)}")
 check("the locked profit is positive", r.realized_pnl > 0, str(r.realized_pnl))
 check("no unwind was needed", not c.sells or len(c.sells) == 1, str(c.sells))
 

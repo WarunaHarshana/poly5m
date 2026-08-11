@@ -414,11 +414,37 @@ MAKER_FIRST_LIVE = _env_bool("MAKER_FIRST_LIVE", False)
 TAKER_FEE_RATE = float(os.getenv("TAKER_FEE_RATE", "0.07"))
 
 
-def taker_fee_per_share(price: float, rate: float | None = None) -> float:
-    """Fee in $ per share for a taker fill at `price` (crypto_fees_v2)."""
+def taker_fee_per_share(price: float, rate: float | None = None,
+                        exponent: float = 1.0) -> float:
+    """Fee in $ per share for a taker fill at `price`.
+
+    Polymarket's documented formula is
+
+        fee = shares * rate * price * (1 - price)
+
+    which the venue's own feeSchedule corroborates: {"rate": 0.07,
+    "exponent": 1, "takerOnly": true} — exponent 1 meaning price^1 * (1-p)^1.
+    Their worked example is 100 shares at $0.50 on a crypto market = $1.75,
+    and 100 * 0.07 * 0.5 * 0.5 reproduces it exactly.
+
+    This previously used `rate * min(p, 1-p)`, a different curve that charged
+    DOUBLE the real fee at 50/50 and ~15% too much at 0.87. It was wrong in the
+    conservative direction — trades were rejected as unprofitable when they were
+    not, and booked PnL was understated — but wrong is wrong: an arb gate is
+    only as good as the cost model inside it.
+    """
     r = TAKER_FEE_RATE if rate is None else float(rate)
     p = min(max(float(price), 0.0), 1.0)
-    return r * min(p, 1.0 - p)
+    if exponent == 1.0:
+        return r * p * (1.0 - p)
+    return r * (p ** exponent) * ((1.0 - p) ** exponent)
+
+
+# Makers pay no taker fee AND receive a share of taker fees back as a daily
+# USDC rebate (crypto: 20%, per the venue feeSchedule's rebateRate). Not
+# credited to PnL anywhere — it is a proportional daily pool, not a guaranteed
+# per-trade payment, so counting it would inflate results.
+MAKER_REBATE_SHARE = float(os.getenv("MAKER_REBATE_SHARE", "0.20"))
 
 VOLATILITY_DAILY = float(os.getenv("VOLATILITY_DAILY", "0.045"))
 

@@ -84,4 +84,39 @@ p = make_pub({"mid": "0.51"}, {"bids": [], "asks": []})
 q = p.buy_quote("t")
 assert abs(q["price"] - 0.51) < 1e-9, q
 
+# --- taker fee must match Polymarket's DOCUMENTED formula -------------------
+# fee = shares * rate * price * (1 - price), corroborated by the venue's own
+# feeSchedule {"rate": 0.07, "exponent": 1, "takerOnly": true}. The bot used to
+# charge rate * min(p, 1-p): double the real fee at 50/50, ~15% too much at
+# 0.87. Wrong in the conservative direction, but it sits inside the arb gate
+# that decides whether real money goes in, so it gets pinned here.
+import config as _cfg
+
+_cfg.TAKER_FEE_RATE = 0.07
+# Polymarket's published worked example.
+_got = 100 * _cfg.taker_fee_per_share(0.50)
+assert abs(_got - 1.75) < 1e-9, f"100 shares @0.50 should cost $1.75, got ${_got}"
+
+for _p in (0.05, 0.25, 0.5, 0.75, 0.95):
+    _expect = 0.07 * _p * (1 - _p)
+    _actual = _cfg.taker_fee_per_share(_p)
+    assert abs(_actual - _expect) < 1e-12, f"p={_p}: {_actual} != {_expect}"
+
+# Symmetric about 0.5, and zero at the boundaries where there is nothing to win.
+assert abs(_cfg.taker_fee_per_share(0.3) - _cfg.taker_fee_per_share(0.7)) < 1e-12
+assert _cfg.taker_fee_per_share(1.0) == 0.0
+assert _cfg.taker_fee_per_share(0.0) == 0.0
+# Peak at 50/50.
+assert _cfg.taker_fee_per_share(0.5) > _cfg.taker_fee_per_share(0.6) > \
+    _cfg.taker_fee_per_share(0.9)
+
+# Every module must price on the SAME curve as the live gate.
+import arb_executor as _ax
+import tuner as _tn
+for _p in (0.44, 0.5, 0.87):
+    assert abs(_ax.taker_fee_per_share(_p) - _cfg.taker_fee_per_share(_p)) < 1e-12
+    assert abs(_tn._taker_fee_per_share(_p) - _cfg.taker_fee_per_share(_p)) < 1e-12
+
+print("FEE_OK  (matches the documented 100 x 0.50 -> $1.75, one curve everywhere)")
+
 print("PRICING_OK")

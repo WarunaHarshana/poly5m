@@ -96,9 +96,13 @@ def _log(entry: dict) -> None:
 
 
 def taker_fee_per_share(price: float) -> float:
-    rate = float(getattr(config, "TAKER_FEE_RATE", 0.07))
-    p = max(0.0, min(1.0, float(price)))
-    return rate * min(p, 1.0 - p)
+    """Delegates to config so there is ONE fee curve in the codebase.
+
+    This module used to carry its own copy, which meant a fix in config would
+    silently leave the arb gate pricing on the old (wrong) curve — the gate
+    that decides whether real money goes in.
+    """
+    return config.taker_fee_per_share(price)
 
 
 def evaluate(ask_up: float, ask_down: float, shares: float,
