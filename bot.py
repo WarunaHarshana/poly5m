@@ -748,17 +748,35 @@ def _quote_side(pub, market, side: str) -> dict | None:
         return None
 
 
-def _scan_sum_to_one_arb(pub, market) -> dict | None:
-    """Tier 2: detect ask_UP + ask_DOWN < 1 - fee (structural mispricing)."""
+def _scan_sum_to_one_arb(pub, market, feed=None) -> dict | None:
+    """Tier 2: detect ask_UP + ask_DOWN < 1 - fee (structural mispricing).
+
+    Prefers the pushed WebSocket book, which gives BOTH sides from a single
+    instant. The REST path reads UP and then DOWN in separate round trips, so a
+    pair priced from it may never have existed simultaneously — a correctness
+    problem, not just a latency one. REST remains the fallback so a socket
+    outage degrades the bot rather than stopping it.
+    """
     if not getattr(config, "ARB_SCAN_ENABLED", True):
         return None
     try:
-        q_up = _quote_side(pub, market, "UP")
-        q_dn = _quote_side(pub, market, "DOWN")
-        if not q_up or not q_dn:
-            return None
-        p_up = float(q_up["price"])
-        p_dn = float(q_dn["price"])
+        p_up = p_dn = None
+        up_sz = dn_sz = None
+        src = "rest"
+        if feed is not None:
+            snap = feed.pair(market["tokens"]["UP"], market["tokens"]["DOWN"])
+            if snap is not None:
+                p_up, p_dn = snap.ask_up, snap.ask_down
+                up_sz, dn_sz = snap.size_up, snap.size_down
+                src = f"ws({snap.age_s * 1000:.0f}ms)"
+        if p_up is None or p_dn is None:
+            q_up = _quote_side(pub, market, "UP")
+            q_dn = _quote_side(pub, market, "DOWN")
+            if not q_up or not q_dn:
+                return None
+            p_up = float(q_up["price"])
+            p_dn = float(q_dn["price"])
+            up_sz, dn_sz = q_up.get("ask_size"), q_dn.get("ask_size")
         if not (0.0 < p_up < 1.0 and 0.0 < p_dn < 1.0):
             return None
         s = p_up + p_dn
@@ -770,8 +788,9 @@ def _scan_sum_to_one_arb(pub, market) -> dict | None:
                 "ask_down": p_dn,
                 "sum": s,
                 "edge": edge,
-                "up_size": q_up.get("ask_size"),
-                "down_size": q_dn.get("ask_size"),
+                "up_size": up_sz,
+                "down_size": dn_sz,
+                "src": src,
             }
     except Exception:
         return None
@@ -1010,6 +1029,22 @@ async def run_realtime(rounds: int = 100, paper: bool = True,
     max_slots = max(rounds * 30, 300)  # safety cap so a dead market can't spin forever
 
     _hb_task = asyncio.create_task(_lock_heartbeat())
+
+    # Pushed order book. Falls back to REST per-scan if it is down or stale,
+    # so a socket problem slows the bot rather than stopping it.
+    book_feed_client = None
+    if bool(getattr(config, "BOOK_FEED_ENABLED", True)):
+        try:
+            from book_feed import BookFeed
+            book_feed_client = BookFeed(
+                max_age_s=float(getattr(config, "BOOK_FEED_MAX_AGE_S", 2.0)))
+            book_feed_client.start()
+            print(f"  [book] websocket feed starting "
+                  f"(max age {book_feed_client.max_age_s:.1f}s; "
+                  f"REST fallback stays active)")
+        except Exception as e:
+            print(f"  [book] websocket feed unavailable ({e}); REST only")
+            book_feed_client = None
 
     settle_tasks: set = set()
     # One observation row per slot: the retry loop re-evaluates the same slot
@@ -1306,7 +1341,8 @@ async def run_realtime(rounds: int = 100, paper: bool = True,
         direction. Returns True if a trade was placed.
         """
         nonlocal arb_done_end_ts, placed
-        arb = await asyncio.to_thread(_scan_sum_to_one_arb, pub, market)
+        arb = await asyncio.to_thread(_scan_sum_to_one_arb, pub, market,
+                                      book_feed_client)
         if not arb:
             return False
         arb_done_end_ts = end_ts  # one attempt per slot (signal seen)
@@ -1529,6 +1565,16 @@ async def run_realtime(rounds: int = 100, paper: bool = True,
 
         lookup_fails = 0
 
+        # Subscribe this slot's tokens as soon as it is discovered, so the book
+        # is already warm when the arb window opens rather than being fetched
+        # cold at decision time.
+        if book_feed_client is not None:
+            try:
+                book_feed_client.watch(market["tokens"]["UP"],
+                                       market["tokens"]["DOWN"])
+            except Exception:
+                pass
+
         question = market.get("question") or "BTC 5-minute Up/Down"
         end_ts = market.get("end_ts")
         remaining = (end_ts - _now(cl_stream)) if end_ts else None
@@ -1614,7 +1660,11 @@ async def run_realtime(rounds: int = 100, paper: bool = True,
                 pass
             if config.ROUND_SECONDS > 0 and wait > 0:
                 if arb_on and wait > 20:
-                    await _heartbeat_sleep(15.0)  # re-scan arb roughly every 15s
+                    # Re-check the arb far more often than the old 15s: with a
+                    # pushed book this is an in-memory read, and a 15s cadence
+                    # on a millisecond market missed almost everything.
+                    scan_gap = float(getattr(config, "ARB_SCAN_INTERVAL_S", 1.0))
+                    await _heartbeat_sleep(max(0.2, min(scan_gap, wait)))
                 else:
                     await _heartbeat_sleep(min(wait, max(1.0, wait - 1.5)))
             continue
@@ -2292,6 +2342,9 @@ async def run_realtime(rounds: int = 100, paper: bool = True,
         await asyncio.gather(*settle_tasks, return_exceptions=True)
     _hb_task.cancel()
     cl_stream.stop()
+    if book_feed_client is not None:
+        print(f"  [book] feed status: {json.dumps(book_feed_client.status())}")
+        book_feed_client.stop()
     release_lock()
     stats = persist(trades, risk, skips)
     if not risk.halted:

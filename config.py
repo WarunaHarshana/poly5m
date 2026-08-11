@@ -332,6 +332,20 @@ ARB_MIN_REMAINING = int(os.getenv("ARB_MIN_REMAINING", "20"))
 # arb_executor.stats() reports the lock rate as it accumulates.
 ARB_LIVE_ENABLED = _env_bool("ARB_LIVE_ENABLED", False)
 
+# Pushed order book over the venue's market WebSocket. Falls back to REST per
+# scan when the socket is down or the book is stale, so an outage degrades the
+# bot instead of stopping it.
+BOOK_FEED_ENABLED = _env_bool("BOOK_FEED_ENABLED", True)
+# Refuse to price an arb from a book older than this. Quotes move in
+# milliseconds on these markets and the 500ms taker buffer was removed in
+# Feb 2026, so a two-second-old book is already a guess.
+BOOK_FEED_MAX_AGE_S = float(os.getenv("BOOK_FEED_MAX_AGE_S", "2.0"))
+# How often to re-check for an arb while waiting out a slot. This was 15s,
+# which on a market that moves in milliseconds meant nearly every gap was
+# missed and the ones caught were stale by construction. With a pushed book the
+# check is a cheap in-memory read, so it can run far more often.
+ARB_SCAN_INTERVAL_S = float(os.getenv("ARB_SCAN_INTERVAL_S", "1.0"))
+
 # How many timestamped backup folders to keep under archive/copies/ (0 = none).
 # Each one holds a full copy of the trade history, written on every settled
 # trade, so leaving this unbounded grows the volume quadratically — it filled

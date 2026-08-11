@@ -93,9 +93,13 @@ assert abs(q["price"] - 0.51) < 1e-9, q
 import config as _cfg
 
 _cfg.TAKER_FEE_RATE = 0.07
-# Polymarket's published worked example.
-_got = 100 * _cfg.taker_fee_per_share(0.50)
-assert abs(_got - 1.75) < 1e-9, f"100 shares @0.50 should cost $1.75, got ${_got}"
+# All three worked examples published in Polymarket's fee docs (100 shares,
+# crypto rate 0.07). The 0.30/0.70 pair also pins the symmetry they state:
+# "a trade at 30c incurs the same dollar fee as a trade at 70c".
+for _price, _want in ((0.30, 1.47), (0.50, 1.75), (0.70, 1.47)):
+    _got = 100 * _cfg.taker_fee_per_share(_price)
+    assert abs(_got - _want) < 1e-9, \
+        f"100 shares @{_price}: docs say ${_want}, got ${_got}"
 
 for _p in (0.05, 0.25, 0.5, 0.75, 0.95):
     _expect = 0.07 * _p * (1 - _p)
