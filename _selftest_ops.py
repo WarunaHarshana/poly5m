@@ -515,6 +515,53 @@ check("a free-space reading is available",
 check("the disk warning threshold is set",
       supervisor.DISK_WARN_MB > 0, str(supervisor.DISK_WARN_MB))
 
+# ---------------------------------------------------------------------------
+print("T15 order lifecycle states")
+import order_state as ostate  # noqa: E402
+
+if os.path.exists(ostate.ORDER_EVENTS):
+    os.remove(ostate.ORDER_EVENTS)
+
+# A live order that genuinely filled.
+for st in (ostate.SIGNAL, ostate.SUBMITTED):
+    ostate.record(st, round_id=1, slug="s1", side="UP", requested_shares=5,
+                  mode="live")
+ostate.record(ostate.ACCEPTED, round_id=1, slug="s1", side="UP", order_id="ord1",
+              requested_shares=5, mode="live",
+              venue_response={"status": "live", "orderID": "ord1"})
+ostate.record(ostate.FILLED, round_id=1, slug="s1", side="UP", order_id="ord1",
+              requested_shares=5, filled_shares=5, mode="live")
+
+# Paper: nothing was ever sent.
+ostate.record(ostate.SIMULATED, round_id=2, slug="s2", side="ARB",
+              filled_shares=5, mode="paper_live")
+# Live, but the venue never confirmed.
+ostate.record(ostate.UNVERIFIED, round_id=3, slug="s3", side="UP", mode="live")
+# Venue refused.
+ostate.record(ostate.REJECTED, round_id=4, slug="s4", side="DOWN", mode="live")
+
+trail = [e["state"] for e in ostate.trail(1)]
+check("the full trail is recorded in order",
+      trail == ["SIGNAL", "SUBMITTED", "ACCEPTED", "FILLED"], str(trail))
+
+s = ostate.summary()
+check("only venue-confirmed fills count as fills",
+      s["venue_confirmed_fills"] == 1, str(s))
+check("a SIMULATED paper fill is NOT counted as a fill",
+      s["simulated"] == 1 and ostate.SIMULATED in ostate.NOT_CONFIRMED, str(s))
+check("an UNVERIFIED fill is NOT counted as a fill",
+      s["unverified"] == 1 and ostate.UNVERIFIED in ostate.NOT_CONFIRMED, str(s))
+check("a REJECTED order is NOT counted as a fill",
+      s["rejected"] == 1 and ostate.REJECTED in ostate.NOT_CONFIRMED, str(s))
+check("only PARTIAL/FILLED hold a position",
+      set(ostate.HOLDS_POSITION) == {ostate.PARTIAL, ostate.FILLED},
+      str(ostate.HOLDS_POSITION))
+
+# The venue's own words are retained as evidence.
+acc = [e for e in ostate.trail(1) if e["state"] == "ACCEPTED"][0]
+check("the venue response is kept with the event",
+      "orderID" in (acc.get("venue_response") or ""), str(acc.get("venue_response")))
+
 print()
 if FAIL:
     raise SystemExit(f"SELFTEST_FAILED ops: {FAIL}")

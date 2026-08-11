@@ -1103,6 +1103,17 @@ body::before {
   transition: background 0.3s, box-shadow 0.3s;
 }
 .conn-dot.stale { background: var(--red); box-shadow: 0 0 8px var(--red); }
+/* Venue-confirmation badge. SIM must never look like a confirmed fill, and
+   UNVERIFIED must be impossible to miss. */
+.fill-tag { font-size: 9px; font-weight: 700; letter-spacing: 0.4px;
+  padding: 2px 5px; border-radius: 4px; white-space: nowrap; }
+.fill-sim { background: rgba(148,163,184,0.15); color: #94a3b8;
+  border: 1px solid rgba(148,163,184,0.35); }
+.fill-live { background: rgba(34,197,94,0.15); color: #22c55e;
+  border: 1px solid rgba(34,197,94,0.4); }
+.fill-unverified { background: rgba(239,68,68,0.18); color: #f87171;
+  border: 1px solid rgba(239,68,68,0.55); }
+
 /* Marks an ARB entry price as a PAIR cost, not a single-share ask. */
 .pair-tag { font-size: 8.5px; font-weight: 700; letter-spacing: 0.5px;
   text-transform: uppercase; opacity: 0.6; margin-left: 4px;
@@ -1832,9 +1843,10 @@ body.trade-flash-lose { animation: page-flash-down 1.6s ease-out; }
     <table>
       <thead><tr>
         <th>Time (ET)</th><th>Round</th><th>Side</th><th>Entry</th><th>Stake</th>
-        <th>Edge</th><th>Outcome</th><th>W/L</th><th>P&amp;L</th><th>Bankroll</th><th>Slot / Link</th>
+        <th>Edge</th><th title="What the VENUE confirmed. SIMULATED means no order was sent to Polymarket.">Fill</th>
+        <th>Outcome</th><th>W/L</th><th>P&amp;L</th><th>Bankroll</th><th>Slot / Link</th>
       </tr></thead>
-      <tbody id="rows"><tr><td class="empty-msg" colspan="11">Waiting for the first trade… start the bot above.</td></tr></tbody>
+      <tbody id="rows"><tr><td class="empty-msg" colspan="12">Waiting for the first trade… start the bot above.</td></tr></tbody>
     </table>
   </div>
 
@@ -1941,6 +1953,29 @@ function curTf() {
 }
 function tfq(sep) { return (sep || '?') + 'tf=' + curTf(); }
 function ck(name) { return 'cache_' + name + '_' + curTf(); }
+/* What the VENUE confirmed about this fill.
+   "we sent an order", "the venue accepted it" and "it filled" are three
+   different things, and the blotter used to show all three identically. A
+   paper fill is modelled against a real book but was never submitted to
+   Polymarket, so it is labelled SIM and must never read as confirmed. */
+function fillCell(t) {
+  let label, cls, tip;
+  if (t.fill_unverified) {
+    label = 'UNVERIFIED'; cls = 'fill-unverified';
+    tip = 'The venue fill lookup failed. Booked as UNFILLED — the order may '
+        + 'still exist on Polymarket. Never treat this as a position.';
+  } else if (t.mode === 'live') {
+    label = 'FILLED'; cls = 'fill-live';
+    tip = 'Confirmed against the venue: ' + Number(t.shares).toFixed(2)
+        + ' shares matched.';
+  } else {
+    label = 'SIM'; cls = 'fill-sim';
+    tip = 'Paper: modelled against the real order book, but NO order was sent '
+        + 'to Polymarket and nothing was matched.';
+  }
+  return `<td><span class="fill-tag ${cls}" title="${tip}">${label}</span></td>`;
+}
+
 function fmtUsd(n) {
   const sign = n < 0 ? '-' : '';
   return sign + '$' + Math.abs(n).toLocaleString(undefined, {
@@ -2354,7 +2389,7 @@ function render(stats, trades) {
   const rows = [...trades].reverse();
   const tb = document.getElementById('rows');
   if (!rows.length) {
-    tb.innerHTML = '<tr><td class="empty-msg" colspan="11">Waiting for the first trade…</td></tr>';
+    tb.innerHTML = '<tr><td class="empty-msg" colspan="12">Waiting for the first trade…</td></tr>';
     return;
   }
   tb.innerHTML = rows.map((t, i) => {
@@ -2394,6 +2429,7 @@ function render(stats, trades) {
           ? `both legs combined (${Number(t.shares).toFixed(2)} shares each side)`
           : `${Number(t.shares).toFixed(2)} shares`}">${fmtUsd(t.stake_usd)}</td>` +
       `<td>${(t.edge >= 0 ? '+' : '') + Number(t.edge).toFixed(2)}</td>` +
+      fillCell(t) +
       `<td class="${outCls}">${t.outcome || '—'}</td>` +
       `<td class="${wl}">${t.won ? 'WON' : 'LOST'}</td>` +
       `<td class="${t.pnl >= 0 ? 'won' : 'lost'}">${(t.pnl >= 0 ? '+' : '') + Number(t.pnl).toFixed(2)}</td>` +
@@ -2629,7 +2665,7 @@ document.getElementById('c-start').onclick = async () => {
         slotEndTs = null;
         lastTopRound = null;
         document.getElementById('rows').innerHTML =
-          '<tr><td class="empty-msg" colspan="11">Fresh session — waiting for the first trade…</td></tr>';
+          '<tr><td class="empty-msg" colspan="12">Fresh session — waiting for the first trade…</td></tr>';
         render({}, []);
       }
       msg.textContent = (mode === 'live' ? '🔴 LIVE started: ' : '▶ started: ')
@@ -3054,7 +3090,7 @@ document.getElementById('c-timeframe').addEventListener('change', () => {
   // own state files (each timeframe has separate trades/stats/logs).
   slotEndTs = null; lastTopRound = null; lastStatusTs = 0;
   document.getElementById('rows').innerHTML =
-    '<tr><td class="empty-msg" colspan="11">Loading ' + curTf() + ' data…</td></tr>';
+    '<tr><td class="empty-msg" colspan="12">Loading ' + curTf() + ' data…</td></tr>';
   poll(); loadAnalysis(); ctlState();
 });
 document.getElementById('an-refresh').onclick = loadAnalysis;
@@ -3365,6 +3401,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except OSError:
                 pass
             return
+
+        # Order lifecycle: what the VENUE said, per order. This is the
+        # difference between "we sent an order" and "it filled".
+        if path == "/api/orders":
+            from urllib.parse import urlparse, parse_qs
+            try:
+                import order_state
+                q = parse_qs(urlparse(self.path).query)
+                rid = (q.get("round") or [None])[0]
+                if rid is not None:
+                    try:
+                        return self._json({"ok": True,
+                                           "trail": order_state.trail(int(rid))})
+                    except ValueError:
+                        return self._json({"ok": False,
+                                           "error": "bad round id"}, 400)
+                return self._json({
+                    "ok": True,
+                    "summary": order_state.summary(),
+                    "recent": order_state.load(limit=60),
+                })
+            except Exception as e:
+                return self._json({"ok": False, "error": str(e)}, 500)
 
         # Learning state: dataset size, parameters in force, recent decisions.
         # Without this the self-tuning loop is invisible unless you SSH in.

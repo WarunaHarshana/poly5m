@@ -29,6 +29,7 @@ from types import SimpleNamespace
 
 import config
 import observations
+import order_state
 import paths
 from price_feed import SimulatedPriceFeed, LivePriceFeed, ChainlinkDataStream
 from signal_engine import compute_signal, count_strike_crossings, fair_value
@@ -1119,6 +1120,25 @@ async def run_realtime(rounds: int = 100, paper: bool = True,
             if not paper:
                 trade.shares = matched_shares
                 trade.stake_usd = round(matched_shares * trade.entry_price, 4)
+                _st_common = dict(round_id=trade.round_id, slug=trade.slug,
+                                  side=trade.side, order_id=str(order_id or ""),
+                                  requested_shares=shares,
+                                  filled_shares=matched_shares,
+                                  price=trade.entry_price, mode=config.MODE)
+                if getattr(trade, "fill_unverified", False):
+                    order_state.record(
+                        order_state.UNVERIFIED, **_st_common,
+                        note="venue fill lookup failed after retry; booked as "
+                             "UNFILLED (the order may still exist)")
+                elif matched_shares <= 0.0:
+                    order_state.record(order_state.CANCELLED, **_st_common,
+                                       note="cancelled with nothing matched")
+                elif matched_shares + 1e-9 < shares:
+                    order_state.record(order_state.PARTIAL, **_st_common,
+                                       note="venue confirmed a partial fill")
+                else:
+                    order_state.record(order_state.FILLED, **_st_common,
+                                       note="venue confirmed the full size")
                 if matched_shares == 0.0:
                     print("  [live fill] Trade was completely unfilled. "
                           "Setting PnL to 0.")
@@ -2171,7 +2191,20 @@ async def run_realtime(rounds: int = 100, paper: bool = True,
         )
 
         order_id = None
+        _os_common = dict(round_id=trade.round_id, slug=trade.slug,
+                          side=sig.side, token_id=token_id,
+                          requested_shares=shares, price=mkt, mode=config.MODE)
+        order_state.record(order_state.SIGNAL, **_os_common,
+                           note=f"gates passed; edge {edge:+.4f}")
+        if paper:
+            # No order is sent in paper. Say so explicitly so a simulated fill
+            # can never be read as one the venue confirmed.
+            order_state.record(order_state.SIMULATED, **_os_common,
+                               filled_shares=shares,
+                               note="paper_live: modelled against the real "
+                                    "book; nothing submitted to Polymarket")
         if not paper:
+            order_state.record(order_state.SUBMITTED, **_os_common)
             try:
                 # Re-check quote right before order (latency / adverse selection).
                 try:
@@ -2215,8 +2248,17 @@ async def run_realtime(rounds: int = 100, paper: bool = True,
                 if isinstance(resp, dict):
                     order_id = (resp.get("orderID") or resp.get("order_id")
                                 or resp.get("id"))
+                # ACCEPTED, not FILLED: the venue took the order. Whether any
+                # of it matched is decided later, against get_trades.
+                order_state.record(
+                    order_state.ACCEPTED if order_id else order_state.OPEN,
+                    **_os_common, order_id=str(order_id or ""),
+                    venue_response=resp,
+                    note="venue accepted the order; fill not yet confirmed")
             except Exception as e:
                 print(f"  order failed: {e}")
+                order_state.record(order_state.REJECTED, **_os_common,
+                                   venue_response=str(e), note="order failed")
                 skips["order_fail"] += 1
                 risk.on_close(stake, 0.0)
                 _clear_open(trade)
