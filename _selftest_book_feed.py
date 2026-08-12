@@ -339,6 +339,44 @@ check("it says why", "no data" in fd_s.last_error, fd_s.last_error)
 closed_busy, _ = _run_watchdog(quiet_for=0)
 check("it leaves a busy socket alone", not closed_busy)
 
+# The resubscriber: a single lost subscribe must not be permanent.
+print("T9 the subscription self-heals")
+
+
+class _SendWS:
+    def __init__(self):
+        self.frames = []
+
+    async def send(self, frame):
+        self.frames.append(json.loads(frame))
+
+
+def _run_resub(assets, ticks=2):
+    fd = BookFeed()
+    fd._assets = set(assets)
+    ws = _SendWS()
+    orig = book_feed.RESUBSCRIBE_S
+    book_feed.RESUBSCRIBE_S = 0.01
+    try:
+        _a2.run(_a2.wait_for(fd._resubscriber(ws), timeout=0.2))
+    except Exception:
+        pass
+    finally:
+        book_feed.RESUBSCRIBE_S = orig
+    return ws.frames
+
+
+frames = _run_resub(["X1", "X2"])
+check("it keeps re-sending the subscription", len(frames) >= 2, str(len(frames)))
+if frames:
+    check("each refresh carries the full asset list",
+          all(set(f["assets_ids"]) == {"X1", "X2"} for f in frames), str(frames[0]))
+    check("refreshes are typed as market subscriptions",
+          all(f.get("type") == "market" for f in frames), str(frames[0]))
+check("the refresh beat is faster than the staleness gate",
+      book_feed.RESUBSCRIBE_S < book_feed.STALE_RECONNECT_S,
+      f"{book_feed.RESUBSCRIBE_S} vs {book_feed.STALE_RECONNECT_S}")
+
 print()
 if FAIL:
     raise SystemExit(f"SELFTEST_FAILED book_feed: {FAIL}")

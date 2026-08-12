@@ -53,6 +53,8 @@ MAX_TRACKED = int(os.getenv("BOOK_FEED_MAX_TRACKED", "8"))
 # of seconds of nothing is never normal.
 STALE_CHECK_S = float(os.getenv("BOOK_FEED_STALE_CHECK_S", "10"))
 STALE_RECONNECT_S = float(os.getenv("BOOK_FEED_STALE_RECONNECT_S", "45"))
+# How often to re-send the subscription so a dropped one self-heals.
+RESUBSCRIBE_S = float(os.getenv("BOOK_FEED_RESUBSCRIBE_S", "20"))
 
 
 @dataclass
@@ -169,6 +171,7 @@ class BookFeed:
                     await self._subscribe(ws, sorted(self._assets))
                     pinger = asyncio.create_task(self._ping(ws))
                     watchdog = asyncio.create_task(self._watchdog(ws))
+                    resub = asyncio.create_task(self._resubscriber(ws))
                     try:
                         async for raw in ws:
                             self._last_msg_at = time.time()
@@ -176,6 +179,7 @@ class BookFeed:
                     finally:
                         pinger.cancel()
                         watchdog.cancel()
+                        resub.cancel()
             except Exception as e:
                 self.last_error = str(e)
             finally:
@@ -193,6 +197,35 @@ class BookFeed:
             await asyncio.sleep(PING_INTERVAL_S)
             try:
                 await ws.send("PING")
+            except Exception:
+                return
+
+    async def _resubscriber(self, ws) -> None:
+        """Periodically re-send the current asset list.
+
+        watch() fires a single subscribe from another thread via
+        run_coroutine_threadsafe and never inspects the resulting Future, so a
+        send that fails — or a subscription the server drops — is invisible and
+        permanent: the feed keeps streaming the PREVIOUS slot's tokens while
+        pair() for the current slot returns None forever, and every scan
+        silently falls back to REST.
+
+        Re-sending is idempotent (the channel replaces the subscription), so a
+        periodic refresh turns that class of failure from permanent into a few
+        seconds long, without needing to know which send was lost.
+        """
+        last_sent = None
+        while True:
+            await asyncio.sleep(RESUBSCRIBE_S)
+            with self._lock:
+                assets = sorted(self._assets)
+            if not assets:
+                continue
+            # Always refresh after an asset change; otherwise refresh anyway on
+            # a slower beat so a silently-dropped subscription self-heals.
+            try:
+                await self._subscribe(ws, assets)
+                last_sent = assets
             except Exception:
                 return
 
