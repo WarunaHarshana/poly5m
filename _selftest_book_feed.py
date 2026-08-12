@@ -118,13 +118,42 @@ check("the pair appears once both sides have asks", f.pair(UP, DN) is not None)
 
 # ---------------------------------------------------------------------------
 print("T5 incremental updates")
+# The REAL price_change shape, captured from the live socket: no top-level
+# asset_id, best bid/ask nested inside a price_changes array, and `market`
+# holding the condition id shared by BOTH outcomes. 98% of the feed looks like
+# this, and an earlier version dropped all of it.
 f = BookFeed()
 f._handle(snapshot(UP, 0.42, 0.44))
-f._handle(json.dumps({"event_type": "price_change", "asset_id": UP,
-                      "best_bid": "0.45", "best_ask": "0.46"}))
+f._handle(snapshot(DN, 0.50, 0.52))
+f._handle(json.dumps({
+    "event_type": "price_change",
+    "market": "0x220d91bfd45f9c67448d7ebf1ee05889af83fdabec83ec99bca861a9c",
+    "timestamp": "1786534500000",
+    "price_changes": [
+        {"asset_id": UP, "price": "0.01", "size": "3954.56", "side": "BUY",
+         "best_bid": "0.45", "best_ask": "0.46"},
+        {"asset_id": DN, "price": "0.02", "size": "100.0", "side": "SELL",
+         "best_bid": "0.53", "best_ask": "0.54"},
+    ],
+}))
 s = f.side(UP)
-check("price_change updates best bid/ask", s.best_bid == 0.45 and s.best_ask == 0.46,
-      str(s))
+check("price_change updates the UP side from the nested array",
+      s.best_bid == 0.45 and s.best_ask == 0.46, str(s))
+s2 = f.side(DN)
+check("...and the DOWN side in the same message",
+      s2.best_bid == 0.53 and s2.best_ask == 0.54, str(s2))
+check("the condition id is NOT stored as a token",
+      "0x220d91bfd45f9c67448d7ebf1ee05889af83fdabec83ec99bca861a9c" not in f._books,
+      str(list(f._books)))
+check("a price_change refreshes the pair's freshness",
+      f.pair(UP, DN) is not None and f.pair(UP, DN).ask_up == 0.46,
+      str(f.pair(UP, DN)))
+
+# last_trade_price carries a top-level asset_id and no book — must not wipe one.
+f._handle(json.dumps({"event_type": "last_trade_price", "asset_id": UP,
+                      "price": "0.46", "size": "10"}))
+check("last_trade_price leaves the book intact",
+      f.side(UP).best_ask == 0.46, str(f.side(UP)))
 check("PONG frames are ignored", f._handle("PONG") is None)
 check("malformed frames do not raise", f._handle("{not json") is None)
 

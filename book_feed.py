@@ -238,11 +238,33 @@ class BookFeed:
             if not isinstance(ev, dict):
                 continue
             self.messages += 1
-            token = (ev.get("asset_id") or ev.get("market")
-                     or ev.get("token_id") or "")
+            etype = (ev.get("event_type") or ev.get("type") or "").lower()
+
+            # price_change is ~98% of the feed (measured: 6002 of 6176 events in
+            # 15s). Its best bid/ask live inside a price_changes ARRAY, one
+            # entry per asset — NOT at the top level, where an earlier version
+            # looked for them. That version therefore ignored almost the entire
+            # stream and refreshed only on the sparse `book` snapshots, letting
+            # the book age past the staleness gate and silently sending every
+            # arb scan down the REST path.
+            if etype == "price_change":
+                for chg in (ev.get("price_changes") or []):
+                    if not isinstance(chg, dict):
+                        continue
+                    tok = chg.get("asset_id")
+                    if not tok:
+                        continue
+                    self._apply_top(tok, chg.get("best_bid"),
+                                    chg.get("best_ask"), now)
+                continue
+
+            # Everything else identifies its asset directly. Note there is NO
+            # fallback to ev["market"]: that is the condition id shared by both
+            # outcomes, so keying a book by it would file quotes under an id
+            # the scanner never asks for.
+            token = ev.get("asset_id") or ev.get("token_id") or ""
             if not token:
                 continue
-            etype = (ev.get("event_type") or ev.get("type") or "").lower()
             if etype in ("book", "snapshot") or "bids" in ev or "asks" in ev:
                 bid, bsz = _top(ev.get("bids") or ev.get("buys"), want_max=True)
                 ask, asz = _top(ev.get("asks") or ev.get("sells"), want_max=False)
@@ -255,19 +277,26 @@ class BookFeed:
                     if ask is not None:
                         b.best_ask, b.ask_size = ask, asz
                     b.updated_at = now
-            elif etype in ("price_change", "tick_size_change", "last_trade_price"):
-                # Best bid/ask deltas, when the venue sends them directly.
-                try:
-                    if ev.get("best_bid") is not None or ev.get("best_ask") is not None:
-                        with self._lock:
-                            b = self._books.setdefault(token, BookSide())
-                            if ev.get("best_bid") is not None:
-                                b.best_bid = float(ev["best_bid"])
-                            if ev.get("best_ask") is not None:
-                                b.best_ask = float(ev["best_ask"])
-                            b.updated_at = now
-                except (TypeError, ValueError):
-                    pass
+            elif ev.get("best_bid") is not None or ev.get("best_ask") is not None:
+                self._apply_top(token, ev.get("best_bid"), ev.get("best_ask"), now)
+
+    def _apply_top(self, token: str, bid, ask, now: float) -> None:
+        """Apply a best bid/ask update for one token."""
+        try:
+            b_val = float(bid) if bid is not None else None
+            a_val = float(ask) if ask is not None else None
+        except (TypeError, ValueError):
+            return
+        if b_val is None and a_val is None:
+            return
+        with self._lock:
+            b = self._books.setdefault(token, BookSide())
+            # 0 and 1 are not tradeable quotes; treat them as "no side".
+            if b_val is not None:
+                b.best_bid = b_val if 0.0 < b_val < 1.0 else None
+            if a_val is not None:
+                b.best_ask = a_val if 0.0 < a_val < 1.0 else None
+            b.updated_at = now
 
     # -- reads -------------------------------------------------------------
     def side(self, token_id: str) -> BookSide | None:
