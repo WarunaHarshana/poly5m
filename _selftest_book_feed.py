@@ -194,6 +194,65 @@ res = bot._scan_sum_to_one_arb(pub3, MARKET, None)
 check("no feed -> pure REST path still works", pub3.calls == 2 and res is not None,
       f"{pub3.calls} calls, {res}")
 
+# ---------------------------------------------------------------------------
+print("T7 subscribing after connect sends the FULL asset list")
+# The channel REPLACES a connection's subscription rather than appending to it.
+# Sending only the newly-added ids therefore subscribes to nothing: production
+# showed connected=true, 16 tracked tokens, books for only 4, and every arb read
+# silently falling back to REST while the feed looked perfectly healthy.
+sent = []
+
+
+class _FakeWS:
+    async def send(self, frame):
+        sent.append(json.loads(frame))
+
+
+f = BookFeed()
+f._connected = True
+f._ws = _FakeWS()
+
+
+class _FakeLoop:
+    """Runs the coroutine inline so the test does not need a real loop."""
+    @staticmethod
+    def _drive(coro):
+        try:
+            coro.send(None)
+        except StopIteration:
+            pass
+
+
+f._loop = _FakeLoop()
+import asyncio as _aio
+
+_real_rcts = _aio.run_coroutine_threadsafe
+_aio.run_coroutine_threadsafe = lambda coro, loop: _FakeLoop._drive(coro)
+try:
+    f.watch("A1", "A2")
+    f.watch("B1", "B2")
+finally:
+    _aio.run_coroutine_threadsafe = _real_rcts
+
+check("a subscribe frame was sent for each watch call", len(sent) == 2, str(sent))
+if len(sent) == 2:
+    check("the FIRST frame carries slot A",
+          set(sent[0]["assets_ids"]) == {"A1", "A2"}, str(sent[0]))
+    check("the SECOND frame re-sends A *and* B, not just the delta",
+          set(sent[1]["assets_ids"]) == {"A1", "A2", "B1", "B2"},
+          f"got {sent[1]['assets_ids']} — a delta-only frame unsubscribes the rest")
+    check("frames are typed as market subscriptions",
+          all(s.get("type") == "market" for s in sent), str(sent))
+
+# The subscription must stay bounded: each slot adds two ids forever.
+f2 = BookFeed()
+for i in range(12):
+    f2.watch(f"s{i}a", f"s{i}b")
+check("the tracked set is capped", len(f2._assets) <= book_feed.MAX_TRACKED,
+      f"{len(f2._assets)} tracked")
+check("the newest slot is never pruned",
+      {"s11a", "s11b"} <= f2._assets, str(sorted(f2._assets)))
+
 print()
 if FAIL:
     raise SystemExit(f"SELFTEST_FAILED book_feed: {FAIL}")

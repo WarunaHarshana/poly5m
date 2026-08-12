@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import threading
 import time
 from dataclasses import dataclass
@@ -44,6 +45,9 @@ WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 PING_INTERVAL_S = 10.0
 # A book older than this is not worth pricing an arb from.
 DEFAULT_MAX_AGE_S = 2.0
+# Cap the subscription. Every 5m slot adds two token ids; resolved markets stop
+# pushing updates but still bloat each resubscribe frame.
+MAX_TRACKED = int(os.getenv("BOOK_FEED_MAX_TRACKED", "8"))
 
 
 @dataclass
@@ -100,6 +104,7 @@ class BookFeed:
         self._books: dict[str, BookSide] = {}
         self._lock = threading.Lock()
         self._assets: set[str] = set()
+        self._subscribe_order: list[str] = []   # oldest-first, for pruning
         self._stop = False
         self._thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -188,15 +193,34 @@ class BookFeed:
         await ws.send(json.dumps({"assets_ids": assets, "type": "market"}))
 
     def watch(self, *token_ids: str) -> None:
-        """Track these tokens. Safe to call every slot — new ids resubscribe."""
+        """Track these tokens. Safe to call every slot.
+
+        Always re-sends the COMPLETE asset list. The channel REPLACES a
+        connection's subscription rather than appending to it, so sending only
+        the newly-added ids silently subscribed to nothing: in production the
+        feed reported connected with 16 tracked tokens and books for only 4,
+        and every arb read quietly fell back to REST. The socket looked healthy
+        the whole time, which is exactly why the [ws]/[rest] tag in the log
+        matters.
+        """
         new = {t for t in token_ids if t}
         with self._lock:
             added = new - self._assets
             self._assets |= new
+            # Bound the subscription: each 5m slot adds two tokens forever, and
+            # long-dead markets push no updates but do bloat every resubscribe.
+            if len(self._assets) > MAX_TRACKED:
+                keep = [t for t in self._subscribe_order if t in self._assets]
+                keep = keep[-(MAX_TRACKED - len(new)):] + sorted(new)
+                self._assets = set(keep)
+            for t in sorted(new):
+                if t not in self._subscribe_order:
+                    self._subscribe_order.append(t)
+            full = sorted(self._assets)
         if added and self._connected and self._loop and self._ws:
             try:
                 asyncio.run_coroutine_threadsafe(
-                    self._subscribe(self._ws, sorted(added)), self._loop)
+                    self._subscribe(self._ws, full), self._loop)
             except Exception:
                 pass
 
