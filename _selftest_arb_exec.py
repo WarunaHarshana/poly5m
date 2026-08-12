@@ -175,6 +175,85 @@ ax.execute(c, MARKET, 0.44, 0.44, 5.0, depth_up=500.0, depth_down=7.0,
 check("a successful lock raises no alert", ax.open_alerts() == [],
       str(ax.open_alerts()))
 
+# ---------------------------------------------------------------------------
+print("T9 a fill must be POSITIVELY confirmed")
+# Believing an unfilled leg filled is the worst error available here: it sends
+# the second leg against a hedge that does not exist. An earlier version used
+# bool(resp.get("success", True)) plus a deny-list of statuses, so any
+# unanticipated response shape counted as a fill.
+class _RespClient(FakeClient):
+    """Returns a scripted response shape for the first leg."""
+    def __init__(self, resp, trades=None):
+        super().__init__({})
+        self.resp = resp
+        self._trades = trades
+
+    def buy(self, token_id, price, size, condition_id, order_type="GTC"):
+        self.buys.append((token_id, price, size, order_type))
+        return self.resp
+
+    def _client(self):
+        outer = self
+
+        class _C:
+            def get_trades(self):
+                if outer._trades is None:
+                    raise RuntimeError("CLOB unreachable")
+                return outer._trades
+        return _C()
+
+
+def first_leg_filled(resp, trades=None):
+    c = _RespClient(resp, trades)
+    r = ax.execute(c, MARKET, 0.44, 0.44, 5.0, depth_up=500.0, depth_down=7.0,
+                   bid_up=0.43, bid_down=0.43)
+    return (r.legs[0].filled if r.legs else None), r
+
+
+f1, _ = first_leg_filled({"status": "matched", "orderID": "o1"})
+check("an explicitly matched order counts as filled", f1 is True, str(f1))
+
+f2, _ = first_leg_filled({"status": "unmatched", "orderID": "o2"})
+check("an explicitly unmatched order does NOT", f2 is False, str(f2))
+
+f3, _ = first_leg_filled({"success": False, "errorMsg": "insufficient balance"})
+check("an explicit rejection does NOT", f3 is False, str(f3))
+
+# The dangerous one: a shape nobody anticipated.
+f4, r4 = first_leg_filled({"orderID": "o4", "status": "pending_new"},
+                          trades=[])
+check("an UNKNOWN status is not assumed filled", f4 is False, str(f4))
+
+# ...but if the venue confirms the match, believe the venue.
+f5, _ = first_leg_filled({"orderID": "o5", "status": "weird_new_status"},
+                         trades=[{"taker_order_id": "o5", "size": 5.0}])
+check("an unknown status IS filled when the venue confirms it", f5 is True,
+      str(f5))
+
+# ...and if the venue cannot be reached, refuse to guess.
+f6, r6 = first_leg_filled({"orderID": "o6", "status": "???"}, trades=None)
+check("an unverifiable response is treated as unfilled", f6 is False, str(f6))
+check("...and says so", "unverifiable" in (r6.legs[0].error or ""),
+      str(r6.legs[0].error))
+
+# A partial match on a FOK is not a fill.
+f7, _ = first_leg_filled({"orderID": "o7", "matched_amount": 3.0})
+check("a partial match is not a fill", f7 is False, str(f7))
+f8, _ = first_leg_filled({"orderID": "o8", "matched_amount": 5.0})
+check("a full match is a fill", f8 is True, str(f8))
+
+# "success" means the REQUEST succeeded on most order APIs, not that anything
+# traded. Treating it as a fill is the exact bug this function prevents.
+f9, _ = first_leg_filled({"orderID": "o9", "status": "success"}, trades=[])
+check("'success' is NOT taken as a fill", f9 is False, str(f9))
+
+# A raw-token-units amount (6-decimal USDC) must not read as a share count:
+# 5000000 >= 5 would otherwise fake a fill on an order that never matched.
+f10, _ = first_leg_filled({"orderID": "o10", "matched_amount": 5000000.0},
+                          trades=[])
+check("an implausible matched size is rejected, not trusted", f10 is False,
+      str(f10))
+
 print()
 if FAIL:
     raise SystemExit(f"SELFTEST_FAILED arb_exec: {FAIL}")

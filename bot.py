@@ -1431,6 +1431,13 @@ async def run_realtime(rounds: int = 100, paper: bool = True,
             return False
         if risk.halted or not risk.daily_loss_ok():
             return False
+        # Arb used to skip this. size_late_scalp calls max_trades_ok() for
+        # momentum, but arb never goes through the sizer, so a live arb could
+        # run past MAX_TRADES_PER_DAY unchecked — the cap silently applied to
+        # the strategy that no longer trades and not to the one that does.
+        if not risk.max_trades_ok():
+            print(f"  [arb] {risk.halt_reason or 'max trades/day'}; skip")
+            return False
 
         slip = float(getattr(config, "PAPER_FILL_SLIPPAGE", 0.01) or 0.0)
         leg_up = float(arb["ask_up"]) + slip
@@ -1478,6 +1485,19 @@ async def run_realtime(rounds: int = 100, paper: bool = True,
         if stake < 0.5 or stake > risk.bankroll - risk.open_exposure:
             print(f"  [arb] stake ${stake:.2f} not affordable "
                   f"(bankroll ${risk.bankroll:.2f}, open ${risk.open_exposure:.2f}); skip")
+            skips["arb_thin"] = skips.get("arb_thin", 0) + 1
+            return False
+        # Arb gets its OWN exposure cap, not the momentum one. MAX_EXPOSURE_USD
+        # is sized for a single directional leg ($1 under the live profile),
+        # while the cheapest legal arb pair is 5 shares a side — about $4.50.
+        # Reusing it here rejected every possible live arb, which would have
+        # looked like "live mode does nothing" rather than like a bug. The two
+        # risks are not comparable: a hedged pair cannot lose the way a naked
+        # leg can, so it earns its own limit.
+        exp_cap = float(getattr(config, "ARB_MAX_EXPOSURE_USD", 0) or 0)
+        if exp_cap > 0 and risk.open_exposure + stake > exp_cap + 1e-9:
+            print(f"  [arb] open ${risk.open_exposure:.2f} + ${stake:.2f} "
+                  f"exceeds ARB_MAX_EXPOSURE_USD ${exp_cap:.2f}; skip")
             skips["arb_thin"] = skips.get("arb_thin", 0) + 1
             return False
 

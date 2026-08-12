@@ -133,6 +133,36 @@ def evaluate(ask_up: float, ask_down: float, shares: float,
     return True, locked, "ok"
 
 
+def _verify_filled(client, order_id, shares) -> bool | None:
+    """Ask the venue whether `order_id` actually matched. None = unknowable.
+
+    Used only when a FOK response cannot be interpreted. Costs a round trip,
+    which is exactly the right trade against acting on a guess about whether we
+    are holding a position.
+    """
+    if not order_id:
+        return False
+    try:
+        c = client._client()
+        trades = c.get_trades()
+    except Exception:
+        return None
+    if not isinstance(trades, list):
+        return None
+    total = 0.0
+    for tr in trades:
+        try:
+            if tr.get("taker_order_id") == order_id:
+                total += float(tr.get("size") or 0.0)
+            else:
+                for mo in (tr.get("maker_orders") or []):
+                    if mo.get("order_id") == order_id:
+                        total += float(mo.get("matched_amount") or 0.0)
+        except (TypeError, ValueError, AttributeError):
+            continue
+    return total + 1e-9 >= float(shares)
+
+
 def execute(client, market: dict, ask_up: float, ask_down: float,
             shares: float, depth_up: float | None = None,
             depth_down: float | None = None,
@@ -170,20 +200,73 @@ def execute(client, market: dict, ask_up: float, ask_down: float,
         return res
 
     def _fok_buy(side, token, price):
+        """Send one FOK leg and decide, conservatively, whether it filled.
+
+        A fill must be POSITIVELY confirmed. An earlier version used
+        `bool(resp.get("success", True))` and a deny-list of status strings,
+        which meant any response shape the venue had not been anticipated to
+        return — a new status, a missing field, a wrapped payload — counted as
+        a fill. Believing an unfilled leg filled is the worst error available
+        here: it sends the second leg against a hedge that does not exist.
+
+        Ambiguity is therefore resolved against the venue, not guessed.
+        """
         try:
             resp = client.buy(token, price, shares, cond, order_type="FOK")
         except Exception as e:
             return LegResult(side, token, price, shares, False, error=str(e))
+
         oid = None
-        filled = False
+        status = ""
+        matched = None
         if isinstance(resp, dict):
             oid = resp.get("orderID") or resp.get("orderId") or resp.get("id")
-            status = str(resp.get("status") or "").lower()
-            # FOK either matched in full or was killed; treat anything not
-            # explicitly matched as unfilled rather than assuming success.
-            filled = bool(resp.get("success", True)) and status not in (
-                "unmatched", "cancelled", "canceled", "killed", "rejected")
-        return LegResult(side, token, price, shares, filled, order_id=oid)
+            status = str(resp.get("status") or resp.get("state") or "").lower()
+            # Only fields whose UNITS are known. `makingAmount` and friends are
+            # conventionally raw token base units (6-decimal USDC), so a $5
+            # order would report 5000000 and `5000000 >= 5 shares` would read
+            # as a full fill on an order that never matched. matched_amount is
+            # the one corroborated elsewhere in this codebase (bot.py's live
+            # fill check reads it from get_trades), and a value that cannot be
+            # a plausible share count is discarded rather than trusted.
+            for k in ("matched_amount", "size_matched", "filled_size"):
+                if resp.get(k) is not None:
+                    try:
+                        val = float(resp[k])
+                    except (TypeError, ValueError):
+                        continue
+                    if 0 <= val <= max(float(shares) * 100.0, 1000.0):
+                        matched = val
+                        break
+            if resp.get("success") is False or resp.get("errorMsg"):
+                return LegResult(side, token, price, shares, False,
+                                 order_id=oid,
+                                 error=str(resp.get("errorMsg") or "rejected"))
+
+        # Only words that unambiguously mean MATCHED. "success" and "complete"
+        # were here and had to go: on most order APIs "success" means the
+        # request was accepted, not that anything traded — which is precisely
+        # the assume-a-fill bug this function exists to prevent. Anything else
+        # falls through to _verify_filled, which asks the venue.
+        POSITIVE = ("matched", "filled")
+        NEGATIVE = ("unmatched", "cancelled", "canceled", "killed", "rejected",
+                    "expired", "failed")
+        if matched is not None:
+            filled = matched + 1e-9 >= float(shares)
+        elif status in NEGATIVE:
+            filled = False
+        elif status in POSITIVE:
+            filled = True
+        else:
+            # Unknown shape. Ask the venue what actually happened rather than
+            # picking the convenient answer.
+            filled = _verify_filled(client, oid, shares)
+            if filled is None:
+                return LegResult(side, token, price, shares, False,
+                                 order_id=oid,
+                                 error=f"unverifiable response (status={status!r}); "
+                                       f"treated as UNFILLED")
+        return LegResult(side, token, price, shares, bool(filled), order_id=oid)
 
     leg1 = _fok_buy(first[0], first[1], first[2])
     if not leg1.filled:

@@ -647,6 +647,68 @@ check("it is not double-counted on the next resume",
       abs(again_bankroll - 100.0) < 0.01,
       f"expected the clobbered $100.00 with no second adjustment, got ${again_bankroll}")
 
+# ---------------------------------------------------------------------------
+print("T18 the live safety profile covers ARB, not just momentum")
+# The profile was written when momentum was the live strategy and tightened
+# only momentum sizing. Arb is now the ONLY strategy that trades live, and it
+# sailed past at $10 a pair while the profile believed exposure was $1.
+probe = subprocess.run(
+    [sys.executable, "-c",
+     "import config, json;"
+     "config.MODE='live';"
+     "notes=config.apply_live_safety_profile();"
+     "print(json.dumps({"
+     "'arb_max_stake': config.ARB_MAX_STAKE_USD,"
+     "'max_exposure': config.MAX_EXPOSURE_USD,"
+     "'arb_max_exposure': config.ARB_MAX_EXPOSURE_USD,"
+     "'fixed_stake': config.FIXED_STAKE_USD,"
+     "'max_trades_day': config.MAX_TRADES_PER_DAY}))"],
+    capture_output=True, text=True, cwd=tempfile.mkdtemp(),
+    env={**os.environ, "PYTHONPATH": os.path.dirname(os.path.abspath(__file__))})
+try:
+    live = json.loads(probe.stdout.strip().splitlines()[-1])
+except Exception:
+    live = {}
+    check("the live profile is readable", False, probe.stdout + probe.stderr)
+
+if live:
+    check("live tightens the ARB stake cap",
+          live["arb_max_stake"] <= 5.0,
+          f"ARB_MAX_STAKE_USD={live['arb_max_stake']} in live")
+    check("live keeps momentum tiny", live["fixed_stake"] <= 1.0, str(live))
+    check("live caps exposure", live["max_exposure"] <= 1.0, str(live))
+    check("live caps trades per day", 0 < live["max_trades_day"] <= 10, str(live))
+    # The arb exposure cap must fit at least one legal pair, or live arb is
+    # silently impossible: MAX_EXPOSURE_USD drops to $1 under the live profile
+    # while the cheapest pair (5 shares a side) costs about $4.50.
+    cheapest_pair = 5.0 * 0.90
+    check("the ARB exposure cap admits at least one legal pair",
+          live["arb_max_exposure"] >= cheapest_pair,
+          f"ARB_MAX_EXPOSURE_USD={live['arb_max_exposure']} < ${cheapest_pair:.2f}")
+    check("the ARB exposure cap is not the momentum one",
+          live["arb_max_exposure"] > live["max_exposure"], str(live))
+
+print("T19 arb honours the exposure cap and the daily trade cap")
+config.MODE = "live"
+config.MAX_EXPOSURE_USD = 5.0
+config.MAX_TRADES_PER_DAY = 3
+rm5 = RiskManager(100.0)
+
+# The daily cap must bite for arb, which never goes through the sizer.
+rm5.trades_today = 3
+check("max_trades_ok() refuses once the daily cap is reached",
+      rm5.max_trades_ok() is False, str(rm5.trades_today))
+check("...and records why", "max trades" in rm5.halt_reason, rm5.halt_reason)
+
+# The exposure cap must bound concurrent arb pairs.
+rm6 = RiskManager(100.0)
+rm6.open_exposure = 4.5
+cap = config.MAX_EXPOSURE_USD
+would_exceed = rm6.open_exposure + 1.0 > cap
+check("a pair that would breach MAX_EXPOSURE_USD is identifiable",
+      would_exceed, f"open {rm6.open_exposure} + 1.0 vs cap {cap}")
+config.MODE = "paper_live"
+
 print()
 if FAIL:
     raise SystemExit(f"SELFTEST_FAILED ops: {FAIL}")

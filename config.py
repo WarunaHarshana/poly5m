@@ -331,6 +331,13 @@ ARB_MIN_REMAINING = int(os.getenv("ARB_MIN_REMAINING", "20"))
 # buying information at the venue minimum, not as an investment.
 # arb_executor.stats() reports the lock rate as it accumulates.
 ARB_LIVE_ENABLED = _env_bool("ARB_LIVE_ENABLED", False)
+# Total USD that may sit in open arb PAIRS at once. Separate from
+# MAX_EXPOSURE_USD, which sizes a single directional leg and drops to $1 under
+# the live profile — the cheapest legal pair is 5 shares a side, roughly $4.50,
+# so sharing that cap silently rejected every live arb. A hedged pair cannot
+# lose the way a naked leg can, so it gets its own limit; two concurrent pairs
+# at the live stake cap is the intent.
+ARB_MAX_EXPOSURE_USD = float(os.getenv("ARB_MAX_EXPOSURE_USD", "20.0"))
 
 # Pushed order book over the venue's market WebSocket. Falls back to REST per
 # scan when the socket is down or the book is stale, so an outage degrades the
@@ -476,6 +483,7 @@ def apply_live_safety_profile() -> list[str]:
     global EDGE_THRESHOLD, MIN_EV, MAX_SPREAD, FEE_BUFFER
     global MIN_ENTRY_PRICE, MAX_ENTRY_PRICE, MIN_CONFIDENCE, MIN_MOVE_USD
     global BASE_TRADE_USD, MAX_TRADE_USD, MAX_EXPOSURE_USD, FIXED_STAKE_USD
+    global ARB_MAX_STAKE_USD, ARB_MAX_EXPOSURE_USD
     global DAILY_LOSS_LIMIT_USD, DAILY_LOSS_LIMIT_PCT, MAX_TRADES_PER_DAY
     global MAX_CONSECUTIVE_LOSSES, KELLY_FRACTION, BTC_PRICE_SOURCES
     global MIN_SLOT_SECONDS, MAX_TRADE_REMAINING, MIN_ASK_SIZE
@@ -513,6 +521,19 @@ def apply_live_safety_profile() -> list[str]:
     MAX_TRADE_USD = min(MAX_TRADE_USD, FIXED_STAKE_USD)
     MAX_EXPOSURE_USD = min(MAX_EXPOSURE_USD, FIXED_STAKE_USD)
     notes.append(f"fixed stake ${FIXED_STAKE_USD:.2f}, max exposure ${MAX_EXPOSURE_USD:.2f}")
+
+    # Arb needs its own cap. This whole profile was written when momentum was
+    # the live strategy, and it tightens momentum sizing only — so arb, which
+    # is now the ONLY strategy that trades live, sailed past it at $10 a pair
+    # while the profile believed exposure was capped at $1.
+    _arb_cap = float(os.getenv("ARB_LIVE_MAX_STAKE_USD", "5.0"))
+    if ARB_MAX_STAKE_USD > _arb_cap:
+        notes.append(f"ARB_MAX_STAKE_USD: {ARB_MAX_STAKE_USD} -> {_arb_cap}")
+        ARB_MAX_STAKE_USD = _arb_cap
+    _arb_exp = float(os.getenv("ARB_LIVE_MAX_EXPOSURE_USD", "10.0"))
+    if ARB_MAX_EXPOSURE_USD > _arb_exp:
+        notes.append(f"ARB_MAX_EXPOSURE_USD: {ARB_MAX_EXPOSURE_USD} -> {_arb_exp}")
+        ARB_MAX_EXPOSURE_USD = _arb_exp
 
     DAILY_LOSS_LIMIT_USD = tighten_max("DAILY_LOSS_LIMIT_USD", DAILY_LOSS_LIMIT_USD, 5.0)
     # PCT=0 means "use absolute $ limit only" — do NOT force 5% back on
