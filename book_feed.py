@@ -55,6 +55,9 @@ STALE_CHECK_S = float(os.getenv("BOOK_FEED_STALE_CHECK_S", "10"))
 STALE_RECONNECT_S = float(os.getenv("BOOK_FEED_STALE_RECONNECT_S", "45"))
 # How often to re-send the subscription so a dropped one self-heals.
 RESUBSCRIBE_S = float(os.getenv("BOOK_FEED_RESUBSCRIBE_S", "20"))
+# Recycle the connection on a timer. Subscriptions decay the longer they live,
+# and a reconnect is cheap (~1s) next to running blind on a stale book.
+MAX_CONN_AGE_S = float(os.getenv("BOOK_FEED_MAX_CONN_AGE_S", "240"))
 
 
 @dataclass
@@ -244,11 +247,24 @@ class BookFeed:
         every read silently falls back to REST — observed in production after
         ~100 minutes, message count stuck at 86813.
         """
+        opened = time.time()
         while True:
             await asyncio.sleep(STALE_CHECK_S)
             quiet = time.time() - self._last_msg_at
+            age = time.time() - opened
+            reason = ""
             if quiet > STALE_RECONNECT_S:
-                self.last_error = (f"no data for {quiet:.0f}s; forcing reconnect")
+                reason = f"no data for {quiet:.0f}s"
+            elif MAX_CONN_AGE_S > 0 and age > MAX_CONN_AGE_S:
+                # A long-lived subscription decays. Measured over 100s on a
+                # fresh connection: 3893 events in the first 10s falling to
+                # 1336 by the last, and far worse without periodic
+                # resubscribes. Rather than keep hunting the cause, recycle the
+                # connection on a timer — a reconnect costs a second and buys a
+                # clean subscription with fresh snapshots.
+                reason = f"connection aged {age / 60:.1f}min"
+            if reason:
+                self.last_error = f"{reason}; forcing reconnect"
                 print(f"  [book] {self.last_error}")
                 try:
                     await ws.close()
