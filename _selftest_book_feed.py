@@ -377,6 +377,29 @@ check("the refresh beat is faster than the staleness gate",
       book_feed.RESUBSCRIBE_S < book_feed.STALE_RECONNECT_S,
       f"{book_feed.RESUBSCRIBE_S} vs {book_feed.STALE_RECONNECT_S}")
 
+# ---------------------------------------------------------------------------
+print("T10 our own PONG must not count as liveness")
+# The keepalive answers PONG every 10s. Counting that as traffic kept the
+# watchdog permanently satisfied on a socket that had stopped delivering books:
+# production sat at a frozen message count for minutes while live stayed True.
+fp = BookFeed()
+fp._last_msg_at = time.time() - 300
+before = fp._last_msg_at
+fp._handle("PONG")
+check("a PONG does not refresh liveness", fp._last_msg_at == before,
+      f"moved by {fp._last_msg_at - before:.1f}s")
+check("a PONG is not counted as a message", fp.messages == 0, str(fp.messages))
+
+fp._handle(snapshot(UP, 0.42, 0.44))
+check("real data DOES refresh liveness", fp._last_msg_at > before)
+check("real data is counted", fp.messages >= 1, str(fp.messages))
+
+fp._connected = True
+fp._last_msg_at = time.time() - (book_feed.STALE_RECONNECT_S + 5)
+fp._handle("PONG")
+check("a socket answering only PONG still reads as NOT live",
+      fp.status()["live"] is False, str(fp.status()))
+
 print()
 if FAIL:
     raise SystemExit(f"SELFTEST_FAILED book_feed: {FAIL}")

@@ -174,7 +174,12 @@ class BookFeed:
                     resub = asyncio.create_task(self._resubscriber(ws))
                     try:
                         async for raw in ws:
-                            self._last_msg_at = time.time()
+                            # NOTE: liveness is stamped inside _handle, only for
+                            # real DATA. Stamping it here counted our own PONG
+                            # replies as traffic, so the keepalive kept the
+                            # watchdog permanently satisfied on a socket that
+                            # had stopped delivering books entirely — message
+                            # count frozen for minutes while live stayed True.
                             self._handle(raw)
                     finally:
                         pinger.cancel()
@@ -291,7 +296,10 @@ class BookFeed:
     # -- message handling --------------------------------------------------
     def _handle(self, raw) -> None:
         if raw == "PONG":
+            # Our own keepalive echo. Deliberately does NOT count as liveness:
+            # a socket can answer PONG forever while delivering no book data.
             return
+        self._last_msg_at = time.time()
         try:
             msg = json.loads(raw)
         except (ValueError, TypeError):
