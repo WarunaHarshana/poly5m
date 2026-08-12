@@ -2073,10 +2073,16 @@ function everySecond() {
       bf.style.color = 'var(--dim)';
       bf.title = 'No websocket feed — the bot is polling the book over REST.';
     } else if (st.connected) {
-      bf.textContent = `BOOK: WS ${st.books || 0}/${st.tracked_tokens || 0}`;
-      bf.style.color = 'var(--won, #22c55e)';
-      bf.title = `Pushed real-time book. ${st.messages || 0} messages, `
-               + `${st.reconnects || 0} reconnects.`;
+      // The hit rate is what matters: a connected socket the scanner never
+      // reads is indistinguishable from a working one without it.
+      const hr = st.ws_hit_rate_pct;
+      bf.textContent = `BOOK: WS ${hr === null || hr === undefined ? '—' : hr + '%'}`;
+      bf.style.color = (hr !== null && hr !== undefined && hr < 50)
+                       ? '#fbbf24' : 'var(--won, #22c55e)';
+      bf.title = `Pushed real-time book. ${st.books || 0}/${st.tracked_tokens || 0} `
+               + `books, ${st.messages || 0} messages, ${st.reconnects || 0} reconnects. `
+               + `Arb scans sourced from the socket: ${st.scans_ws || 0}, `
+               + `fell back to REST: ${st.scans_rest || 0}.`;
     } else {
       bf.textContent = 'BOOK: WS DOWN';
       bf.style.color = '#f87171';

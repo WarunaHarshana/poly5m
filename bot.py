@@ -264,6 +264,10 @@ _status: dict = {}
 # Set by run_realtime once the book feed exists, so write_status can report its
 # health without threading the object through every call site.
 _book_feed_ref: dict = {"feed": None}
+# How every arb scan sourced its quote. The hit rate is the only honest measure
+# of whether the socket is doing its job; the per-signal [ws]/[rest] tag only
+# fires on the rare scan that finds a gap.
+_scan_src: dict = {"ws": 0, "rest": 0, "no_feed": 0}
 # Trades placed but not yet settled. Since settlement moved to background
 # tasks the main loop keeps writing status for the NEXT slot, which clobbered
 # the "holding" snapshot — the dashboard showed phase=waiting/side=None while
@@ -304,7 +308,13 @@ def write_status(**kw):
     # REST behaves identically from the outside, so it has to be stated.
     if _book_feed_ref.get("feed") is not None:
         try:
-            _status["book_feed"] = _book_feed_ref["feed"].status()
+            st = _book_feed_ref["feed"].status()
+            total = _scan_src["ws"] + _scan_src["rest"]
+            st["scans_ws"] = _scan_src["ws"]
+            st["scans_rest"] = _scan_src["rest"]
+            st["ws_hit_rate_pct"] = (round(100.0 * _scan_src["ws"] / total, 1)
+                                     if total else None)
+            _status["book_feed"] = st
         except Exception:
             pass
     try:
@@ -802,6 +812,14 @@ def _scan_sum_to_one_arb(pub, market, feed=None) -> dict | None:
                 p_up, p_dn = snap.ask_up, snap.ask_down
                 up_sz, dn_sz = snap.size_up, snap.size_down
                 src = f"ws({snap.age_s * 1000:.0f}ms)"
+                _scan_src["ws"] += 1
+            else:
+                # Counted, because only signal-FINDING scans get logged and
+                # those are rare — two REST lines told us nothing about whether
+                # the socket was being used 99% of the time or 0% of it.
+                _scan_src["rest"] += 1
+        else:
+            _scan_src["no_feed"] += 1
         if p_up is None or p_dn is None:
             q_up = _quote_side(pub, market, "UP")
             q_dn = _quote_side(pub, market, "DOWN")
