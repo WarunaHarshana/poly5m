@@ -421,15 +421,32 @@ def _norm_addr(addr: str | None) -> str:
     return a
 
 
+def _wallet_setting(env: dict, key: str, default: str = "") -> str:
+    """Read a wallet setting the way the BOT reads it: .env, then environment.
+
+    The wizard originally looked only at the local .env file, which is correct
+    for a laptop and wrong everywhere else. On a container platform .env is
+    dockerignored and does not exist, while the real values arrive as service
+    variables — so the dashboard reported "private key not set" and refused to
+    check the balance on a deployment that was, in fact, fully configured. That
+    is the one screen someone uses to confirm their setup before risking money,
+    so it has to reflect what config.py actually sees.
+    """
+    val = (env.get(key) or "").strip()
+    if val:
+        return val
+    return (os.getenv(key) or default).strip()
+
+
 def _wallet_status() -> dict:
     env = _parse_env_file()
-    pk = (env.get("PRIVATE_KEY") or "").strip()
-    funder = _norm_addr(env.get("FUNDER_ADDRESS"))
+    pk = _wallet_setting(env, "PRIVATE_KEY")
+    funder = _norm_addr(_wallet_setting(env, "FUNDER_ADDRESS"))
     try:
-        sig = int(env.get("SIGNATURE_TYPE") or "0")
+        sig = int(_wallet_setting(env, "SIGNATURE_TYPE") or "0")
     except ValueError:
         sig = 0
-    live_confirm = (env.get("LIVE_CONFIRM") or "").strip().lower() in (
+    live_confirm = _wallet_setting(env, "LIVE_CONFIRM").lower() in (
         "yes", "y", "true", "1")
     pk_ok = bool(pk) and len(pk) >= 32
     funder_ok = bool(re.fullmatch(r"0x[0-9a-fA-F]{40}", funder or ""))
@@ -546,15 +563,20 @@ def _fetch_polymarket_balance() -> dict:
     """
     global _last_balance_ok, _balance_in_flight
     env = _parse_env_file()
-    pk = (env.get("PRIVATE_KEY") or "").strip()
-    funder = _norm_addr(env.get("FUNDER_ADDRESS"))
+    # Same source order as the bot: .env first, then service variables. Reading
+    # only .env made this endpoint refuse to check the balance on a deployment
+    # whose credentials were set as environment variables — i.e. exactly the
+    # pre-live sanity check it exists for.
+    pk = _wallet_setting(env, "PRIVATE_KEY")
+    funder = _norm_addr(_wallet_setting(env, "FUNDER_ADDRESS"))
     if not pk or not funder:
         return {
             "ok": False,
             "balance_usd": None,
             "allowance_usd": None,
             "funder": funder or None,
-            "error": "Save private key + funder in Live Wallet Setup first.",
+            "error": "No PRIVATE_KEY / FUNDER_ADDRESS in .env or the "
+                     "environment.",
             "ts": __import__("time").time(),
         }
     # Collapse concurrent dashboard polls (15s interval can overlap with 30s timeout).

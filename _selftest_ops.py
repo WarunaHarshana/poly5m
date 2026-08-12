@@ -709,6 +709,62 @@ check("a pair that would breach MAX_EXPOSURE_USD is identifiable",
       would_exceed, f"open {rm6.open_exposure} + 1.0 vs cap {cap}")
 config.MODE = "paper_live"
 
+# ---------------------------------------------------------------------------
+print("T20 the wallet wizard reads service variables, not just .env")
+# The wizard looked only at a local .env file, which is right on a laptop and
+# wrong on a container platform: .env is dockerignored, so a deployment whose
+# credentials arrive as service variables reported "private key not set" and
+# refused to check the balance. That is the one screen used to confirm a setup
+# before risking money, so it must reflect what config.py actually sees.
+# app derives ENV_PATH from its own module directory, not the cwd, so a
+# developer's real .env is always found locally. Point it at a nonexistent file
+# to reproduce the container, where .env is dockerignored and absent — the
+# precedence itself (.env wins when present) is intended and unchanged.
+wallet_probe = subprocess.run(
+    [sys.executable, "-c",
+     "import app, json;"
+     "app._parse_env_file = lambda *a, **k: {};"   # container: no .env at all
+     "print(json.dumps(app._wallet_status()))"],
+    capture_output=True, text=True,
+    cwd=tempfile.mkdtemp(),
+    env={**os.environ,
+         "NO_BROWSER": "1",
+         "PYTHONPATH": os.path.dirname(os.path.abspath(__file__)),
+         "STATE_ROOT": tempfile.mkdtemp(),
+         "PRIVATE_KEY": "0x" + "1" * 64,
+         "FUNDER_ADDRESS": "0x" + "a" * 40,
+         "SIGNATURE_TYPE": "3",
+         "LIVE_CONFIRM": "yes"})
+try:
+    ws = json.loads(wallet_probe.stdout.strip().splitlines()[-1])
+except Exception:
+    ws = {}
+    check("wallet status is readable", False,
+          (wallet_probe.stdout + wallet_probe.stderr)[:300])
+
+if ws:
+    check("a key set as a service variable is seen",
+          ws["private_key_set"] is True, str(ws))
+    check("the funder address is seen",
+          ws["funder_address"].lower() == "0x" + "a" * 40, str(ws))
+    check("SIGNATURE_TYPE comes from the environment",
+          ws["signature_type"] == 3, str(ws))
+    check("LIVE_CONFIRM comes from the environment",
+          ws["live_confirm"] is True, str(ws))
+    check("the wizard reports ready", ws["ready"] is True, str(ws))
+    check("the key itself is never returned",
+          "1" * 64 not in json.dumps(ws), "PRIVATE KEY LEAKED IN /api/wallet")
+
+# The image must be able to build a live client at all, or MODE=live dies at
+# startup and the balance check can never confirm a wallet.
+reqs = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "requirements.txt"), encoding="utf-8").read()
+check("the deployed image installs the CLOB client",
+      "py-clob-client-v2" in reqs and
+      not any(l.strip().startswith("#") and "py-clob-client-v2" in l
+              for l in reqs.splitlines() if "py-clob-client-v2" in l),
+      "py-clob-client-v2 missing from requirements.txt")
+
 print()
 if FAIL:
     raise SystemExit(f"SELFTEST_FAILED ops: {FAIL}")

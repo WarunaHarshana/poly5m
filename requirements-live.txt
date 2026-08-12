@@ -1,6 +1,5 @@
-# Real-money trading only (MODE=live). Not needed for paper or paper_live.
-#   pip install -r requirements.txt -r requirements-live.txt
+# The live-trading client now ships in requirements.txt, because the
+# deployed image is the one that goes live and must be able to build a
+# wallet client to verify itself before any money moves.
+# Kept as an alias so existing instructions keep working.
 -r requirements.txt
-
-# Pulls eth-account / eth-abi / py-order-utils for order signing.
-py-clob-client-v2>=0.1.0

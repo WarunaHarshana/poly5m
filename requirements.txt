@@ -5,9 +5,10 @@ requests>=2.31
 python-dotenv>=1.0
 websockets>=12.0          # Polymarket RTDS Chainlink Data Stream (btc/usd)
 
-# Real-money trading (MODE=live) additionally needs the Polymarket CLOB V2
-# client — see requirements-live.txt. It is kept out of this file on purpose:
-# every py_clob_client_v2 import in polymarket_client.py sits inside a function,
-# so paper mode never touches it, and it drags in the whole eth-account stack.
-# Installing it in the paper image would add minutes to every deploy for code
-# that never runs there.
+# Real-money trading and the wallet/balance checks. Previously split out to
+# keep the paper image lean, which was right while the deployment was paper
+# only — but the image is now the one that goes live, and without this
+# MODE=live dies at startup on ModuleNotFoundError while /api/balance can
+# never confirm a wallet. A slower build is a fair price for a deployment that
+# can actually be verified before money goes in.
+py-clob-client-v2>=0.1.0
