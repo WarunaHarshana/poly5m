@@ -991,9 +991,21 @@ async def run_realtime(rounds: int = 100, paper: bool = True,
     print(f"  edge gates: floor {lm_min_edge:+.2f} / ceiling "
           f"{lm_max_edge:.2f} (0=off)  chainlink_strike_required={require_cl_strike}  "
           f"pause_after_loss={late_pause_n}")
+    # This banner used to say "LIVE: log-only (leg risk)" unconditionally,
+    # left over from before live arb was wired. With ARB_LIVE_ENABLED=1 the bot
+    # really does place FOK orders, so the banner was telling the operator that
+    # nothing would trade while real money was about to move.
+    if paper:
+        _arb_exec_label = "PAPER exec (simulated fills)"
+    elif bool(getattr(config, "ARB_LIVE_ENABLED", False)):
+        _arb_exec_label = ("LIVE EXEC — REAL ORDERS (FOK both legs, "
+                           "unwind on a stranded leg)")
+    else:
+        _arb_exec_label = "LIVE: log-only (ARB_LIVE_ENABLED=0)"
     print(f"  [arb] sum-to-one scanner: {'ON' if arb_on else 'off'}  "
           f"min_edge={arb_min_edge:.3f}  max_stake=${arb_max_stake:.2f}  "
-          f"{'PAPER exec' if paper else 'LIVE: log-only (leg risk)'}")
+          f"max_exposure=${float(getattr(config, 'ARB_MAX_EXPOSURE_USD', 0) or 0):.2f}  "
+          f"{_arb_exec_label}")
     # Print the modes that change WHETHER we trade, not just how. Without this
     # the only evidence that observe-only is live is the absence of trades,
     # which is indistinguishable from a quiet market.

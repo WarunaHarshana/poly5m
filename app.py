@@ -443,9 +443,13 @@ def _wallet_status() -> dict:
     pk = _wallet_setting(env, "PRIVATE_KEY")
     funder = _norm_addr(_wallet_setting(env, "FUNDER_ADDRESS"))
     try:
-        sig = int(_wallet_setting(env, "SIGNATURE_TYPE") or "0")
+        # Default must match config.SIGNATURE_TYPE (3), not 0. The wizard
+        # defaulted to 0 and so reported "Signature type set (0)" on a bot that
+        # was actually authenticating with type 3 — sending the operator to
+        # debug a setting that was already right.
+        sig = int(_wallet_setting(env, "SIGNATURE_TYPE") or "3")
     except ValueError:
-        sig = 0
+        sig = 3
     live_confirm = _wallet_setting(env, "LIVE_CONFIRM").lower() in (
         "yes", "y", "true", "1")
     pk_ok = bool(pk) and len(pk) >= 32
