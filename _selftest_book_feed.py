@@ -282,6 +282,63 @@ check("the tracked set is capped", len(f2._assets) <= book_feed.MAX_TRACKED,
 check("the newest slot is never pruned",
       {"s11a", "s11b"} <= f2._assets, str(sorted(f2._assets)))
 
+# ---------------------------------------------------------------------------
+print("T8 a silent socket is not 'healthy'")
+# A half-open connection keeps TCP up while no data flows. `async for` never
+# raises, so without a watchdog the feed reports connected=true forever with a
+# frozen message count while every read falls back to REST. Seen in production
+# after ~100 minutes, stuck at 86813 messages.
+f = BookFeed()
+f._connected = True
+f._last_msg_at = time.time()
+st = f.status()
+check("a freshly-fed socket is live", st["live"] is True, str(st))
+check("quiet time is reported", st["quiet_s"] < 1.0, str(st))
+
+f._last_msg_at = time.time() - (book_feed.STALE_RECONNECT_S + 5)
+st = f.status()
+check("a silent socket is NOT live even though connected",
+      st["connected"] is True and st["live"] is False, str(st))
+check("the silence duration is visible",
+      st["quiet_s"] > book_feed.STALE_RECONNECT_S, str(st))
+check("the reconnect threshold is well under a slot",
+      book_feed.STALE_RECONNECT_S < 300, str(book_feed.STALE_RECONNECT_S))
+
+# The watchdog itself: it must close a silent socket, and leave a busy one be.
+import asyncio as _a2
+
+
+class _WS:
+    def __init__(self):
+        self.closed = False
+
+    async def close(self):
+        self.closed = True
+
+
+def _run_watchdog(quiet_for):
+    fd = BookFeed()
+    fd._last_msg_at = time.time() - quiet_for
+    ws = _WS()
+    orig_check, orig_recon = book_feed.STALE_CHECK_S, book_feed.STALE_RECONNECT_S
+    book_feed.STALE_CHECK_S = 0.01
+    book_feed.STALE_RECONNECT_S = 5.0
+    try:
+        _a2.run(_a2.wait_for(fd._watchdog(ws), timeout=1.0))
+    except (_a2.TimeoutError, Exception):
+        pass
+    finally:
+        book_feed.STALE_CHECK_S, book_feed.STALE_RECONNECT_S = orig_check, orig_recon
+    return ws.closed, fd
+
+
+closed_silent, fd_s = _run_watchdog(quiet_for=60)
+check("the watchdog closes a silent socket", closed_silent)
+check("it says why", "no data" in fd_s.last_error, fd_s.last_error)
+
+closed_busy, _ = _run_watchdog(quiet_for=0)
+check("it leaves a busy socket alone", not closed_busy)
+
 print()
 if FAIL:
     raise SystemExit(f"SELFTEST_FAILED book_feed: {FAIL}")

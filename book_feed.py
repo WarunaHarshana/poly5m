@@ -48,6 +48,11 @@ DEFAULT_MAX_AGE_S = 2.0
 # Cap the subscription. Every 5m slot adds two token ids; resolved markets stop
 # pushing updates but still bloat each resubscribe frame.
 MAX_TRACKED = int(os.getenv("BOOK_FEED_MAX_TRACKED", "8"))
+# Watchdog: how often to check for silence, and how long a silence means the
+# connection is dead. These markets push thousands of events a minute, so tens
+# of seconds of nothing is never normal.
+STALE_CHECK_S = float(os.getenv("BOOK_FEED_STALE_CHECK_S", "10"))
+STALE_RECONNECT_S = float(os.getenv("BOOK_FEED_STALE_RECONNECT_S", "45"))
 
 
 @dataclass
@@ -114,6 +119,7 @@ class BookFeed:
         self.messages = 0
         self.reconnects = 0
         self.last_error: str = ""
+        self._last_msg_at: float = time.time()
 
     # -- lifecycle ---------------------------------------------------------
     def start(self) -> None:
@@ -162,11 +168,14 @@ class BookFeed:
                     backoff = 1.0
                     await self._subscribe(ws, sorted(self._assets))
                     pinger = asyncio.create_task(self._ping(ws))
+                    watchdog = asyncio.create_task(self._watchdog(ws))
                     try:
                         async for raw in ws:
+                            self._last_msg_at = time.time()
                             self._handle(raw)
                     finally:
                         pinger.cancel()
+                        watchdog.cancel()
             except Exception as e:
                 self.last_error = str(e)
             finally:
@@ -185,6 +194,28 @@ class BookFeed:
             try:
                 await ws.send("PING")
             except Exception:
+                return
+
+    async def _watchdog(self, ws) -> None:
+        """Reconnect when the socket goes quiet.
+
+        The library's own keepalive is disabled (this service wants a text
+        PING), which means nothing detects a half-open connection: TCP stays up,
+        no data arrives, and `async for` blocks forever without raising. The
+        feed then reports connected=true with a frozen message count while
+        every read silently falls back to REST — observed in production after
+        ~100 minutes, message count stuck at 86813.
+        """
+        while True:
+            await asyncio.sleep(STALE_CHECK_S)
+            quiet = time.time() - self._last_msg_at
+            if quiet > STALE_RECONNECT_S:
+                self.last_error = (f"no data for {quiet:.0f}s; forcing reconnect")
+                print(f"  [book] {self.last_error}")
+                try:
+                    await ws.close()
+                except Exception:
+                    pass
                 return
 
     async def _subscribe(self, ws, assets: list[str]) -> None:
@@ -335,8 +366,13 @@ class BookFeed:
         with self._lock:
             tracked = len(self._assets)
             books = len(self._books)
+        quiet = time.time() - self._last_msg_at
         return {
+            # "connected" alone is not health: a half-open socket reports True
+            # forever. `live` also requires that data actually arrived recently.
             "connected": self._connected,
+            "live": bool(self._connected and quiet <= STALE_RECONNECT_S),
+            "quiet_s": round(quiet, 1),
             "tracked_tokens": tracked,
             "books": books,
             "messages": self.messages,

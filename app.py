@@ -2072,6 +2072,12 @@ function everySecond() {
       bf.textContent = 'BOOK: REST';
       bf.style.color = 'var(--dim)';
       bf.title = 'No websocket feed — the bot is polling the book over REST.';
+    } else if (st.connected && st.live === false) {
+      // Half-open: TCP up, no data. Reports connected forever without this.
+      bf.textContent = 'BOOK: WS STALLED';
+      bf.style.color = '#f87171';
+      bf.title = `Socket connected but silent for ${st.quiet_s}s — the `
+               + `watchdog will force a reconnect. Falling back to REST.`;
     } else if (st.connected) {
       // The hit rate is what matters: a connected socket the scanner never
       // reads is indistinguishable from a working one without it.
