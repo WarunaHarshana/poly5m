@@ -22,17 +22,13 @@ Gamma outcome after the slot closes so WON/LOST matches the website.
 from __future__ import annotations
 import asyncio
 import json
-import math
 import os
 import time
-from types import SimpleNamespace
 
 import config
-import observations
 import order_state
 import paths
-from price_feed import SimulatedPriceFeed, LivePriceFeed, ChainlinkDataStream
-from signal_engine import compute_signal, count_strike_crossings, fair_value
+from price_feed import LivePriceFeed, ChainlinkDataStream
 from risk import RiskManager
 from executor import PaperExecutor, Trade, stamp_trade_times
 from decision_journal import log_decision
@@ -330,17 +326,6 @@ def write_status(**kw):
 
 
 
-def market_price_from_model(model_prob_up: float, side: str, noise_rng) -> float:
-    """Offline-only synthetic mid: partial reaction to fair value + noise so an
-    edge only sometimes exists. Live/paper_live use the real book ask."""
-    fair = model_prob_up if side == "UP" else (1 - model_prob_up)
-    # Markets underreact to some degree; stickiness in [0.3, 0.8] leaves room
-    # for the stricter edge/EV filters to still fire on a subset of rounds.
-    stickiness = noise_rng.uniform(0.30, 0.80)
-    quote = 0.5 + (fair - 0.5) * stickiness + noise_rng.gauss(0, 0.04)
-    return min(0.95, max(0.05, quote))
-
-
 def _trade_archive_key(d: dict) -> str:
     return "|".join([
         str(d.get("ts", "")),
@@ -622,70 +607,6 @@ def persist(trades, risk, skip_counts: dict | None = None):
     return stats
 
 
-def run_sim(rounds: int = 200, sleep_between: float = 0.0, seed: int = 42):
-    """Offline paper simulation (MODE=paper)."""
-    import random
-    noise = random.Random(seed + 1)
-    feed = SimulatedPriceFeed(seed=seed)
-    risk = RiskManager(config.STARTING_BANKROLL)
-    executor = PaperExecutor()
-    trades: list[Trade] = []
-    skips = {"no_edge": 0}
-    write_status(phase="running", message="offline simulation")
-    persist(trades, risk, skips)  # clean slate visible immediately after --reset
-
-    for rid in range(1, rounds + 1):
-        if risk.halted:
-            print(f"[HALT] {risk.halt_reason}; stopping.")
-            break
-        for _ in range(config.MOMENTUM_LOOKBACK):
-            feed.step()
-        prices = feed.recent(config.MOMENTUM_LOOKBACK)
-        price_before = prices[-1]
-        sig = compute_signal(
-            prices,
-            sample_seconds=config.SAMPLE_SECONDS,
-            volatility_daily=config.VOLATILITY_DAILY,
-            vol_blend=config.VOL_BLEND,
-        )
-        # Synthetic ask: mid + half-spread so offline sim is not filled at mid.
-        mid = market_price_from_model(sig.model_prob_up, sig.side, noise)
-        half_spread = max(0.01, abs(noise.gauss(0.015, 0.008)))
-        mkt = min(0.97, mid + half_spread)
-        model_side_prob = sig.model_prob_up if sig.side == "UP" else (1 - sig.model_prob_up)
-        stake = risk.size_trade(model_side_prob, mkt, confidence=sig.confidence)
-        if stake <= 0:
-            skips["no_edge"] += 1
-            continue
-        shares = round(stake / mkt, 4)
-        trade = Trade(ts=time.time(), round_id=rid, side=sig.side,
-                      entry_price=round(mkt, 4), shares=shares, stake_usd=stake,
-                      model_prob=round(model_side_prob, 4),
-                      edge=round(model_side_prob - mkt, 4))
-        stamp_trade_times(trade)
-        risk.on_open(stake)
-        for _ in range(config.MOMENTUM_LOOKBACK):
-            feed.step()
-        price_after = feed.price()
-        trade = executor.open_and_resolve(trade, price_after >= price_before)
-        risk.on_close(stake, trade.pnl)
-        trade.bankroll_after = round(risk.bankroll, 2)
-        trades.append(trade)
-        flag = "WON " if trade.won else "LOST"
-        print(f"R{rid:>3} {sig.side:<4} entry={mkt:.2f} stake=${stake:>5.2f} "
-              f"edge={trade.edge:+.2f} conf={sig.confidence:.2f} -> {flag} "
-              f"pnl={trade.pnl:+.2f} bankroll=${risk.bankroll:.2f} "
-              f"@ {trade.time_et or trade.time_utc}")
-        if sleep_between:
-            time.sleep(sleep_between)
-
-    stats = persist(trades, risk, skips)
-    write_status(phase="stopped", message="simulation complete")
-    print("\n=== SUMMARY ===")
-    print(json.dumps(stats, indent=2))
-    return stats
-
-
 def _now(cl_stream: ChainlinkDataStream | None = None) -> float:
     """Wall time for slot math — prefer Chainlink stream clock (PC often drifts)."""
     if cl_stream is not None and cl_stream.ready:
@@ -857,48 +778,6 @@ def _scan_sum_to_one_arb(pub, market, feed=None) -> dict | None:
     return None
 
 
-async def _try_maker_entry(pub, market, side: str, best_ask: float,
-                           remaining: float | None) -> float | None:
-    """Rest one tick under the ask; return the fill price if we got filled.
-
-    PAPER FILL RULE (deliberately strict): we only count a fill when the
-    observed best ask drops to at or below our resting price — i.e. the
-    market actually traded down to us. Simply waiting never produces a fill.
-
-    Still slightly optimistic: it ignores queue position (other bids at our
-    price may absorb the flow first), so treat maker fill RATES from paper as
-    an upper bound. The fill PRICE and the zero fee are exact.
-    """
-    if not getattr(config, "MAKER_FIRST_ENABLED", True):
-        return None
-    tick = 0.01
-    ticks = max(1, int(getattr(config, "MAKER_IMPROVE_TICKS", 1) or 1))
-    limit = round(float(best_ask) - tick * ticks, 2)
-    if limit <= 0 or limit < float(getattr(config, "MIN_ENTRY_PRICE", 0) or 0):
-        return None
-    wait_s = float(getattr(config, "MAKER_WAIT_SECONDS", 3.0) or 0.0)
-    min_rem = float(getattr(config, "MAKER_MIN_REMAINING", 6.0) or 0.0)
-    if remaining is not None and remaining - wait_s < min_rem:
-        return None  # not enough slot left to wait then still act
-    if config.ROUND_SECONDS <= 0:
-        wait_s = min(wait_s, 0.05)  # fast/test mode
-    deadline = time.time() + wait_s
-    while time.time() < deadline:
-        await asyncio.sleep(min(0.5, max(0.05, wait_s / 6.0)))
-        q = await asyncio.to_thread(_quote_side, pub, market, side)
-        if not q:
-            continue
-        # best_ask is None when the book is one-sided and buy_quote fell back
-        # to the midpoint — use the executable price in that case, otherwise
-        # the fill check silently never triggers.
-        ba = q.get("best_ask")
-        if ba is None:
-            ba = q.get("price")
-        if ba is not None and float(ba) <= limit + 1e-9:
-            return limit
-    return None
-
-
 def _journal(session_id: str, mode: str, strategy: str, **kw):
     if not getattr(config, "DECISION_JOURNAL", True):
         return
@@ -915,25 +794,24 @@ async def run_realtime(rounds: int = 100, paper: bool = True,
                        resume: bool = False):
     """Real BTC data + real Polymarket quotes for the current 5-minute slot.
 
-    SINGLE strategy: late_momentum — in the last LATE_MOMENTUM window
-    (~8-40s left), if BTC moved >= LATE_MOMENTUM_MIN_MOVE from the slot's
-    Chainlink strike, buy the side the move points to (entry band + edge
-    floor/ceiling + book-quality gates). mid / late_scalp / late_every /
-    hybrid were retired 2026-07-17: archive data showed negative live
-    expectancy or paper results inflated by simulation bugs.
+    SINGLE strategy: sum-to-one ARB. When ask_UP + ask_DOWN < 1 - ARB_MIN_EDGE,
+    buying BOTH sides pays $1/share whichever way the slot resolves — a
+    structural mispricing, not a prediction. Each slot is scanned from the
+    moment it is discovered down to ARB_MIN_REMAINING seconds left; the tail is
+    too short to fill two legs, so it is waited out.
 
-    Alongside it, a sum-to-one ARB scanner watches every analyzed slot: when
-    ask_UP + ask_DOWN < 1 - ARB_MIN_EDGE, buying BOTH sides pays $1/share
-    whichever way the slot resolves (structural edge, no prediction).
-    Arb execution is PAPER-ONLY — live would need both legs to fill (leg
-    risk), which is not handled; in live mode signals are logged only.
+    Every directional strategy was retired on measurement. mid / late_scalp /
+    late_every / hybrid went on 2026-07-17 (negative live expectancy, or paper
+    results inflated by simulation bugs); late_momentum followed after 41
+    venue-confirmed trades at -$16.57 and 740+ priced slots showing the book
+    already prices the signal correctly to within ~1pp before fees.
 
     paper=True  -> simulated fills (MODE=paper_live), no wallet/money.
-    paper=False -> REAL orders (MODE=live), funded wallet required.
+    paper=False -> REAL orders (MODE=live), funded wallet required. Both legs
+                   go out FOK via arb_executor, which unwinds a stranded leg.
 
-    Resolution (matches Polymarket rules):
-      Up iff Chainlink Data Streams BTC/USD at end >= price at start of range.
-      Paper PnL prefers Gamma's official outcome; stream used for strike/signal.
+    Resolution: a locked pair pays either way, so the official Gamma outcome
+    only LABELS the row — it cannot change the PnL.
     """
     from polymarket_client import PolymarketPublic
     pub = PolymarketPublic()
@@ -967,39 +845,14 @@ async def run_realtime(rounds: int = 100, paper: bool = True,
         risk = RiskManager(config.STARTING_BANKROLL)
         live_client = PolymarketClient()
 
-    if hasattr(config, "apply_strategy_flags"):
-        config.apply_strategy_flags()
-
-    # --- late_momentum parameters ---
-    late_min = int(getattr(config, "LATE_MOMENTUM_MIN_REMAINING", 8))
-    late_max = int(getattr(config, "LATE_MOMENTUM_TIME_LIMIT", 40))
-    lm_min_move = float(getattr(config, "LATE_MOMENTUM_MIN_MOVE", 10.0))
-    lm_min_entry = float(getattr(config, "LATE_MOMENTUM_MIN_ENTRY", 0.55))
-    lm_max_entry = float(getattr(config, "LATE_MOMENTUM_MAX_ENTRY", 0.92))
-    lm_min_edge = float(getattr(config, "LATE_MOMENTUM_MIN_EDGE", 0.0) or 0.0)
-    lm_max_edge = float(getattr(config, "LATE_MOMENTUM_MAX_EDGE", 0.10) or 0.0)
-    late_pause_slots = 0  # cooldown after a loss
-    late_pause_n = int(getattr(config, "LATE_SCALP_PAUSE_SLOTS_AFTER_LOSS", 0) or 0)
-    # Momentum needs the real Chainlink strike — a proxy strike produced fake
-    # signals and unreliable local resolution in past sessions.
-    require_cl_strike = bool(getattr(config, "LATE_SCALP_REQUIRE_CHAINLINK", True))
-    # Entry band for sizing (risk.size_late_scalp reads config globals).
-    config.MIN_ENTRY_PRICE = lm_min_entry
-    config.MAX_ENTRY_PRICE = lm_max_entry
-    config.MIN_SLOT_SECONDS = late_min
-    config.MAX_TRADE_REMAINING = late_max
-
     # --- arb parameters ---
     arb_on = bool(getattr(config, "ARB_TRADE_ENABLED", True))
     arb_min_edge = float(getattr(config, "ARB_MIN_EDGE", 0.02) or 0.02)
     arb_min_rem = int(getattr(config, "ARB_MIN_REMAINING", 20))
     arb_max_stake = float(getattr(config, "ARB_MAX_STAKE_USD", 10.0) or 10.0)
 
-    print(f"[STRATEGY: late_momentum] window {late_min}-{late_max}s left  "
-          f"move>=${lm_min_move:.0f}  entry band [{lm_min_entry:.2f},{lm_max_entry:.2f}]")
-    print(f"  edge gates: floor {lm_min_edge:+.2f} / ceiling "
-          f"{lm_max_edge:.2f} (0=off)  chainlink_strike_required={require_cl_strike}  "
-          f"pause_after_loss={late_pause_n}")
+    print(f"[STRATEGY: sum-to-one arb] scanning each slot from open down to "
+          f"{arb_min_rem}s left")
     # This banner used to say "LIVE: log-only (leg risk)" unconditionally,
     # left over from before live arb was wired. With ARB_LIVE_ENABLED=1 the bot
     # really does place FOK orders, so the banner was telling the operator that
@@ -1015,13 +868,13 @@ async def run_realtime(rounds: int = 100, paper: bool = True,
           f"min_edge={arb_min_edge:.3f}  max_stake=${arb_max_stake:.2f}  "
           f"max_exposure=${float(getattr(config, 'ARB_MAX_EXPOSURE_USD', 0) or 0):.2f}  "
           f"{_arb_exec_label}")
-    # Print the modes that change WHETHER we trade, not just how. Without this
-    # the only evidence that observe-only is live is the absence of trades,
-    # which is indistinguishable from a quiet market.
-    print(f"  [modes] momentum_observe_only="
-          f"{'ON (recording only, no momentum trades)' if getattr(config, 'MOMENTUM_OBSERVE_ONLY', False) else 'off'}"
+    # Print the modes that change WHETHER we trade, not just how — otherwise a
+    # gate silently holding everything back is indistinguishable from a quiet
+    # market.
+    print(f"  [modes] scan_interval={float(getattr(config, 'ARB_SCAN_INTERVAL_S', 1.0)):.2f}s"
           f"  min_shares_sizing={'ON' if getattr(config, 'MIN_SHARES_SIZING', False) else 'off'}"
-          f"  quote_every_slot={'ON' if getattr(config, 'OBSERVE_QUOTE_ALWAYS', True) else 'off'}")
+          f"  book_feed={'ON' if getattr(config, 'BOOK_FEED_ENABLED', True) else 'off'}"
+          f"  min_order_shares={float(getattr(config, 'MIN_ORDER_SHARES', 5)):.0f}")
 
     label = "PAPER-LIVE (real data, simulated fills)" if paper else "LIVE (REAL MONEY)"
     strat_tag = config.strategy_name()
@@ -1124,7 +977,6 @@ async def run_realtime(rounds: int = 100, paper: bool = True,
     # every ~1s, and 40 near-identical rows would swamp the tuner's sample.
     obs_written: dict = {"end_ts": None}
     last_counted_end_ts = None  # count real slots, not poll iterations
-    last_traded_end_ts = None   # momentum: never re-enter a traded slot
     arb_done_end_ts = None      # arb: at most one attempt per slot
     early_seen_end_ts = None    # count slot_too_early once per slot
     time_guard_seen_end_ts = None  # log the time-guard verdict once per slot
@@ -1134,18 +986,22 @@ async def run_realtime(rounds: int = 100, paper: bool = True,
     # the FIRST settled trade, and the UI kept showing the old session.
     persist(trades, risk, skips)
 
-    async def _settle_trade(trade, stake, shares, order_id, market, question,
-                            end_ts, slot_start_time, slot_open_ref, strike_src,
-                            price_before, was_late, mkt, edge,
+    async def _settle_trade(trade, stake, shares, market, question,
+                            end_ts, slot_start_time, mkt, edge,
                             verified_fill=None, leg_order_ids=None):
-        """Hold to slot end, check live fills, resolve, book PnL, persist.
+        """Hold to slot end, resolve, book PnL, persist.
 
         Runs as a background task for real slots so the main loop can keep
-        analyzing the next slot while Gamma resolution is polled (this used to
+        scanning the next slot while Gamma resolution is polled (this used to
         block the loop for up to ~4.5 minutes per trade). Open exposure is
         released in risk.on_close, so the exposure caps still bound overlap.
+
+        An arb pair pays $1 on exactly one leg whichever way the slot lands, so
+        the outcome LABELS the row but cannot change its PnL. That is why there
+        is no local price comparison here any more: guessing a direction from a
+        local close price was wrong on 7 of the first 56 rows, and for an arb it
+        buys nothing even when it is right.
         """
-        nonlocal late_pause_slots
         try:
             hold = (end_ts - _now(cl_stream)) if end_ts else config.ROUND_SECONDS
             print(f"  holding {max(0, hold):.0f}s until the slot resolves...")
@@ -1175,69 +1031,21 @@ async def run_realtime(rounds: int = 100, paper: bool = True,
                 # with its shares and stake zeroed, while the wallet held the
                 # real position.
                 matched_shares = float(verified_fill)
-            elif not paper and live_client is not None:
-                try:
-                    if order_id:
-                        print(f"  [live fill] cancelling order {order_id} to check fills...")
-                        await asyncio.to_thread(live_client.cancel_order, str(order_id))
-                        try:
-                            c = live_client._client()
-                            trades_list = await asyncio.to_thread(c.get_trades)
-                            filled = 0.0
-                            if trades_list and isinstance(trades_list, list):
-                                for tr in trades_list:
-                                    # Match on the taker order id only — tr["id"]
-                                    # is the TRADE id, never our order id.
-                                    if tr.get("taker_order_id") == order_id:
-                                        filled += float(tr.get("size") or 0.0)
-                                    else:
-                                        maker_ords = tr.get("maker_orders") or []
-                                        for mo in maker_ords:
-                                            if mo.get("order_id") == order_id:
-                                                filled += float(mo.get("matched_amount") or 0.0)
-                            print(f"  [live fill] matched shares: {filled:.4f} "
-                                  f"(requested: {shares:.4f})")
-                            matched_shares = filled
-                        except Exception as fe:
-                            # NEVER assume a fill we could not confirm. This
-                            # used to "default to full size", which books a
-                            # position — and its PnL — off a failed API call:
-                            # a submitted order and a filled order are not the
-                            # same thing. Retry once, then treat as unfilled.
-                            print(f"  [live fill check error] {fe}; retrying "
-                                  f"once before assuming NOTHING filled")
-                            await asyncio.sleep(2.0)
-                            try:
-                                c = live_client._client()
-                                trades_list = await asyncio.to_thread(c.get_trades)
-                                filled = 0.0
-                                for tr in (trades_list or []):
-                                    if tr.get("taker_order_id") == order_id:
-                                        filled += float(tr.get("size") or 0.0)
-                                    else:
-                                        for mo in (tr.get("maker_orders") or []):
-                                            if mo.get("order_id") == order_id:
-                                                filled += float(
-                                                    mo.get("matched_amount") or 0.0)
-                                matched_shares = filled
-                                print(f"  [live fill] retry matched: {filled:.4f}")
-                            except Exception as fe2:
-                                matched_shares = 0.0
-                                print(f"  [live fill] UNVERIFIED after retry "
-                                      f"({fe2}) — booking as UNFILLED. The "
-                                      f"order may still be live; reconcile.py "
-                                      f"and cancel_all cover the residue.")
-                                trade.fill_unverified = True
-                    else:
-                        # No order id came back, so there is nothing to verify
-                        # against. Cancel everything and book nothing.
+            elif not paper:
+                # Live, but nobody proved a fill. arb_executor confirms BOTH
+                # legs against the venue before this coroutine is spawned, so
+                # reaching here means a caller skipped that handoff. Book
+                # nothing rather than assume a position exists — a submitted
+                # order and a filled order are not the same thing.
+                matched_shares = 0.0
+                trade.fill_unverified = True
+                print("  [live fill] settler got no verified fill — booking "
+                      "NOTHING rather than assuming the pair exists")
+                if live_client is not None:
+                    try:
                         await asyncio.to_thread(live_client.cancel_all)
-                        matched_shares = 0.0
-                        trade.fill_unverified = True
-                        print("  [live fill] no order id returned — treating as "
-                              "UNFILLED rather than assuming the full size")
-                except Exception as e:
-                    print(f"  cancel cleanup: {e}")
+                    except Exception as e:
+                        print(f"  cancel cleanup: {e}")
 
             # Update trade shares/stake based on actual fill size
             if not paper:
@@ -1246,8 +1054,7 @@ async def run_realtime(rounds: int = 100, paper: bool = True,
                 # An arb has no single order id — it has one per leg. Record
                 # both, so the trail names the orders the venue actually
                 # matched instead of an empty string.
-                _oid_str = (",".join(str(x) for x in leg_order_ids if x)
-                            if leg_order_ids else str(order_id or ""))
+                _oid_str = ",".join(str(x) for x in (leg_order_ids or []) if x)
                 _st_common = dict(round_id=trade.round_id, slug=trade.slug,
                                   side=trade.side, order_id=_oid_str,
                                   requested_shares=shares,
@@ -1256,8 +1063,8 @@ async def run_realtime(rounds: int = 100, paper: bool = True,
                 if getattr(trade, "fill_unverified", False):
                     order_state.record(
                         order_state.UNVERIFIED, **_st_common,
-                        note="venue fill lookup failed after retry; booked as "
-                             "UNFILLED (the order may still exist)")
+                        note="no verified fill reached the settler; booked as "
+                             "UNFILLED (any real position is unaccounted for)")
                 elif matched_shares <= 0.0:
                     order_state.record(order_state.CANCELLED, **_st_common,
                                        note="cancelled with nothing matched")
@@ -1273,10 +1080,10 @@ async def run_realtime(rounds: int = 100, paper: bool = True,
                     skips["unfilled"] = skips.get("unfilled", 0) + 1
                     risk.trades_today = max(0, risk.trades_today - 1)
 
-            # --- Resolution (Polymarket rules) ---
-            # Up iff end_price >= start_price on Chainlink Data Streams BTC/USD.
-            # ALWAYS prefer official Gamma outcome (matches website). Local
-            # compare is a last resort — and UNRELIABLE with a proxy strike.
+            # --- Resolution label (Polymarket official, or nothing) ---
+            # price_after is for the dashboard's BTC readout only; it no longer
+            # decides anything, because a locked pair's PnL is already settled
+            # by the fills.
             price_after = None
             if slot_start_time:
                 try:
@@ -1288,22 +1095,20 @@ async def run_realtime(rounds: int = 100, paper: bool = True,
                 try:
                     price_after = await asyncio.to_thread(feed.price)
                 except Exception:
-                    price_after = price_before
-            local_up = price_after >= slot_open_ref
+                    price_after = 0.0
 
             official = None
             slug = market.get("slug") or ""
-            proxy_strike = strike_src in ("exchange-proxy", "warmup-fallback")
             poll_attempts = 90
             if slug:
                 write_status(phase="resolving",
                              message="waiting for Polymarket outcome",
                              end_ts=end_ts, question=question, side=trade.side)
-                # Brief grace — Gamma often lags end_ts by 10–30s+
+                # Brief grace — Gamma often lags end_ts by 10-30s+
                 if config.ROUND_SECONDS > 0:
                     await asyncio.sleep(12.0)
                 print(f"  [resolve] polling official outcome up to "
-                      f"~{poll_attempts * 3}s (strike={strike_src})...")
+                      f"~{poll_attempts * 3}s...")
                 for attempt in range(poll_attempts):
                     try:
                         official = await asyncio.to_thread(
@@ -1325,47 +1130,26 @@ async def run_realtime(rounds: int = 100, paper: bool = True,
             if official in ("UP", "DOWN"):
                 resolved_up = official == "UP"
                 src = "polymarket-official"
-                if (official == "UP") != local_up:
-                    print(f"  [resolve] mismatch: official={official} vs "
-                          f"stream/local={'UP' if local_up else 'DOWN'} "
-                          f"(end=${price_after:,.2f} start=${slot_open_ref:,.2f} "
-                          f"strike={strike_src}) - using official (website truth)")
-                else:
-                    print(f"  [resolve] official={official} "
-                          f"(local agrees; end=${price_after:,.2f} "
-                          f"start=${slot_open_ref:,.2f})")
+                print(f"  [resolve] official={official} "
+                      f"(BTC ${price_after:,.2f} at close)")
             else:
-                resolved_up = local_up
-                if proxy_strike:
-                    src = "local-UNRELIABLE-proxy-strike"
-                    print(f"  [resolve] WARNING: no official outcome after "
-                          f"~{poll_attempts * 3}s AND strike was {strike_src}. "
-                          f"Local estimate {'UP' if local_up else 'DOWN'} "
-                          f"end=${price_after:,.2f} vs start=${slot_open_ref:,.2f} "
-                          f"- may NOT match Polymarket. Prefer restarting bot "
-                          f"before next slots so Chainlink open is recorded.")
-                else:
-                    src = "chainlink-stream" if cl_stream.ready else "local-estimate"
-                    print(f"  [resolve] no Gamma outcome yet; PROVISIONAL "
-                          f"{src} {'UP' if local_up else 'DOWN'} "
-                          f"end=${price_after:,.2f} vs start=${slot_open_ref:,.2f}"
-                          f"\n            local resolution disagreed with "
-                          f"Polymarket on 7 of the first 56 trades (near-ties "
-                          f"especially) — reconcile.py re-checks this later and "
-                          f"corrects the trade and bankroll if it is wrong.")
+                # The PnL is already final — one leg of the pair pays $1/share
+                # either way — so only the direction label is missing. Say that
+                # plainly instead of inventing a direction from a local price
+                # compare, which disagreed with Polymarket on 7 of the first 56
+                # rows. reconcile.py fills the label in later.
+                resolved_up = True
+                src = "arb-label-pending"
+                print(f"  [resolve] no Gamma outcome yet. PnL is final "
+                      f"regardless (a locked pair pays either way); the "
+                      f"direction label is provisional and reconcile.py will "
+                      f"correct it.")
 
             trade = executor.open_and_resolve(trade, resolved_up)
             trade.resolve_source = src
             risk.on_close(stake, trade.pnl)
             trade.bankroll_after = round(risk.bankroll, 2)
             trades.append(trade)
-            # Loss cooldown (protect bankroll after a hit). Arb losses do not
-            # trigger it — a losing "arb" means fills were worse than quoted,
-            # not that momentum is out of regime.
-            if not trade.won and was_late and late_pause_n > 0:
-                late_pause_slots = max(late_pause_slots, late_pause_n)
-                print(f"  [late_momentum] LOSS cooldown: skip next "
-                      f"{late_pause_slots} late window(s)")
             flag = "WON " if trade.won else "LOST"
             print(f"  resolved {'UP' if resolved_up else 'DOWN'} [{src}] "
                   f"-> {flag} pnl={trade.pnl:+.2f} "
@@ -1653,11 +1437,10 @@ async def run_realtime(rounds: int = 100, paper: bool = True,
             arb_verified = float(live_res.shares or shares)
             arb_leg_ids = [lg.order_id for lg in live_res.legs if lg.order_id]
         settle_coro = _settle_trade(
-            trade=trade, stake=stake, shares=shares, order_id=None,
+            trade=trade, stake=stake, shares=shares,
             market=market, question=question, end_ts=end_ts,
-            slot_start_time=slot_start_time, slot_open_ref=0.0,
-            strike_src="n/a-arb", price_before=0.0,
-            was_late=False, mkt=pair_cost, edge=edge_after,
+            slot_start_time=slot_start_time,
+            mkt=pair_cost, edge=edge_after,
             verified_fill=arb_verified, leg_order_ids=arb_leg_ids,
         )
         if config.ROUND_SECONDS <= 0 or not end_ts:
@@ -1726,764 +1509,76 @@ async def run_realtime(rounds: int = 100, paper: bool = True,
         question = market.get("question") or "BTC 5-minute Up/Down"
         end_ts = market.get("end_ts")
         remaining = (end_ts - _now(cl_stream)) if end_ts else None
-        # Count SLOTS toward max_slots, not loop iterations. The arb scanner
-        # re-polls every ~15s, so iteration-counting hit the 300 cap in ~75
-        # minutes and shut down a healthy (just selective) live session with
-        # zero trades placed.
-        if end_ts is None or end_ts != last_counted_end_ts:
-            slots_seen += 1
-            last_counted_end_ts = end_ts
-        if end_ts is not None and end_ts == last_traded_end_ts:
-            # Already traded this slot (settling in background) — never
-            # double-enter the same market; wait for the next slot.
-            write_status(phase="holding",
-                         message="trade open on this slot; waiting for slot end")
-            await _sleep_until_slot_end(end_ts, cl_stream)
-            continue
-        rem_txt = f"{remaining:.0f}s left" if remaining is not None else "no end time"
-        print(f"\nslot: {question}  ({rem_txt})")
-        # non-empty => walk the full gate stack and record, but never trade
-        observe_only = ("momentum_observe_only: recording for the tuner, "
-                        "not trading"
-                        if getattr(config, "MOMENTUM_OBSERVE_ONLY", False)
-                        else "")
-        try:
-            from config import get_time_suitability
-            suitability, reason = get_time_suitability()
-            # The retry loop revisits a slot every ~15s; printing the guard
-            # verdict each time buries the trading decisions in a 24/7 log.
-            first_look = end_ts != time_guard_seen_end_ts
-            time_guard_seen_end_ts = end_ts
-            if first_look:
-                print(f"  [Time Guard] Suitability: {suitability} - {reason}")
-            if suitability == "AVOID":
-                # Walk the slot through the full gate stack but refuse to
-                # trade it. Bailing out here (the old behaviour) meant the
-                # avoided hours produced no observations at all, so the tuner
-                # could never test whether the guard actually helps — the
-                # filter was permanently unfalsifiable. Now it is measured.
-                observe_only = f"time_guard: {reason}"
-                if first_look:
-                    print(f"  [Time Guard] observe-only for this slot "
-                          f"(recording features, placing no trade)")
-            # A passing time guard must not clear an observe-only mode set for
-            # another reason — blanking it here would have quietly limited
-            # MOMENTUM_OBSERVE_ONLY to the avoided hours only.
-        except Exception:
-            pass
-        write_status(phase="analyzing", question=question, slug=market.get("slug"),
-                     end_ts=end_ts, side=None, edge=None, mkt=None)
-
-        # ---- ARB SCAN: any point in the slot with enough time left ----
-        if (arb_on and remaining is not None and remaining >= arb_min_rem
-                and end_ts != arb_done_end_ts):
-            try:
-                if await _try_arb(market, question, end_ts, remaining):
-                    continue  # arb placed; next loop pass (momentum may still run)
-            except Exception as e:
-                print(f"  [arb] scan error: {e}")
-
-        # ---- WINDOW CHECKS (late_momentum: last late_min..late_max s) ----
-        min_slot = late_min
-        max_rem = late_max
-        if remaining is not None and remaining < min_slot:
-            print(f"  slot closing ({remaining:.0f}s); waiting for the next slot...")
-            skips["slot_closing"] += 1
-            write_status(phase="waiting", message="slot closing")
-            await _sleep_until_slot_end(end_ts, cl_stream)
-            continue
-        if remaining is not None and max_rem > 0 and remaining > max_rem:
-            wait = remaining - max_rem
-            if end_ts != early_seen_end_ts:
-                early_seen_end_ts = end_ts
-                skips["slot_too_early"] += 1
-                print(f"  slot too early ({remaining:.0f}s left); waiting "
-                      f"{wait:.0f}s for late_momentum window (max rem {max_rem}s)...")
-            write_status(phase="waiting", message="waiting for late window")
-            # Sample a price while waiting (builds momentum/vol history) and
-            # wake periodically so the arb scanner keeps watching the book.
-            try:
-                await asyncio.to_thread(feed.price)
-            except Exception:
-                pass
-            if config.ROUND_SECONDS > 0 and wait > 0:
-                if arb_on and wait > 20:
-                    # Re-check the arb far more often than the old 15s: with a
-                    # pushed book this is an in-memory read, and a 15s cadence
-                    # on a millisecond market missed almost everything.
-                    scan_gap = float(getattr(config, "ARB_SCAN_INTERVAL_S", 1.0))
-                    await _heartbeat_sleep(max(0.2, min(scan_gap, wait)))
-                else:
-                    await _heartbeat_sleep(min(wait, max(1.0, wait - 1.5)))
-            continue
-
-        remaining = (end_ts - _now(cl_stream)) if end_ts else remaining
-        if remaining is not None and remaining < min_slot:
-            print(f"  window missed ({remaining:.0f}s left); next slot...")
-            skips["slot_closing"] += 1
-            await _sleep_until_slot_end(end_ts, cl_stream)
-            continue
-
-        # ---- LATE MOMENTUM PATH ----
-        phase_name = "late_momentum"
-
-        # Feature vector for THIS slot, filled in as the gates run and flushed
-        # once — traded or skipped — by _flush_obs below. Retries rebuild it
-        # from scratch (the loop `continue`s back to here), so only the final
-        # evaluation of a slot is ever recorded.
-        slot_obs: dict = {
-            "slug": market.get("slug"),
-            "end_ts": end_ts,
-            "slot_start_ts": (end_ts - config.SLOT_SECONDS) if end_ts else None,
-            "mode": config.MODE,
-            "timeframe": getattr(config, "TIMEFRAME", "5m"),
-            "asset": getattr(config, "ASSET", "btc"),
-            "session_id": _ensure_session_id(),
-            "remaining_s": remaining,
-        }
-        def _flush_obs(decision: str, skip_reason: str = "") -> None:
-            """Record this slot's features exactly once."""
-            if not slot_obs.get("end_ts") or obs_written.get("end_ts") == end_ts:
-                return
-            obs_written["end_ts"] = end_ts
-            slot_obs["decision"] = decision
-            slot_obs["skip_reason"] = skip_reason
-            observations.record(slot_obs)
-
-        # Stagger entry: if we just entered the late window, add a tiny random
-        # delay (100-400ms) to reduce API congestion and quote volatility.
-        if remaining is not None and remaining >= late_max - 0.5:
-            import random
-            delay = random.uniform(0.1, 0.4)
-            await asyncio.sleep(delay)
-            remaining -= delay
-
-        async def _late_skip(skip_key: str, msg: str, retry: bool = True):
-            """Skip this attempt; optionally retry while the window is open.
-
-            Counters increment only when the slot is finally given up —
-            counting every ~1s retry poll inflated skip stats ~50x.
-            """
-            write_status(phase="waiting", message=msg, strategy=phase_name)
-            print(f"  [{phase_name}] {msg}")
-            rem_now = (end_ts - _now(cl_stream)) if end_ts else remaining
-            if retry and rem_now is not None and rem_now > late_min + 2:
-                await asyncio.sleep(min(1.2, max(0.4, rem_now - late_min)))
-                return "retry"
-            skips[skip_key] = skips.get(skip_key, 0) + 1
-            _flush_obs("skip", msg)
-            await _sleep_until_slot_end(end_ts, cl_stream)
-            return "done"
-
-        # Cooldown after a loss (harder to chain blowups).
-        if late_pause_slots > 0:
-            print(f"  [{phase_name}] pause after loss "
-                  f"({late_pause_slots} late window(s) left); skip")
-            skips["no_edge"] = skips.get("no_edge", 0) + 1
-            late_pause_slots -= 1
-            write_status(phase="waiting", message="late pause after loss",
-                         strategy=phase_name)
-            await _sleep_until_slot_end(end_ts, cl_stream)
-            continue
-
-        slot_start_time = (end_ts - config.SLOT_SECONDS) if end_ts else None
-        slot_open_ref = None
-        strike_src = "unknown"
-        if slot_start_time:
-            try:
-                slot_open_ref = await asyncio.to_thread(
-                    feed.get_slot_start_price, slot_start_time)
-                if slot_open_ref is not None:
-                    has_cl = bool(
-                        cl_stream.ready and (
-                            cl_stream.price_at_or_before(
-                                float(slot_start_time), max_age_s=60.0)
-                            or cl_stream.price_at(
-                                float(slot_start_time), max_skew_s=20.0)
-                        )
-                    )
-                    strike_src = ("chainlink-data-stream" if has_cl
-                                  else "exchange-proxy")
-            except Exception as e:
-                print(f"  failed to fetch slot start price: {e}")
-        try:
-            price_before = await asyncio.to_thread(feed.price)
-        except Exception:
-            price_before = slot_open_ref or 0.0
-        if slot_open_ref is None:
-            slot_open_ref = price_before
-            strike_src = "warmup-fallback"
-        move_usd = abs(price_before - slot_open_ref) if slot_open_ref else 0.0
-        slot_obs.update(strike=slot_open_ref, strike_src=strike_src,
-                        spot=price_before)
-        rem_lbl = f"{remaining:.0f}s left" if remaining is not None else "n/a left"
-        print(f"  [{phase_name}] strike=${slot_open_ref:,.2f} [{strike_src}]  "
-              f"btc=${price_before:,.2f} move=${move_usd:.1f}  {rem_lbl}")
-
-        # Momentum is strike-relative: a proxy/fallback strike produces fake
-        # signals AND unreliable local resolution. Skip the slot.
-        if require_cl_strike and strike_src != "chainlink-data-stream":
-            if await _late_skip(
-                "proxy_strike",
-                f"no Chainlink tick for slot open — resolution risk too high "
-                f"(strike from {strike_src})",
-                retry=False,
-            ) == "retry":
-                continue
-            continue
-
-        # Realized vol + chop from the Chainlink tick buffer, scoped to THIS
-        # slot. The polled `feed.recent()` history is sampled irregularly
-        # (~15s+ apart, spanning several slots) while _realized_vol_daily
-        # assumed a fixed 5s spacing — that overstated vol ~1.7x and made the
-        # chop filter compare previous-slot prices to the current strike.
-        slot_ticks = []
-        rv = None
-        if slot_start_time and cl_stream.ready:
-            # Fixed recent window so chop/vol mean the same thing on 5m and
-            # 15m (crossing counts grow with elapsed time). On 5m this is the
-            # whole slot, so behaviour there is unchanged.
-            lookback = float(getattr(config, "CHOP_LOOKBACK_S", 300) or 300)
-            window_start = max(float(slot_start_time),
-                               _now(cl_stream) - lookback)
-            slot_ticks = cl_stream.ticks_since(window_start)
-            rv = cl_stream.realized_vol_daily_since(window_start)
-        if rv is None:
-            # Fallback: polled history, but with the spacing it really has.
-            prices_poll = feed.recent(int(getattr(config, "MOMENTUM_LOOKBACK", 12)))
-            if len(prices_poll) >= 4:
-                from signal_engine import _realized_vol_daily
-                rv = _realized_vol_daily(
-                    prices_poll, float(getattr(config, "ARB_MIN_REMAINING", 15)))
-        slot_prices = [px for _ts, px in slot_ticks]
-        price_window_start = slot_prices[0] if slot_prices else price_before
-        price_now = price_before
-
-        slot_obs["realized_vol_daily"] = rv
-        max_chop = int(getattr(config, "LATE_MOMENTUM_MAX_CHOP", 3) or 0)
-        if slot_open_ref and len(slot_prices) >= 4:
-            slot_obs["chop_crosses"] = count_strike_crossings(
-                slot_prices, float(slot_open_ref))
-
-        diff = price_now - slot_open_ref
-        # Scale the required lead with sqrt(time left): diffusion noise over
-        # the remaining seconds grows ~sqrt(t), so a $10 lead at 40s is much
-        # weaker evidence than $10 at 12s. Calibrated so the configured value
-        # applies at 20s remaining.
-        min_move = float(lm_min_move)
-        if remaining is not None and remaining > 0:
-            min_move *= math.sqrt(max(float(remaining), 1.0) / 20.0)
-
-        # Record the direction the move points at even when it is too small to
-        # trade — that is exactly the counterfactual the tuner needs to answer
-        # "would a lower min-move threshold have made money?".
-        side_hint = "UP" if diff >= 0 else "DOWN"
-        slot_obs.update(move_usd=diff, min_move_req=min_move, side=side_hint)
-
-        # Quote the momentum side BEFORE the cheap gates get a chance to bail.
-        #
-        # This costs one extra book read on slots we are about to skip, and it
-        # buys the only thing that makes those gates testable. Previously the
-        # chop filter and the move threshold rejected a slot before any price
-        # was recorded, so 46% of a day's labeled observations carried no ask —
-        # and a backtest cannot price a trade it has no price for. The tuner
-        # could therefore never answer "is MAX_CHOP=3 too strict?", which meant
-        # those gates were permanently exempt from the evidence. Same class of
-        # blind spot as the time guard, fixed the same way: evaluate and
-        # record, then decide.
-        q = None
-        mkt = None
-        if bool(getattr(config, "OBSERVE_QUOTE_ALWAYS", True)):
-            try:
-                q = await asyncio.to_thread(_quote_side, pub, market, side_hint)
-                if q and q.get("price") is not None:
-                    mkt = float(q["price"])
-                    slot_obs.update(ask=mkt, bid=q.get("bid"),
-                                    spread=q.get("spread"),
-                                    ask_size=q.get("ask_size"))
-            except Exception as e:
-                # Observation-only failure: never let it kill the slot. The
-                # gates below re-fetch if they actually need a tradeable quote.
-                print(f"  [obs] quote for {side_hint} unavailable: {e}")
-                q = None
-
-        # Score the model edge for every priced slot, not just the ones that
-        # survive the entry band. fair_value is local arithmetic — no API call —
-        # and without this the edge floor/ceiling are exactly as untestable as
-        # the chop filter was: only 3.6% of rows carried an edge, all of them
-        # rows that had already passed the band being questioned.
-        fee_rate_obs = float(market.get("fee_rate")
-                             if market.get("fee_rate") is not None
-                             else getattr(config, "TAKER_FEE_RATE", 0.07))
-        fv_obs = None
-        if mkt is not None and slot_open_ref:
-            try:
-                fv_obs = fair_value(
-                    spot=float(price_now),
-                    strike=float(slot_open_ref),
-                    remaining_seconds=float(remaining or 1.0),
-                    volatility_daily=float(getattr(config, "VOLATILITY_DAILY", 0.045)),
-                    realized_vol_daily=rv,
-                    vol_blend=float(getattr(config, "VOL_BLEND", 0.5)),
-                )
-                prob_obs = (fv_obs.fair_prob_up if side_hint == "UP"
-                            else 1.0 - fv_obs.fair_prob_up)
-                fee_ps_obs = config.taker_fee_per_share(mkt, fee_rate_obs)
-                slot_obs.update(model_prob=prob_obs,
-                                edge=prob_obs - mkt,
-                                edge_net=prob_obs - mkt - fee_ps_obs,
-                                fee_per_share=fee_ps_obs)
-            except Exception as e:
-                print(f"  [obs] fair value unavailable: {e}")
-                fv_obs = None
-
-        # Chop filter: if price flip-flopped across the strike WITHIN this
-        # slot, a "lead" is noise, not momentum — skip.
-        if max_chop > 0 and slot_open_ref and len(slot_prices) >= 4:
-            crossings = slot_obs["chop_crosses"]
-            if crossings > max_chop:
-                if await _late_skip(
-                    "thin_move",
-                    f"choppy: {crossings} strike crossings > {max_chop}",
-                    retry=True,
-                ) == "retry":
-                    continue
-                continue
-
-        side = None
-        if diff >= min_move:
-            side = "UP"
-        elif diff <= -min_move and config.LATE_MOMENTUM_BIDIRECTIONAL:
-            side = "DOWN"
-
-        if not side:
-            if await _late_skip(
-                "thin_move",
-                f"strike gap {diff:+.1f} < min ${min_move:.1f}",
-                retry=True,
-            ) == "retry":
-                continue
-            continue
-
-        # side is always side_hint here (both derive from the sign of diff), so
-        # the observation quote above is for the right token; only re-fetch if
-        # it failed or was disabled.
-        token_id = market["tokens"][side]
-        if mkt is None:
-            try:
-                q = await asyncio.to_thread(_quote_side, pub, market, side)
-                if not q:
-                    raise ValueError("Failed to get quote")
-                mkt = float(q["price"])
-                slot_obs.update(ask=mkt, bid=q.get("bid"),
-                                spread=q.get("spread"),
-                                ask_size=q.get("ask_size"))
-            except Exception as e:
-                if await _late_skip("quote_fail",
-                                    f"failed to get quote for {side}: {e}",
-                                    retry=True) == "retry":
-                    continue
-                continue
-
-        min_entry = lm_min_entry
-        max_entry = lm_max_entry
-        if mkt < min_entry or mkt > max_entry:
-            if await _late_skip(
-                "quote_range",
-                f"{side} ask {mkt:.3f} outside entry band "
-                f"[{min_entry:.2f}, {max_entry:.2f}]",
-                retry=True,
-            ) == "retry":
-                continue
-            continue
-
-        # Book-quality protections (spread + requote before committing).
-        lm_max_spread = float(getattr(config, "LATE_SCALP_MAX_SPREAD", 0)
-                              or getattr(config, "MAX_SPREAD", 0) or 0)
-        if (lm_max_spread > 0 and q.get("spread") is not None
-                and q["spread"] > lm_max_spread):
-            if await _late_skip(
-                "wide_spread",
-                f"spread {q['spread']:.3f} > {lm_max_spread:.3f}",
-                retry=True,
-            ) == "retry":
-                continue
-            continue
-        if getattr(config, "LATE_SCALP_REQUOTE", True):
-            rq_sleep = float(getattr(config, "LATE_SCALP_REQUOTE_SLEEP_S",
-                                     0.35) or 0.35)
-            if config.ROUND_SECONDS > 0 and rq_sleep > 0:
-                await asyncio.sleep(min(rq_sleep, 1.0))
-            q2 = await asyncio.to_thread(_quote_side, pub, market, side)
-            if q2 and "price" in q2:
-                mkt2 = float(q2["price"])
-                max_jump = float(getattr(config, "LATE_SCALP_MAX_ASK_JUMP",
-                                         0.04) or 0.04)
-                if mkt2 > mkt + max_jump:
-                    if await _late_skip(
-                        "wide_spread",
-                        f"requote ask jumped {mkt:.3f}->{mkt2:.3f}",
-                        retry=True,
-                    ) == "retry":
-                        continue
-                    continue
-                if mkt2 != mkt:
-                    # Conservative: size/fill at the fresher price.
-                    mkt = mkt2
-                    q = q2
-                if mkt < min_entry or mkt > max_entry:
-                    if await _late_skip(
-                        "quote_range",
-                        f"after requote ask {mkt:.3f} outside band",
-                        retry=True,
-                    ) == "retry":
-                        continue
-                    continue
-
-        fv = fair_value(
-            spot=float(price_now),
-            strike=float(slot_open_ref),
-            remaining_seconds=float(remaining or 1.0),
-            volatility_daily=float(getattr(config, "VOLATILITY_DAILY", 0.045)),
-            realized_vol_daily=rv,
-            vol_blend=float(getattr(config, "VOL_BLEND", 0.5)),
-        )
-        model_side_prob = fv.fair_prob_up if side == "UP" else (1.0 - fv.fair_prob_up)
-        edge = model_side_prob - mkt
-        # Net edge after the REAL taker fee (rate*p*(1-p)/share). At 0.85
-        # that's ~0.9c/share; at 0.60 it's ~1.7c — mid prices pay the most.
-        fee_rate = float(market.get("fee_rate")
-                         if market.get("fee_rate") is not None
-                         else getattr(config, "TAKER_FEE_RATE", 0.07))
-        fee_ps = config.taker_fee_per_share(mkt, fee_rate)
-        edge_net = edge - fee_ps
-        slot_obs.update(model_prob=model_side_prob, edge=edge,
-                        edge_net=edge_net, fee_per_share=fee_ps,
-                        side=side, ask=mkt, remaining_s=remaining)
-
-        if lm_min_edge != 0.0 and edge_net < lm_min_edge:
-            if await _late_skip(
-                "no_edge",
-                f"net edge {edge_net:.3f} < floor {lm_min_edge:.3f} "
-                f"(model {model_side_prob:.3f} vs ask {mkt:.3f} "
-                f"+ fee {fee_ps:.3f}/sh)",
-                retry=True,
-            ) == "retry":
-                continue
-            continue
-        # Edge CEILING: when the model is far above the book this late in the
-        # slot, the book is usually right and the model is stale/overconfident
-        # (archive: edge>=0.15 bucket was 75% WR, -$0.15/trade).
-        if lm_max_edge > 0 and edge > lm_max_edge:
-            if await _late_skip(
-                "no_edge",
-                f"edge {edge:.3f} > ceiling {lm_max_edge:.3f} "
-                f"(model {model_side_prob:.3f} way above ask {mkt:.3f} — "
-                f"suspect stale strike/vol; book is usually right)",
-                retry=True,
-            ) == "retry":
-                continue
-            continue
-
-        if observe_only:
-            # All features are captured; the slot is recorded and left alone.
-            print(f"  [late_momentum] {observe_only} — would have taken "
-                  f"{side} @ {mkt:.3f} (edge {edge_net:+.3f}); not trading")
-            _flush_obs("skip", observe_only)
-            write_status(phase="waiting", message=observe_only,
-                         strategy=phase_name)
-            await _sleep_until_slot_end(end_ts, cl_stream)
-            continue
 
         # Prefer the venue's own published minimum over the config default, so
         # sizing tracks the market rather than an assumption that could go
-        # stale (verified live: orderMinSize = 5 on the BTC 5m markets).
+        # stale (verified live: orderMinSize = 5 on the BTC 5m markets). This
+        # used to sit in the momentum path, downstream of an observe-only
+        # `continue` that always fired first — so it never actually ran, and
+        # arb only ever saw the config default. Now it runs before every scan,
+        # which is the path that reads MIN_ORDER_SHARES.
         venue_min = market.get("min_order_size")
         if venue_min and float(venue_min) > 0:
             config.MIN_ORDER_SHARES = float(venue_min)
 
-        stake = risk.size_late_scalp(mkt, edge=max(edge_net, 0.0))
-
-        ask_sz = q.get("ask_size")
-        print(f"  [late_momentum] side={side} strike=${slot_open_ref:.2f} "
-              f"spot=${price_now:.2f} win_start=${price_window_start:.2f} "
-              f"gap=${diff:+.2f} ask={mkt:.3f} edge={edge:.3f} "
-              f"(net {edge_net:.3f} after fee {fee_ps:.3f}/sh) stake=${stake:.2f}")
-        write_status(
-            phase="analyzing", btc_price=round(price_now, 2),
-            side=side, model=round(model_side_prob, 4),
-            mkt=round(mkt, 4), edge=round(edge, 4), stake=stake,
-            confidence=round(fv.fair_prob_up, 4),
-            end_ts=end_ts, question=question,
-            strategy="late_momentum",
-        )
-
-        if stake <= 0:
-            why = getattr(risk, "last_skip_reason", "") or "no stake"
-            if await _late_skip("no_edge", f"size skip ({why})",
-                                retry=True) == "retry":
-                continue
+        # Count SLOTS toward max_slots, not loop iterations, so a selective but
+        # healthy session is not shut down by the safety cap.
+        if end_ts is None or end_ts != last_counted_end_ts:
+            slots_seen += 1
+            last_counted_end_ts = end_ts
+        if end_ts is not None and end_ts == arb_done_end_ts:
+            # Arb takes at most one attempt per market. Nothing left to do on
+            # this slot but wait it out.
+            write_status(phase="waiting",
+                         message="arb attempted on this slot; waiting for slot end")
+            await _sleep_until_slot_end(end_ts, cl_stream)
             continue
 
-        sig = SimpleNamespace(
-            side=side,
-            confidence=round(fv.fair_prob_up, 4),
-            model_prob_up=fv.fair_prob_up,
-            realized_vol_daily=rv,
-            z_score=fv.z_score,
-            sigma_usd=fv.sigma_usd,
-            fair_prob_up=fv.fair_prob_up,
-        )
+        rem_txt = f"{remaining:.0f}s left" if remaining is not None else "no end time"
+        print(f"\nslot: {question}  ({rem_txt})")
+        write_status(phase="analyzing", question=question, slug=market.get("slug"),
+                     end_ts=end_ts, side=None, edge=None, mkt=None)
 
-        shares = round(stake / mkt, 4)
-        # Ensure we don't request more shares than visible ask size when known.
-        if ask_sz is not None and ask_sz > 0:
-            shares = min(shares, round(ask_sz * 0.5, 4))  # take at most half the level
-            stake = round(shares * mkt, 2)
-            if stake < 0.5:
-                print("  sized below dust after depth cap; skip")
-                skips["thin_book"] += 1
-                _flush_obs("skip", "sized below dust after depth cap")
-                await _sleep_until_slot_end(end_ts, cl_stream)
-                continue
-            # Venue minimum: if the depth cap pushed us under MIN_ORDER_SHARES,
-            # a live order would be rejected — skip instead of sending it.
-            min_sh = float(getattr(config, "MIN_ORDER_SHARES", 0) or 0)
-            if (getattr(config, "ENFORCE_MIN_SHARES", True)
-                    and min_sh > 0 and shares < min_sh):
-                print(f"  depth cap left {shares:.2f} shares < venue min "
-                      f"{min_sh:.0f}; skip (book too thin)")
-                skips["thin_book"] += 1
-                _flush_obs("skip", "depth cap below venue minimum shares")
-                await _sleep_until_slot_end(end_ts, cl_stream)
-                continue
+        if not arb_on:
+            print("  [arb] scanner disabled (ARB_TRADE_ENABLED=0); idling this slot")
+            await _sleep_until_slot_end(end_ts, cl_stream)
+            continue
 
-        # --- MAKER-FIRST: try to rest under the ask before crossing ---
-        # Makers pay ZERO fee here (feeSchedule.takerOnly), and the fee is
-        # several times the spread — so this is the single largest
-        # controllable cost in the system.
-        is_maker = False
-        maker_ok = (paper or getattr(config, "MAKER_FIRST_LIVE", False))
-        if maker_ok:
-            rem_now = (end_ts - _now(cl_stream)) if end_ts else remaining
-            maker_px = await _try_maker_entry(pub, market, side, mkt, rem_now)
-            if maker_px is not None:
-                is_maker = True
-                mkt = maker_px
-                print(f"  [maker] filled resting @ {maker_px:.3f} "
-                      f"(ask was {q['price']:.3f}) — no taker fee")
-
-        # Pessimistic paper fills — pay ask + slippage (thin end-of-slot books
-        # slip the most; skipping this made late paper results unrealistic).
-        # Maker fills skip slippage: we set the price, we did not cross.
-        fill_px = float(mkt)
-        if paper and not is_maker:
-            slip = float(getattr(config, "PAPER_FILL_SLIPPAGE", 0.01) or 0.0)
-            if slip > 0:
-                fill_px = min(0.99, float(mkt) + slip)
-                if fill_px != mkt and fill_px > 0:
-                    # An order is placed for a SIZE, so slippage makes you pay
-                    # more per share — it does not hand you fewer shares.
-                    # Holding the dollar amount fixed and dividing by the worse
-                    # price silently shrank the order below the venue minimum
-                    # (5 shares became 4.94), simulating a fill that the CLOB
-                    # would have rejected outright. Keep the size, raise the
-                    # cost, and only fall back to the dollar-fixed behaviour
-                    # when we are not sizing off the venue minimum.
-                    min_sh = float(getattr(config, "MIN_ORDER_SHARES", 0) or 0)
-                    hold_size = (getattr(config, "MIN_SHARES_SIZING", False)
-                                 and min_sh > 0
-                                 and shares <= min_sh + 1e-6)
-                    if hold_size:
-                        stake = round(shares * fill_px, 2)
-                    else:
-                        shares = round(stake / fill_px, 4)
-                        stake = round(shares * fill_px, 2)
-                    print(f"  [paper] pessimistic fill ask {mkt:.3f} + "
-                          f"slip {slip:.3f} -> {fill_px:.3f} "
-                          f"(shares={shares:.2f} stake=${stake:.2f}"
-                          f"{'; size held at venue min' if hold_size else ''})")
-        elif is_maker:
-            # Keep the share count the depth cap approved and spend LESS —
-            # recomputing shares from the cheaper maker price would push size
-            # back above the cap (and past the venue-minimum check already
-            # done above), buying more than the book was shown to support.
-            stake = round(shares * fill_px, 2)
-
-        trade = Trade(
-            ts=time.time(),
-            round_id=placed + 1,
-            side=sig.side,
-            entry_price=round(fill_px, 4),
-            shares=shares,
-            stake_usd=stake,
-            model_prob=round(model_side_prob, 4),
-            edge=round(edge, 4),
-            # Maker fills pay no fee (takerOnly). Rebates are real but NOT
-            # credited — they are a proportional daily pool, not guaranteed.
-            fee_usd=(0.0 if is_maker else
-                     round(shares * config.taker_fee_per_share(fill_px, fee_rate), 4)),
-            is_maker=is_maker,
-            slug=market.get("slug") or "",
-            question=question,
-            slot_start_ts=slot_start_time,
-            end_ts=end_ts,
-        )
-        stamp_trade_times(trade)
-        # `ask` stays the RAW book ask on every row. Overwriting it with the
-        # post-slippage/maker fill would make traded rows systematically
-        # cheaper than skipped ones and bias every backtest that compares them.
-        slot_obs.update(fill_price=fill_px, is_maker=is_maker, stake_usd=stake)
-        _flush_obs("trade")
-        risk.on_open(stake)
-        _register_open(trade, end_ts)
-        trade_event_id = f"placed-{trade.round_id}-{int(trade.ts)}"
-        strat_lbl = "late_momentum"
-        try:
-            _journal(
-                _ensure_session_id(),
-                "paper_live" if paper else "live",
-                strat_lbl,
-                phase=strat_lbl,
-                action="trade",
-                reason="placed",
-                slug=trade.slug,
-                question=question,
-                side=sig.side,
-                spot=price_before,
-                strike=slot_open_ref,
-                strike_src=strike_src,
-                move_usd=move_usd,
-                remaining_s=remaining,
-                model_prob=model_side_prob,
-                fair_prob=getattr(sig, "fair_prob_up", None),
-                z_score=getattr(sig, "z_score", None),
-                ask=mkt,
-                fill_price=fill_px,
-                edge=edge,
-                conf=getattr(sig, "confidence", None),
-                stake=stake,
-                shadow=False,
-            )
-        except Exception:
-            pass
-        print(f"  TRADE PLACED [{strat_lbl}] R{trade.round_id} {trade.side} "
-              f"@ {trade.entry_price:.2f} ${trade.stake_usd:.2f}  "
-              f"{trade.time_et or trade.time_utc}")
-        write_status(
-            phase="holding",
-            trade_event="placed",
-            trade_event_id=trade_event_id,
-            end_ts=end_ts,
-            side=sig.side,
-            mkt=round(mkt, 4),
-            edge=round(edge, 4),
-            stake=stake,
-            question=question,
-            slug=trade.slug,
-            event_url=trade.event_url,
-            time_et=trade.time_et,
-            time_utc=trade.time_utc,
-            strategy=strat_lbl,
-            message=f"TRADE PLACED [{strat_lbl}] {sig.side} @ {mkt:.2f}",
-        )
-
-        order_id = None
-        _os_common = dict(round_id=trade.round_id, slug=trade.slug,
-                          side=sig.side, token_id=token_id,
-                          requested_shares=shares, price=mkt, mode=config.MODE)
-        order_state.record(order_state.SIGNAL, **_os_common,
-                           note=f"gates passed; edge {edge:+.4f}")
-        if paper:
-            # No order is sent in paper. Say so explicitly so a simulated fill
-            # can never be read as one the venue confirmed.
-            order_state.record(order_state.SIMULATED, **_os_common,
-                               filled_shares=shares,
-                               note="paper_live: modelled against the real "
-                                    "book; nothing submitted to Polymarket")
-        if not paper:
-            order_state.record(order_state.SUBMITTED, **_os_common)
+        # ---- ARB SCAN: poll this slot's book until it pays or time runs out ----
+        # The re-scan cadence used to live INSIDE momentum's "slot too early"
+        # branch, which only ran while more than late_max (40s) remained. Two
+        # consequences: the last 40s..ARB_MIN_REMAINING of every slot was never
+        # re-scanned at all, and deleting the momentum block would have silently
+        # dropped arb to a single scan per slot. Scanning is an in-memory read of
+        # the pushed book, so poll it properly — the whole slot down to
+        # ARB_MIN_REMAINING now belongs to arb.
+        scan_gap = max(0.2, float(getattr(config, "ARB_SCAN_INTERVAL_S", 1.0) or 1.0))
+        scans = 0
+        while True:
+            remaining = (end_ts - _now(cl_stream)) if end_ts else None
+            if remaining is not None and remaining < arb_min_rem:
+                print(f"  [arb] {scans} scan(s) this slot; {remaining:.0f}s left "
+                      f"is under the {arb_min_rem}s floor — waiting it out")
+                break
+            scans += 1
             try:
-                # Re-check quote right before order (latency / adverse selection).
-                try:
-                    q2 = await asyncio.to_thread(_quote_side, pub, market, sig.side)
-                    if not q2 or "price" not in q2:
-                        raise RuntimeError("failed to re-check quote before order")
-                    # Maker orders rest BELOW the ask on purpose — an ask that
-                    # is higher than our limit is expected, not a reason to
-                    # abort or to chase upward.
-                    if not is_maker:
-                        if q2["price"] > mkt + 0.02:
-                            raise RuntimeError(
-                                f"ask moved {mkt:.3f} -> {q2['price']:.3f} before order")
-                        if q2["price"] > mkt:
-                            # Keep the SHARE COUNT and pay slightly more.
-                            # Recomputing shares from the higher ask shrank the
-                            # order below the 5-share venue minimum — live
-                            # rejected 4.93 shares on the very first real trade.
-                            new_mkt = float(q2["price"])
-                            new_stake = round(shares * new_mkt, 2)
-                            stake_cap = float(getattr(
-                                config, "LATE_SCALP_MAX_STAKE_USD", 5.0) or 5.0)
-                            if (new_stake > stake_cap + 1e-9
-                                    or new_stake > risk.bankroll):
-                                raise RuntimeError(
-                                    f"ask moved to {new_mkt:.3f}; stake "
-                                    f"${new_stake:.2f} would exceed cap")
-                            mkt = new_mkt
-                            trade.entry_price = round(mkt, 4)
-                            # Keep exposure accounting consistent with on_open.
-                            risk.open_exposure += new_stake - stake
-                            stake = new_stake
-                            trade.stake_usd = stake
-                except RuntimeError:
-                    raise
-                except Exception:
-                    pass
-                resp = await asyncio.to_thread(live_client.buy, token_id, float(mkt),
-                                       shares, market["conditionId"])
-                print(f"  ORDER PLACED: {resp}")
-                if isinstance(resp, dict):
-                    order_id = (resp.get("orderID") or resp.get("order_id")
-                                or resp.get("id"))
-                # ACCEPTED, not FILLED: the venue took the order. Whether any
-                # of it matched is decided later, against get_trades.
-                order_state.record(
-                    order_state.ACCEPTED if order_id else order_state.OPEN,
-                    **_os_common, order_id=str(order_id or ""),
-                    venue_response=resp,
-                    note="venue accepted the order; fill not yet confirmed")
+                if await _try_arb(market, question, end_ts, remaining):
+                    break
             except Exception as e:
-                print(f"  order failed: {e}")
-                order_state.record(order_state.REJECTED, **_os_common,
-                                   venue_response=str(e), note="order failed")
-                skips["order_fail"] += 1
-                risk.on_close(stake, 0.0)
-                _clear_open(trade)
-                write_status(phase="waiting",
-                             message=f"order failed: {str(e)[:80]}")
-                await _sleep_until_slot_end(end_ts, cl_stream)
-                continue
+                print(f"  [arb] scan error: {e}")
+            if end_ts is not None and end_ts == arb_done_end_ts:
+                # A signal was seen and declined (edge too wide, book too thin,
+                # a risk cap). One attempt per slot, so stop re-reading a book
+                # we have already decided not to act on.
+                break
+            if config.ROUND_SECONDS <= 0 or end_ts is None:
+                break  # fast/deterministic test mode: single pass, no sleeping
+            await _heartbeat_sleep(scan_gap)
 
-        # Settle in the background so the main loop can move on to the next
-        # slot — resolution polling used to block the loop for up to ~4.5 min
-        # per trade. `placed` counts at placement; exposure caps bound overlap.
-        placed += 1
-        last_traded_end_ts = end_ts
-        settle_coro = _settle_trade(
-            trade=trade, stake=stake, shares=shares, order_id=order_id,
-            market=market, question=question, end_ts=end_ts,
-            slot_start_time=slot_start_time, slot_open_ref=slot_open_ref,
-            strike_src=strike_src, price_before=price_before,
-            was_late=True, mkt=mkt, edge=edge,
-        )
-        if config.ROUND_SECONDS <= 0 or not end_ts:
-            # Fast/test mode (or no end time): settle inline, deterministic.
-            await settle_coro
-        else:
-            _task = asyncio.create_task(settle_coro)
-            settle_tasks.add(_task)
-            _task.add_done_callback(settle_tasks.discard)
+        # No point waiting out a slot we are done with — the loop is about to
+        # exit anyway once the round count is reached.
+        if placed < rounds:
+            await _sleep_until_slot_end(end_ts, cl_stream)
 
     if settle_tasks:
         print(f"\n[settle] waiting for {len(settle_tasks)} open trade(s) to resolve...")
@@ -2509,8 +1604,8 @@ if __name__ == "__main__":
     ap.add_argument("--mode", choices=["paper", "paper_live", "live"],
                     default=config.MODE, help="overrides MODE from .env")
     ap.add_argument("--strategy", default=None,
-                    help="accepted for compatibility; every value maps to "
-                         "late_momentum (other strategies were retired)")
+                    help="accepted for compatibility; arb is the only "
+                         "strategy left, so the value is ignored")
     ap.add_argument("--asset", choices=["btc", "eth", "sol"], default=None,
                     help="btc | eth | sol (defaults to asset in .env/config)")
     ap.add_argument("--timeframe", choices=["5m", "15m", "4h"], default=None,
@@ -2550,11 +1645,6 @@ if __name__ == "__main__":
             f"python bot.py --mode paper_live\n"
             f"  bash:        TIMEFRAME={args.timeframe} "
             f"python bot.py --mode paper_live")
-    if args.strategy:
-        config.STRATEGY = args.strategy
-    # Normalize menu aliases (late_every -> EVERY_SLOT on, late_scalp selective)
-    if hasattr(config, "apply_strategy_flags"):
-        config.apply_strategy_flags()
     if args.bankroll is not None:
         config.STARTING_BANKROLL = args.bankroll
     if args.bet is not None:
@@ -2563,9 +1653,10 @@ if __name__ == "__main__":
         config.FIXED_STAKE_USD = args.bet
         if config.MAX_EXPOSURE_USD < args.bet:
             config.MAX_EXPOSURE_USD = args.bet
+        # --bet sizes a single position, so it raises the arb pair cap too.
         if args.mode != "live":
-            config.LATE_SCALP_MAX_STAKE_USD = max(getattr(config, "LATE_SCALP_MAX_STAKE_USD", 0.0), args.bet)
-            config.MID_MAX_STAKE_USD = max(getattr(config, "MID_MAX_STAKE_USD", 0.0), args.bet)
+            config.ARB_MAX_STAKE_USD = max(
+                getattr(config, "ARB_MAX_STAKE_USD", 0.0), args.bet)
     if args.reset:
         reset_state()
 
@@ -2591,7 +1682,12 @@ if __name__ == "__main__":
                 pass
 
     if args.mode == "paper":
-        run_sim(rounds=args.rounds or 200, sleep_between=args.sleep, seed=args.seed)
+        # The offline simulator drove a synthetic directional book, which only
+        # ever meant anything for momentum. An arb needs two real, live-quoted
+        # sides to be worth simulating at all, so paper_live is the paper mode.
+        raise SystemExit(
+            "MODE=paper (offline simulation) was momentum-only and is gone. "
+            "Use --mode paper_live for simulated fills against the real book.")
     elif args.mode == "paper_live":
         asyncio.run(run_realtime(rounds=args.rounds or 100, paper=True,
                                  resume=args.resume and not args.reset))

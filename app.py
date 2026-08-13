@@ -8,7 +8,7 @@ Endpoints:
     GET  /               -> embedded dashboard
     GET  /dashboard      -> embedded dashboard
     GET  /api/control    -> {running, pid, mode, cmd, exit_code}
-    POST /api/start      -> launch bot.py (paper / paper_live / live with gates)
+    POST /api/start      -> launch bot.py (paper_live / live with gates)
     POST /api/stop       -> terminate the bot
     GET  /api/wallet     -> live wallet readiness (key never returned full)
     POST /api/wallet     -> save wallet settings into local .env
@@ -51,7 +51,10 @@ STATE_DIR = paths.state_dir(_STATE_SUB)
 ENV_PATH = os.path.join(HERE, ".env")
 os.chdir(HERE)
 
-ALLOWED_MODES = {"paper", "paper_live", "live"}
+# MODE=paper was an OFFLINE simulator against a synthetic directional book —
+# meaningful only for momentum. An arb needs two real, live-quoted sides to be
+# worth simulating at all, so paper_live is the paper mode now.
+ALLOWED_MODES = {"paper_live", "live"}
 # Only these recurring series exist (verified live 2026-07-19).
 ALLOWED_TIMEFRAMES = {"5m", "15m"}
 
@@ -778,7 +781,7 @@ def _start(opts: dict) -> dict:
         mode = str(opts.get("mode", "paper_live"))
         if mode not in ALLOWED_MODES:
             return {"ok": False,
-                    "error": "Mode must be paper, paper_live, or live."}
+                    "error": "Mode must be paper_live or live."}
 
         # Real-money gates (UI + CLI both go through these checks when started here)
         if mode == "live":
@@ -1631,7 +1634,6 @@ body.trade-flash-lose { animation: page-flash-down 1.6s ease-out; }
         <span class="ctl-label">Mode</span>
         <select id="c-mode" class="ctl-select">
           <option value="paper_live">paper_live · real data, fake fills</option>
-          <option value="paper">paper · offline sim</option>
           <option value="live" class="mode-live-opt">live · REAL MONEY</option>
         </select>
       </div>
