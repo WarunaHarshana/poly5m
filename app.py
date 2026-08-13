@@ -70,6 +70,9 @@ EXPORT_FILES = (
     "archive/decisions.jsonl",
     "archive/decisions.csv",
     "archive/tuning_log.jsonl",       # every tuning decision + reason
+    "archive/arb_executions.jsonl",   # every live leg, its response and errors
+    "archive/corrections.jsonl",      # reconciliation corrections
+    "archive/order_events.jsonl",     # order lifecycle transitions
     "tuned_params.json",              # parameters currently in force
     "stats.json",
     "trades.json",

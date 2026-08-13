@@ -1545,6 +1545,19 @@ async def run_realtime(rounds: int = 100, paper: bool = True,
                 arb.get("bid_up"), arb.get("bid_down"),
             )
             print(f"  [arb/live] {live_res.reason}")
+            # Say WHY, per leg. "not filled" covers two opposite situations —
+            # the venue killed a FOK because nothing matched (the edge is not
+            # capturable) versus the venue REJECTED the order (a fixable setup
+            # problem: allowance, signing, tick size, min size). Without the
+            # venue's own words those are indistinguishable, and the first is a
+            # verdict on the strategy while the second is a bug in ours.
+            for _lg in live_res.legs:
+                print(f"    leg {_lg.side} px={_lg.price:.3f} "
+                      f"size={_lg.size} filled={_lg.filled}"
+                      + (f"  order_id={_lg.order_id}" if _lg.order_id else "")
+                      + (f"\n      venue said: {str(_lg.error)[:300]}"
+                         if _lg.error else "  (no error — order was killed, "
+                                           "not rejected)"))
             if not live_res.ok:
                 # Either nothing was bought, or the stranded leg was unwound.
                 # Book the realised unwind cost (0 when no leg filled) and
