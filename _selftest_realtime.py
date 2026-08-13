@@ -398,6 +398,66 @@ assert _worst <= 8.0, (
 print("PHASE_E_OK (status stays fresh while scanning) scans=", scan_calls["n"],
       "writes=", len(_beats), "worst gap=", round(_worst, 2), "s")
 
+# ---- Phase F: the live gate must price what a live FOK actually pays ----
+# Regression. PAPER_FILL_SLIPPAGE models a SIMULATED fill; a live leg goes out
+# FOK at the quoted ask and fills there or not at all. Charging it live made
+# bot._try_arb reject pairs on a price it would never pay — and disagree with
+# arb_executor.evaluate(), which prices the same pair from the raw asks. A real
+# signal at pair 0.950 / fees 0.030 scored -0.000 and was skipped; its true
+# locked edge was +0.020.
+import arb_executor  # noqa: E402
+
+config.ROUND_SECONDS = 0
+config.ARB_MIN_LOCKED_EDGE = 0.02
+config.PAPER_FILL_SLIPPAGE = 0.01
+config.ARB_MIN_REMAINING = 20
+config.ARB_MAX_EDGE = 0.15
+FakePubArb.slot_seconds = 30.0
+
+# Shaped like the live signals: asymmetric, because the fee curve peaks at 0.50
+# and a symmetric pair therefore costs MORE in fees than a lopsided one at the
+# same total. Raw 0.930 clears the floor comfortably; the same pair plus two
+# cents of simulated slippage does not.
+ASK_UP, ASK_DN = 0.290, 0.640          # raw pair 0.930, slipped pair 0.950
+
+
+def _marginal_scan(pub, market, feed=None):
+    return {"ask_up": ASK_UP, "ask_down": ASK_DN, "sum": ASK_UP + ASK_DN,
+            "edge": 1 - (ASK_UP + ASK_DN), "up_size": 500.0, "down_size": 500.0,
+            "bid_up": ASK_UP - 0.01, "bid_down": ASK_DN - 0.01, "src": "test"}
+
+
+bot._scan_sum_to_one_arb = _marginal_scan
+_viable, _locked, _why = arb_executor.evaluate(ASK_UP, ASK_DN, 5.0)
+assert _viable, f"the executor should accept this pair: {_why}"
+
+polymarket_client.PolymarketClient = FakeArbLiveClient
+FakeArbLiveClient.calls = []
+config.MODE = "live"
+stats_f = asyncio.run(bot.run_realtime(rounds=1, paper=False))
+config.MODE = "paper_live"
+_legs = [c for c in FakeArbLiveClient.calls if c[0] == "buy"]
+assert stats_f["trades"] == 1, (
+    "the live gate rejected a pair the executor accepts (locked %+.4f) — the "
+    "two gates disagree, which is how a real +0.020 arb got skipped: %s"
+    % (_locked, stats_f))
+assert len(_legs) == 2, f"expected both legs to go out, got {_legs}"
+# The order must be sent at the RAW ask, not a slipped one.
+assert all(abs(c[2] - ASK_UP) < 1e-9 or abs(c[2] - ASK_DN) < 1e-9
+           for c in _legs), \
+    f"legs must be priced at the quoted ask, not a slipped one: {_legs}"
+
+# ...and paper must STILL pay slippage, because its fills are imaginary.
+bot._scan_sum_to_one_arb = _marginal_scan
+stats_g = asyncio.run(bot.run_realtime(rounds=1, paper=True))
+assert stats_g["trades"] == 0, (
+    "paper must keep charging simulated slippage — without it, paper reports "
+    "fills at prices a simulation cannot honestly claim: %s" % stats_g)
+bot._scan_sum_to_one_arb = _real_scan
+print("PHASE_F_OK (live prices the FOK, paper keeps its slippage) "
+      "live_trades=", stats_f["trades"], "paper_trades=", stats_g["trades"],
+      "locked=", round(_locked, 4))
+
 bot._scan_sum_to_one_arb = _real_scan
 config.ROUND_SECONDS = 0
 

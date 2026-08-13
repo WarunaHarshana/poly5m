@@ -1328,7 +1328,20 @@ async def run_realtime(rounds: int = 100, paper: bool = True,
             print(f"  [arb] {risk.halt_reason or 'max trades/day'}; skip")
             return False
 
-        slip = float(getattr(config, "PAPER_FILL_SLIPPAGE", 0.01) or 0.0)
+        # Slippage models a SIMULATED fill. A live leg goes out as FOK at the
+        # quoted ask, so it fills at that price or not at all — there is no
+        # slippage to pay, and charging it here made the gate reject arbs on a
+        # price the bot would never have paid. Measured live: a pair at 0.950
+        # with 0.030 fees scored -0.000 against the slipped cost and was
+        # skipped, while its real locked edge was +0.020 — which is exactly
+        # what arb_executor.evaluate() computes from the raw asks moments
+        # later, so the two gates disagreed with each other.
+        #
+        # The protection against a stale quote is the order type, not a made-up
+        # cost: if the pair is not really there, the FOK is killed and the
+        # attempt is free.
+        slip = (float(getattr(config, "PAPER_FILL_SLIPPAGE", 0.01) or 0.0)
+                if paper else 0.0)
         leg_up = float(arb["ask_up"]) + slip
         leg_dn = float(arb["ask_down"]) + slip
         pair_cost = leg_up + leg_dn
