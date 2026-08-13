@@ -157,32 +157,30 @@ def compute_report(hours: float | None = None,
     out["groups"] = [
         _agg("ALL", rows),
         _agg("ARB (paired)", arb),
-        _agg("MOMENTUM", mom),
-        _agg("momentum UP", [r for r in mom if r.get("side") == "UP"]),
-        _agg("momentum DOWN", [r for r in mom if r.get("side") == "DOWN"]),
+        # Kept only so a historical range still reconciles — momentum has not
+        # traded since it was retired, and nothing is expected here.
+        _agg("MOMENTUM (retired)", mom),
     ]
 
-    if mom:
-        n = len(mom)
-        wins = sum(1 for r in mom if r.get("won"))
-        avg_entry = sum(fnum(r, "entry_price") for r in mom) / n
-        fees = sum(est_fee(r) for r in mom)
-        stake = sum(fnum(r, "stake_usd") for r in mom) or 1.0
-        breakeven = avg_entry + fees / stake * avg_entry
-        achieved = wins / n
-        out["momentum"] = {
+    if arb:
+        n = len(arb)
+        wins = sum(1 for r in arb if r.get("won"))
+        # An arb's profit is set at fill: shares - stake - fees. So the useful
+        # cut is by PAIR COST, not by direction — a pair bought at 0.94 has a
+        # third of the margin of one bought at 0.88, and that is where the
+        # fee drag shows up first.
+        out["arb"] = {
             "n": n,
-            "achieved_wr": round(100 * achieved, 1),
-            "breakeven_wr": round(100 * breakeven, 1),
-            "above_breakeven": achieved > breakeven,
-            "sample_ok": n >= MOMENTUM_TARGET_N,
-            "target_n": MOMENTUM_TARGET_N,
+            "locked_wr": round(100 * wins / n, 1),
+            "avg_pair_cost": round(
+                sum(fnum(r, "entry_price") for r in arb) / n, 4),
+            "fees": round(sum(est_fee(r) for r in arb), 4),
             "buckets": [
-                _agg(f"{lo:.2f}-{hi:.2f}",
-                     [r for r in mom if lo <= fnum(r, "entry_price") < hi])
-                for lo, hi in ((0.0, 0.70), (0.70, 0.80), (0.80, 0.85),
-                               (0.85, 0.90), (0.90, 0.95), (0.95, 1.01))
-                if any(lo <= fnum(r, "entry_price") < hi for r in mom)
+                _agg(f"pair {lo:.2f}-{hi:.2f}",
+                     [r for r in arb if lo <= fnum(r, "entry_price") < hi])
+                for lo, hi in ((0.0, 0.85), (0.85, 0.90), (0.90, 0.93),
+                               (0.93, 0.96), (0.96, 1.01))
+                if any(lo <= fnum(r, "entry_price") < hi for r in arb)
             ],
         }
 

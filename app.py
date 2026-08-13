@@ -153,122 +153,94 @@ _ENV_KEYS = (
 
 # Tunables editable from the dashboard (never secrets).
 # Each field: key, label, type (float|int|bool|str), default, group, hint
+# Sum-to-one arb is the only strategy. Every directional one was retired on
+# measurement: mid / late_scalp / late_every / hybrid on 2026-07-17, and
+# late_momentum after 41 venue-confirmed trades at -$16.57.
 # NOTE 2026-07-17: mid / late_scalp / late_every / hybrid strategies were
 # retired (negative or simulation-inflated expectancy) — the bot now runs
 # late_momentum plus a sum-to-one arb scanner. Their settings are gone too.
 STRATEGY_FIELDS = [
+    # --- Gates: what counts as an arb worth attempting ---
+    {"key": "ARB_SCAN_ENABLED", "label": "Scan for arbs", "type": "bool",
+     "default": "1", "group": "gates",
+     "hint": "Master switch for the scanner. Off = the bot watches nothing."},
+    {"key": "ARB_TRADE_ENABLED", "label": "Act on what it finds", "type": "bool",
+     "default": "1", "group": "gates",
+     "hint": "Off = signals are logged but never traded, in any mode"},
+    {"key": "ARB_MIN_EDGE", "label": "Min raw gap", "type": "float",
+     "default": "0.02", "group": "gates",
+     "hint": "Required 1 − (ask_UP + ask_DOWN) BEFORE fees. The cheap first look."},
+    {"key": "ARB_MIN_LOCKED_EDGE", "label": "Min locked edge / pair", "type": "float",
+     "default": "0.02", "group": "gates",
+     "hint": "Profit per pair AFTER slippage and both taker fees — the number "
+             "that actually has to be positive"},
+    {"key": "ARB_MAX_EDGE", "label": "Max believable gap (0=off)", "type": "float",
+     "default": "0.15", "group": "gates",
+     "hint": "A 15c+ 'free' gap is makers pulling quotes, not a fillable arb"},
+    {"key": "ARB_MIN_REMAINING", "label": "Min seconds left", "type": "int",
+     "default": "20", "group": "gates",
+     "hint": "Below this there is not enough slot left to get two legs done"},
+    {"key": "ARB_SCAN_INTERVAL_S", "label": "Scan interval (s)", "type": "float",
+     "default": "1.0", "group": "gates",
+     "hint": "How often to re-read the book within a slot (floored at 0.2s)"},
     # --- General ---
     {"key": "ASSET", "label": "Default asset", "type": "str",
      "default": "btc", "group": "general",
      "hint": "btc | eth | sol (Start menu can override)"},
-    {"key": "STRATEGY", "label": "Strategy", "type": "str",
-     "default": "late_momentum", "group": "general",
-     "hint": "late_momentum is the only strategy (others retired 2026-07-17)"},
-    # --- Late momentum strategy ---
-    {"key": "LATE_MOMENTUM_MIN_MOVE", "label": "Min move $ vs strike", "type": "float",
-     "default": "10.0", "group": "late_momentum",
-     "hint": "Required lead at 20s left; auto-scales with sqrt(time left)"},
-    {"key": "LATE_MOMENTUM_MAX_CHOP", "label": "Max strike crossings (0=off)", "type": "int",
-     "default": "3", "group": "late_momentum",
-     "hint": "Skip choppy slots where price keeps flipping across the strike"},
-    {"key": "LATE_MOMENTUM_TIME_LIMIT", "label": "Window opens (s left)", "type": "int",
-     "default": "40", "group": "late_momentum",
-     "hint": "Start checking when seconds left drops under this"},
-    {"key": "LATE_MOMENTUM_MIN_REMAINING", "label": "Window closes (s left)", "type": "int",
-     "default": "8", "group": "late_momentum",
-     "hint": "Stop trading below this many seconds"},
-    {"key": "LATE_MOMENTUM_BIDIRECTIONAL", "label": "Bidirectional", "type": "bool",
-     "default": "1", "group": "late_momentum",
-     "hint": "1=bet UP on pump / DOWN on dump, 0=only UP"},
-    {"key": "LATE_MOMENTUM_MIN_ENTRY", "label": "Min entry ask", "type": "float",
-     "default": "0.55", "group": "late_momentum",
-     "hint": "Archive: entries under ~0.92 carried the profit"},
-    {"key": "LATE_MOMENTUM_MAX_ENTRY", "label": "Max entry ask", "type": "float",
-     "default": "0.88", "group": "late_momentum",
-     "hint": "0.80-0.90 is breakeven (n=92) and gives trade flow; 0.90+ loses -$0.12/trade"},
-    {"key": "LATE_MOMENTUM_MIN_EDGE", "label": "Edge floor (0 = off)", "type": "float",
-     "default": "-0.20", "group": "late_momentum",
-     "hint": "Skip trades the model prices as strongly overpriced (edge < -0.20 "
-             "lost -$0.14/trade over n=69). Middle edges are fine; 0 = floor off"},
-    {"key": "LATE_MOMENTUM_MAX_EDGE", "label": "Edge ceiling (0=off)", "type": "float",
-     "default": "0.10", "group": "late_momentum",
-     "hint": "Skip when model is FAR above book — stale strike, book usually right"},
-    {"key": "LATE_SCALP_REQUIRE_CHAINLINK", "label": "Require Chainlink strike", "type": "bool",
-     "default": "1", "group": "late_momentum",
-     "hint": "Refuse exchange-proxy strikes (resolution risk)"},
-    {"key": "LATE_SCALP_REQUOTE", "label": "Requote before fill", "type": "bool",
-     "default": "1", "group": "late_momentum",
-     "hint": "Re-check the book before committing; skip on ask jumps"},
-    {"key": "LATE_SCALP_MAX_SPREAD", "label": "Max spread", "type": "float",
-     "default": "0.10", "group": "late_momentum"},
-    {"key": "LATE_SCALP_MAX_STAKE_USD", "label": "Max stake $", "type": "float",
-     "default": "5.00", "group": "late_momentum"},
-    {"key": "LATE_SCALP_PAUSE_SLOTS_AFTER_LOSS", "label": "Pause windows after loss", "type": "int",
-     "default": "2", "group": "late_momentum"},
-    {"key": "LATE_SCALP_USE_EDGE_SIZING", "label": "Edge-scaled sizing", "type": "bool",
-     "default": "1", "group": "late_momentum",
-     "hint": "Scale stake by model edge (fractional Kelly)"},
-    # --- Maker-first execution ---
-    {"key": "MAKER_FIRST_ENABLED", "label": "Maker-first entry", "type": "bool",
-     "default": "1", "group": "late_momentum",
-     "hint": "Rest under the ask before crossing — makers pay ZERO fee here"},
-    {"key": "MAKER_IMPROVE_TICKS", "label": "Ticks under ask", "type": "int",
-     "default": "1", "group": "late_momentum",
-     "hint": "Deeper = better price but lower fill rate"},
-    {"key": "MAKER_WAIT_SECONDS", "label": "Maker wait (s)", "type": "float",
-     "default": "3.0", "group": "late_momentum",
-     "hint": "How long to wait for the market to come to us before crossing"},
-    {"key": "MAKER_FIRST_LIVE", "label": "Maker-first in LIVE", "type": "bool",
-     "default": "0", "group": "late_momentum",
-     "hint": "Keep 0 until paper shows a solid maker fill rate"},
-    # --- Sum-to-one arbitrage ---
-    {"key": "ARB_TRADE_ENABLED", "label": "Arb scanner + paper execution", "type": "bool",
-     "default": "1", "group": "arb",
-     "hint": "Buy BOTH sides when ask_UP+ask_DOWN < 1 − min edge. Paper-only; live logs signals."},
-    {"key": "ARB_MIN_EDGE", "label": "Min arb edge (raw)", "type": "float",
-     "default": "0.04", "group": "arb",
-     "hint": "Required 1 − (ask_UP + ask_DOWN) before slippage"},
-    {"key": "ARB_MIN_LOCKED_EDGE", "label": "Min locked edge / pair", "type": "float",
-     "default": "0.02", "group": "arb",
-     "hint": "Required profit per pair AFTER slippage + taker fees"},
-    {"key": "ARB_MAX_EDGE", "label": "Max believable edge (0=off)", "type": "float",
-     "default": "0.15", "group": "arb",
-     "hint": "Bigger gaps = makers pulling quotes, not fillable arbs — skip"},
     {"key": "TAKER_FEE_RATE", "label": "Taker fee rate", "type": "float",
-     "default": "0.07", "group": "risk",
-     "hint": "Verified live: rate × min(p,1−p)/share; Gamma per-market rate overrides"},
-    {"key": "ARB_MAX_STAKE_USD", "label": "Max arb stake $", "type": "float",
-     "default": "10.0", "group": "arb",
-     "hint": "Total for both legs of one pair"},
-    {"key": "ARB_MIN_REMAINING", "label": "Min seconds left to scan", "type": "int",
-     "default": "20", "group": "arb",
-     "hint": "Skip arbs too close to slot end"},
-    # --- Risk ---
+     "default": "0.07", "group": "execution",
+     "hint": "Polymarket’s documented curve: rate × p × (1−p) per share, charged on BOTH legs. Gamma’s per-market rate overrides this."},
+    {"key": "ARB_MAX_STAKE_USD", "label": "Max stake / pair $", "type": "float",
+     "default": "5.0", "group": "sizing",
+     "hint": "Total across BOTH legs of one pair"},
+    # --- Sizing & risk ---
     {"key": "PAPER_FILL_SLIPPAGE", "label": "Paper fill slippage", "type": "float",
-     "default": "0.01", "group": "risk",
-     "hint": "Added to ask on simulated fills (both arb legs too)"},
+     "default": "0.01", "group": "execution",
+     "hint": "Added to the ask on simulated fills — both legs, so a paper pair costs 2c more than quoted"},
     {"key": "FIXED_STAKE_USD", "label": "Fixed stake $", "type": "float",
-     "default": "1", "group": "risk"},
+     "default": "1", "group": "sizing"},
     {"key": "BASE_TRADE_USD", "label": "Base trade $", "type": "float",
-     "default": "1", "group": "risk"},
+     "default": "1", "group": "sizing"},
     {"key": "MAX_TRADE_USD", "label": "Max trade $", "type": "float",
-     "default": "1", "group": "risk"},
+     "default": "1", "group": "sizing"},
     {"key": "MAX_EXPOSURE_USD", "label": "Max exposure $", "type": "float",
-     "default": "1", "group": "risk"},
+     "default": "1", "group": "sizing"},
     {"key": "STARTING_BANKROLL", "label": "Starting bankroll $", "type": "float",
-     "default": "50", "group": "risk"},
+     "default": "50", "group": "sizing"},
     {"key": "DAILY_LOSS_LIMIT_USD", "label": "Daily loss limit $", "type": "float",
-     "default": "5", "group": "risk"},
+     "default": "5", "group": "sizing"},
     {"key": "DAILY_LOSS_LIMIT_PCT", "label": "Daily loss limit % (0=off)", "type": "float",
-     "default": "0", "group": "risk"},
+     "default": "0", "group": "sizing"},
     {"key": "MAX_TRADES_PER_DAY", "label": "Max trades / day", "type": "int",
-     "default": "50", "group": "risk"},
+     "default": "50", "group": "sizing"},
     {"key": "MAX_CONSECUTIVE_LOSSES", "label": "Max consecutive losses", "type": "int",
-     "default": "2", "group": "risk"},
+     "default": "2", "group": "sizing"},
     {"key": "MIN_ORDER_SHARES", "label": "Min order shares", "type": "float",
-     "default": "5", "group": "risk"},
+     "default": "5", "group": "sizing"},
     {"key": "ENFORCE_MIN_SHARES", "label": "Enforce min shares", "type": "bool",
-     "default": "1", "group": "risk"},
+     "default": "1", "group": "sizing"},
+    {"key": "ARB_MAX_EXPOSURE_USD", "label": "Max open exposure $", "type": "float",
+     "default": "10.0", "group": "sizing",
+     "hint": "Total across all open pairs. Separate from MAX_EXPOSURE_USD, which "
+             "sizes a single directional leg \u2014 a hedged pair cannot lose the "
+             "same way, so it earns its own limit."},
+    # --- Execution ---
+    {"key": "BOOK_FEED_ENABLED", "label": "WebSocket order book", "type": "bool",
+     "default": "1", "group": "execution",
+     "hint": "Gives BOTH sides from one instant. Two REST reads seconds apart can "
+             "describe a pair that never simultaneously existed."},
+    {"key": "BOOK_FEED_MAX_AGE_S", "label": "Max book age (s)", "type": "float",
+     "default": "2.0", "group": "execution",
+     "hint": "Older than this and the scan falls back to REST rather than trusting it"},
+    # --- Live safety ---
+    {"key": "ARB_LIVE_ENABLED", "label": "Send REAL orders", "type": "bool",
+     "default": "0", "group": "live",
+     "hint": "With MODE=live this places real FOK orders on both legs. Off = live "
+             "mode still only logs signals."},
+    {"key": "LIVE_BLACKOUT_WINDOWS_UTC", "label": "Blackout windows (UTC)", "type": "str",
+     "default": "", "group": "live",
+     "hint": "HH:MM-HH:MM, comma separated. No live order is sent inside one \u2014 "
+             "a 503 between the two legs is the one path that strands a naked leg."},
 ]
 
 _SETTINGS_KEYS = {f["key"] for f in STRATEGY_FIELDS}
@@ -279,9 +251,10 @@ def _settings_payload() -> dict:
     """Current strategy settings from .env + schema for the UI."""
     env = _parse_env_file()
     groups = {
-        "late_momentum": "Late Momentum strategy",
-        "arb": "Sum-to-one arbitrage",
-        "risk": "Risk & size",
+        "gates": "Gates",
+        "sizing": "Sizing & risk",
+        "execution": "Execution",
+        "live": "Live safety",
         "general": "General",
     }
     fields = []
@@ -331,9 +304,6 @@ def _save_settings(body: dict) -> dict:
             s = s.lower()
             if s not in ("btc", "eth", "sol"):
                 errors.append("ASSET must be btc, eth, or sol")
-        elif k == "STRATEGY":
-            # Only strategy left; coerce legacy values instead of erroring.
-            s = "late_momentum"
         updates[k] = s
     if errors and not updates:
         return {"ok": False, "error": "; ".join(errors)}
@@ -813,7 +783,6 @@ def _start(opts: dict) -> dict:
         timeframe = str(opts.get("timeframe") or "5m").strip().lower()
         if timeframe not in ALLOWED_TIMEFRAMES:
             timeframe = "5m"
-        strategy = "late_momentum"  # only strategy (others retired)
         asset = str(opts.get("asset") or "btc").strip().lower()
         if asset not in ("btc", "eth", "sol"):
             asset = "btc"
@@ -821,10 +790,9 @@ def _start(opts: dict) -> dict:
 
         # Persist asset choice for next load
         try:
-            _upsert_env({"ASSET": asset, "STRATEGY": strategy})
+            _upsert_env({"ASSET": asset})
         except Exception:
             pass
-        cmd += ["--strategy", strategy]
         try:
             rounds = int(opts.get("rounds") or 100)
             if mode == "live":
@@ -927,7 +895,7 @@ DASHBOARD_HTML = r"""<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Momentum Desk — Polymarket 5m Bot</title>
+<title>Arb Desk — Polymarket 5m Bot</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -1546,8 +1514,8 @@ body.trade-flash-lose { animation: page-flash-down 1.6s ease-out; }
   <div class="header glass-card">
     <div class="brand">
       <span class="brand-icon">&#9889;</span>
-      <span class="brand-text">MOMENTUM <span>DESK</span></span>
-      <span class="badge" title="mid / late_scalp / late_every / hybrid retired 2026-07-17">late_momentum + arb</span>
+      <span class="brand-text">ARB <span>DESK</span></span>
+      <span class="badge" title="Every directional strategy was retired on measurement. Sum-to-one arb is the only one left: buy BOTH sides when they cost under $1 together, and one leg pays $1/share whichever way the slot lands.">sum-to-one arb</span>
     </div>
     <div class="header-right">
       <span class="badge mode" id="mode">MODE: —</span>
@@ -1581,12 +1549,6 @@ body.trade-flash-lose { animation: page-flash-down 1.6s ease-out; }
         <select id="c-timeframe" class="ctl-select">
           <option value="5m">5m · 12 slots/hr · deepest book</option>
           <option value="15m">15m · 4 slots/hr · ~4x thinner</option>
-        </select>
-      </div>
-      <div class="ctl-field">
-        <span class="ctl-label">Strategy</span>
-        <select id="c-strategy" class="ctl-select">
-          <option value="late_momentum">late_momentum · move vs strike, last 40s (+ arb scanner)</option>
         </select>
       </div>
       <div class="ctl-field">
@@ -1629,16 +1591,16 @@ body.trade-flash-lose { animation: page-flash-down 1.6s ease-out; }
     </div>
     <div id="sp-body">
       <div class="sp-tabs" id="sp-tabs">
-        <button type="button" class="sp-tab on" data-g="late_momentum">Late Momentum</button>
-        <button type="button" class="sp-tab" data-g="arb">Arbitrage</button>
-        <button type="button" class="sp-tab" data-g="risk">Risk</button>
+        <button type="button" class="sp-tab on" data-g="gates">Gates</button>
+        <button type="button" class="sp-tab" data-g="sizing">Sizing &amp; risk</button>
+        <button type="button" class="sp-tab" data-g="execution">Execution</button>
+        <button type="button" class="sp-tab" data-g="live">Live safety</button>
         <button type="button" class="sp-tab" data-g="general">General</button>
       </div>
       <div id="sp-groups"></div>
       <div class="sp-actions">
         <button type="button" class="btn-save" id="sp-save">Save settings to .env</button>
         <button type="button" class="btn-ghost" id="sp-reload">Reload from .env</button>
-        <button type="button" class="btn-ghost" id="sp-preset-momentum">Preset: momentum · archive-tuned</button>
       </div>
       <div class="sp-msg" id="sp-msg"></div>
       <p class="sp-note" id="sp-note">Changes apply after you <b>Stop</b> and <b>Start</b> the bot (child process reads .env on launch).</p>
@@ -1747,10 +1709,6 @@ body.trade-flash-lose { animation: page-flash-down 1.6s ease-out; }
       <span class="sb-v" id="sb-signal">—</span>
     </div>
     <div class="sb-item">
-      <span class="sb-k">Time Guard</span>
-      <span class="sb-v" id="sb-time-suitability">—</span>
-    </div>
-    <div class="sb-item">
       <span class="sb-k">PM Wallet</span>
       <span class="sb-v big mono" id="sb-wallet">—</span>
     </div>
@@ -1775,16 +1733,16 @@ body.trade-flash-lose { animation: page-flash-down 1.6s ease-out; }
       </div>
     </div>
     <div class="panel glass-card strat animate-in delay-4">
-      <div class="phead"><span>Strategy</span><span>Momentum + Arb</span></div>
+      <div class="phead"><span>Strategy</span><span>Sum-to-one Arb</span></div>
       <div class="pbody">
-        <div class="lbl">Late Momentum</div>
-        <p>In the last ~40s of each 5-min slot: if spot moved past the Chainlink strike by the min move, buy <span class="up">UP</span>/<span class="down">DOWN</span> in the 0.55–0.92 ask band. Edge floor <i>and</i> ceiling — a model far above the book usually means a stale strike.</p>
-        <div class="lbl">Sum-to-one Arb</div>
-        <p>Whenever <span class="arb">ask UP + ask DOWN &lt; $1</span>, buy both sides — one leg pays $1/share either way (paper-only execution; live logs signals).</p>
-        <div class="lbl">Risk</div>
-        <p>Edge-scaled sizing · exposure caps · loss cooldown · daily-loss circuit breaker. Background settlement keeps the loop watching every slot.</p>
+        <div class="lbl">The trade</div>
+        <p>Whenever <span class="arb">ask UP + ask DOWN &lt; $1</span>, buy equal shares of both. Exactly one leg pays $1/share whichever way the slot resolves, so the profit is <b>arithmetic, not a prediction</b> — it is set the moment both legs fill.</p>
+        <div class="lbl">Why it can still lose</div>
+        <p>Only two ways. Fees can eat the gap, which is why the locked edge is computed net of <i>both</i> taker fees before anything is sent. Or the second leg misses after the first fills — that leaves a naked directional position, so it is unwound at the bid immediately and the failure is alerted, never just logged.</p>
+        <div class="lbl">Execution</div>
+        <p>Both legs go out <b>FOK</b>: they fill completely or not at all. The thinner side goes first, so a miss costs nothing. Prices come from one WebSocket snapshot — two REST reads seconds apart can describe a pair that never simultaneously existed.</p>
         <div class="lbl">Data Source</div>
-        <p id="datanote">Chainlink Data Streams (Polymarket's oracle) + real order books. Paper fills pay ask + slippage.</p>
+        <p id="datanote">Real Polymarket order books over WebSocket, with a REST fallback. Paper fills pay ask + slippage on both legs.</p>
       </div>
     </div>
   </div>
@@ -1819,6 +1777,27 @@ body.trade-flash-lose { animation: page-flash-down 1.6s ease-out; }
     </table>
   </div>
 
+  <!-- ===== LIVE EXECUTION RECORD ===== -->
+  <!-- The number the whole live test exists to produce. A locked pair is
+       profitable by construction, so "does it fill" is the only open question. -->
+  <div class="panel glass-card" id="exec-panel" style="margin-top:14px">
+    <div class="phead">
+      <span>Live Execution Record · <span style="color:var(--accent2)">does it actually fill?</span></span>
+      <span id="ex-sub" class="mono">—</span>
+    </div>
+    <div class="pbody">
+      <div id="ex-naked" class="arb-alert" style="display:none"></div>
+      <div id="ex-verdict" class="an-verdict">No attempts recorded yet.</div>
+      <div id="ex-tiles" class="tiles" style="margin-top:12px"></div>
+      <div id="ex-funnel" style="margin-top:14px"></div>
+      <p style="margin-top:10px;font-size:11.5px;color:var(--txt-soft);line-height:1.5">
+        A first-leg kill costs <b>nothing</b> — no position was opened, so it is a
+        miss, not a loss. The row that matters is <b>unwind failures</b>: that is
+        the only path in this design that can leave a real naked position.
+      </p>
+    </div>
+  </div>
+
   <!-- ===== LEARNING & DATA ===== -->
   <div class="panel glass-card" id="learn-panel" style="margin-top:14px">
     <div class="phead">
@@ -1828,7 +1807,6 @@ body.trade-flash-lose { animation: page-flash-down 1.6s ease-out; }
       </span>
     </div>
     <div class="pbody">
-      <div id="ln-alert" class="arb-alert" style="display:none"></div>
       <div id="ln-summary" class="an-verdict">Loading learning state…</div>
       <div style="display:flex;gap:10px;flex-wrap:wrap;margin:12px 0 4px">
         <a class="btn-save" id="ln-dl" href="/api/export" download
@@ -1866,7 +1844,7 @@ body.trade-flash-lose { animation: page-flash-down 1.6s ease-out; }
       <div id="an-verdict" class="an-verdict">Loading analysis…</div>
       <div style="overflow-x:auto"><table id="an-groups"></table></div>
       <div id="an-buckets-wrap" style="display:none;margin-top:12px">
-        <div class="lbl" style="font-size:9.5px;font-weight:600;color:var(--dim);letter-spacing:0.8px;text-transform:uppercase;margin-bottom:6px">Momentum by entry price</div>
+        <div class="lbl" style="font-size:9.5px;font-weight:600;color:var(--dim);letter-spacing:0.8px;text-transform:uppercase;margin-bottom:6px">Arb by pair cost</div>
         <div style="overflow-x:auto"><table id="an-buckets"></table></div>
       </div>
       <p id="an-notes" style="margin-top:10px;font-size:11.5px;color:var(--txt-soft);line-height:1.5"></p>
@@ -2143,24 +2121,38 @@ function handleTradeEvent(st) {
     : '';
   const when = st.time_et || st.time_utc || '';
 
+  // An ARB is a PAIR, not a direction. Colouring it as "up" (which anything
+  // not DOWN used to get) read as a directional call, and the WON/LOST framing
+  // does not fit a position that pays either way.
+  const isArb = side === 'ARB';
+  const dirCls = isArb ? 'arb' : (side === 'DOWN' ? 'down' : 'up');
+
   if (st.trade_event === 'placed') {
-    const title = `TRADE PLACED · ${side || '?'}`;
-    const body = `${side} @ ${mkt} ${stake}<br>${q}${when ? '<br>' + when : ''}${link}`;
-    showToast(title, body, side === 'DOWN' ? 'down' : 'up');
-    blinkPage(side === 'DOWN' ? 'down' : 'up');
+    const title = isArb ? 'PAIR LOCKED · ARB' : `TRADE PLACED · ${side || '?'}`;
+    const body = isArb
+      ? `both legs @ ${mkt}/pair ${stake}<br>${q}${when ? '<br>' + when : ''}${link}`
+      : `${side} @ ${mkt} ${stake}<br>${q}${when ? '<br>' + when : ''}${link}`;
+    showToast(title, body, dirCls);
+    blinkPage(dirCls);
     playTradeBeep('placed');
-    desktopNotify(title, `${side} @ ${mkt} ${stake} · ${q}`);
+    desktopNotify(title, `${isArb ? 'pair' : side} @ ${mkt} ${stake} · ${q}`);
   } else if (st.trade_event === 'resolved') {
     const res = (st.last_result || '').toUpperCase();
     const pnl = st.last_pnl != null
       ? ((st.last_pnl >= 0 ? '+' : '') + Number(st.last_pnl).toFixed(2))
       : '';
-    const title = res === 'WON' ? `WON · ${side}` : (res === 'LOST' ? `LOST · ${side}` : `RESOLVED · ${side}`);
-    const body = `${res} ${pnl} · entry ${mkt}<br>${q}${link}`;
-    showToast(title, body, res === 'WON' ? 'won' : (res === 'LOST' ? 'lost' : ''));
-    blinkPage(res === 'WON' ? 'won' : (res === 'LOST' ? 'lost' : (side === 'DOWN' ? 'down' : 'up')));
-    playTradeBeep(res === 'WON' ? 'won' : 'lost');
-    desktopNotify(title, `${res} ${pnl} · ${side} @ ${mkt}`);
+    const paid = res === 'WON';
+    const title = isArb
+      ? (paid ? `PAIR PAID ${pnl}` : `PAIR SETTLED ${pnl}`)
+      : (paid ? `WON · ${side}` : (res === 'LOST' ? `LOST · ${side}` : `RESOLVED · ${side}`));
+    const body = isArb
+      ? `${pnl} on a pair costing ${mkt}<br>${q}${link}`
+      : `${res} ${pnl} · entry ${mkt}<br>${q}${link}`;
+    const cls = paid ? 'won' : (res === 'LOST' ? 'lost' : '');
+    showToast(title, body, cls);
+    blinkPage(cls || dirCls);
+    playTradeBeep(paid ? 'won' : 'lost');
+    desktopNotify(title, isArb ? `${pnl} · pair @ ${mkt}` : `${res} ${pnl} · ${side} @ ${mkt}`);
   }
 }
 
@@ -2235,23 +2227,6 @@ function renderStatus(st) {
     sig.innerHTML = `<span class="${cls}">${st.last_result} ${(st.last_pnl >= 0 ? '+' : '') + Number(st.last_pnl || 0).toFixed(2)}</span>`;
   } else {
     sig.textContent = '—';
-  }
-
-  const tsEl = document.getElementById('sb-time-suitability');
-  if (tsEl) {
-    const suit = st.time_suitability || '—';
-    if (suit === '—') {
-      tsEl.textContent = '—';
-    } else {
-      const idx = suit.indexOf(':');
-      const action = idx !== -1 ? suit.substring(0, idx).trim() : suit;
-      const reason = idx !== -1 ? suit.substring(idx + 1).trim() : '';
-      let cls = 'dim';
-      if (action === 'GOOD') cls = 'won';
-      else if (action === 'AVOID') cls = 'lost';
-      else if (action === 'CAUTION') cls = 'amb';
-      tsEl.innerHTML = `<span class="${cls}" style="font-weight:bold">${action}</span> <span style="font-size:10px;opacity:0.8">${reason}</span>`;
-    }
   }
 
   openPositions = Array.isArray(st.open_positions) ? st.open_positions : [];
@@ -2336,21 +2311,20 @@ function render(stats, trades) {
       s: pmSub, cls: pmBal != null ? 'pos' : '' },
     { k: 'Local Bankroll',  v: fmtUsd(stats.bankroll || start), s: 'bot tracker · start ' + fmtUsd(start) },
     { k: 'Realized P&L',    v: fmtUsd(pnl),                    s: pnlPct.toFixed(1) + '% vs start', cls: pnl >= 0 ? 'pos' : 'neg' },
-    // Momentum-only win rate vs its breakeven — the blended number counted
-    // structural ARB wins as skill and read ~10pp too good.
-    { k: 'Momentum WR',
-      v: (stats.momentum_trades ? (stats.momentum_win_rate || 0) + '%' : '—'),
-      s: (stats.momentum_trades
-          ? ('needs ' + (stats.momentum_breakeven_wr || 0) + '% · n=' + stats.momentum_trades)
-          : 'no directional trades yet'),
-      cls: (stats.momentum_trades &&
-            stats.momentum_win_rate > stats.momentum_breakeven_wr) ? 'pos' : 'neg' },
-    { k: 'Momentum / Arb P&L',
-      v: fmtUsd(stats.momentum_pnl || 0),
-      s: 'arb ' + fmtUsd(stats.arb_pnl || 0) + ' · fees ' + fmtUsd(stats.fees_paid || 0)
-         + ' · maker ' + (stats.maker_fill_rate || 0) + '%',
-      cls: (stats.momentum_pnl || 0) >= 0 ? 'pos' : 'neg' },
-    { k: 'Trades',          v: stats.trades || 0,               s: (stats.wins || 0) + 'W / ' + (stats.losses || 0) + 'L total' },
+    // Lock rate is THE number: an arb that fills is profitable by
+    // construction, so the only question is how often both legs land.
+    { k: 'Lock Rate',
+      v: (lastArbExec && lastArbExec.attempts
+          ? (lastArbExec.lock_rate_pct || 0) + '%' : '—'),
+      s: (lastArbExec && lastArbExec.attempts
+          ? (lastArbExec.both_legs_locked || 0) + ' of ' + lastArbExec.attempts + ' attempts'
+          : 'no attempts yet'),
+      cls: (lastArbExec && lastArbExec.both_legs_locked) ? 'pos' : '' },
+    { k: 'Arb P&L',
+      v: fmtUsd(stats.arb_pnl || 0),
+      s: (stats.arb_trades || 0) + ' pairs · fees ' + fmtUsd(stats.fees_paid || 0),
+      cls: (stats.arb_pnl || 0) >= 0 ? 'pos' : 'neg' },
+    { k: 'Pairs Settled',   v: stats.arb_trades || 0,           s: (stats.trades || 0) + ' rows in the blotter' },
     { k: 'Max Drawdown',    v: fmtUsd(mdd),                     s: 'peak-to-trough', cls: 'neg' },
     { k: 'Circuit Breaker', v: stats.halted ? 'TRIPPED' : 'ARMED',
       s: stats.halted ? (stats.halt_reason || 'halted') : 'daily loss stop',
@@ -2597,7 +2571,6 @@ document.getElementById('c-start').onclick = async () => {
     mode,
     asset:    document.getElementById('c-asset').value,
     timeframe: curTf(),
-    strategy: document.getElementById('c-strategy').value,
     bankroll: document.getElementById('c-bankroll').value,
     bet:      document.getElementById('c-bet').value,
     rounds:   document.getElementById('c-rounds').value,
@@ -2821,7 +2794,10 @@ document.getElementById('lw-toggle').onclick = () => {
 
 /* ===== STRATEGY SETTINGS UI ===== */
 let settingsSchema = null;
-let settingsActiveGroup = 'late_momentum';
+// Must name a group the server actually returns. Every .sp-group is
+// display:none until one gets the `on` class, so a stale value here renders
+// the entire settings body blank with no error anywhere.
+let settingsActiveGroup = 'gates';
 
 function _spVal(field) {
   const el = document.getElementById('sf-' + field.key);
@@ -2853,12 +2829,6 @@ function renderSettings(data) {
           <span style="font-size:12px;color:var(--txt-soft)">${f.key}</span></div>
           ${hint}</div>`;
       }
-      if (f.key === 'STRATEGY') {
-        return `<div class="sp-field"><label>${f.label}</label>
-          <select id="${id}">
-            <option value="late_momentum" selected>late_momentum (only strategy)</option>
-          </select>${hint}</div>`;
-      }
       if (f.key === 'ASSET') {
         const v = String(f.value || 'btc').toLowerCase();
         return `<div class="sp-field"><label>${f.label}</label>
@@ -2867,6 +2837,13 @@ function renderSettings(data) {
             <option value="eth" ${v==='eth'?'selected':''}>eth</option>
             <option value="sol" ${v==='sol'?'selected':''}>sol</option>
           </select>${hint}</div>`;
+      }
+      // Free text (blackout windows). Must come AFTER the enumerated keys
+      // above, or it swallows them.
+      if (f.type === 'str') {
+        return `<div class="sp-field"><label>${f.label}</label>
+          <input id="${id}" type="text" value="${f.value ?? ''}" data-key="${f.key}">
+          ${hint}</div>`;
       }
       const step = f.type === 'int' ? '1' : 'any';
       return `<div class="sp-field"><label>${f.label}</label>
@@ -2927,10 +2904,6 @@ async function saveSettings(partial) {
     renderSettings(r);
     msg.textContent = 'Saved ' + (r.saved ? r.saved.length : '') + ' keys to .env — Stop + Start bot to apply.';
     msg.className = 'sp-msg ok';
-    // Sync strategy dropdown if present
-    if (settings.STRATEGY && document.getElementById('c-strategy')) {
-      document.getElementById('c-strategy').value = settings.STRATEGY;
-    }
     // Sync asset dropdown if present
     if (settings.ASSET && document.getElementById('c-asset')) {
       document.getElementById('c-asset').value = settings.ASSET.toLowerCase();
@@ -2961,28 +2934,6 @@ document.getElementById('sp-toggle').onclick = () => {
   body.style.display = hide ? 'none' : '';
   btn.textContent = hide ? 'Show' : 'Hide';
 };
-// Values the trade-archive bucket analysis supported (2026-07-17):
-// entries <= 0.92 carried the profit; huge model edges were anti-predictive.
-document.getElementById('sp-preset-momentum').onclick = () => saveSettings({
-  STRATEGY: 'late_momentum',
-  LATE_MOMENTUM_MIN_MOVE: '10.0',
-  LATE_MOMENTUM_TIME_LIMIT: '40',
-  LATE_MOMENTUM_MIN_REMAINING: '8',
-  LATE_MOMENTUM_BIDIRECTIONAL: '1',
-  LATE_MOMENTUM_MIN_ENTRY: '0.55',
-  LATE_MOMENTUM_MAX_ENTRY: '0.92',
-  LATE_MOMENTUM_MIN_EDGE: '0.0',
-  LATE_MOMENTUM_MAX_EDGE: '0.10',
-  LATE_SCALP_REQUIRE_CHAINLINK: '1',
-  LATE_SCALP_REQUOTE: '1',
-  LATE_SCALP_MAX_SPREAD: '0.10',
-  LATE_SCALP_MAX_STAKE_USD: '5.0',
-  LATE_SCALP_PAUSE_SLOTS_AFTER_LOSS: '2',
-  ARB_TRADE_ENABLED: '1',
-  ARB_MIN_EDGE: '0.02',
-  ARB_MAX_STAKE_USD: '10.0',
-  ARB_MIN_REMAINING: '20',
-});
 
 /* ===== PERFORMANCE ANALYSIS PANEL ===== */
 function anCls(v) { return v > 0 ? 'won' : (v < 0 ? 'lost' : ''); }
@@ -2998,21 +2949,22 @@ function renderAnalysis(rep) {
     groups.innerHTML = ''; bwrap.style.display = 'none'; notes.textContent = '';
     return;
   }
-  // Verdict banner (momentum vs breakeven — the number that decides live)
-  const m = rep.momentum;
+  // Verdict banner. A settled arb pair is profitable by construction, so the
+  // question here is not "did we pick right" but "did the pair cost little
+  // enough that fees left something behind".
+  const m = rep.arb;
   if (m) {
-    const above = m.above_breakeven;
-    verdict.className = 'an-verdict ' + (above ? (m.sample_ok ? 'good' : 'warn')
-                                               : 'bad');
+    const ok = m.locked_wr >= 100;
+    verdict.className = 'an-verdict ' + (ok ? 'good' : 'warn');
     verdict.innerHTML =
-      `Momentum: ${m.achieved_wr}% win rate vs ~${m.breakeven_wr}% breakeven ` +
-      `→ <b>${above ? 'ABOVE' : 'BELOW'} breakeven</b> (n=${m.n})` +
-      `<small>${m.sample_ok
-        ? 'Sample size OK — this verdict is meaningful.'
-        : 'Small sample — target ' + m.target_n + '+ momentum trades before trusting this (or going live).'}</small>`;
+      `Arb: ${m.n} settled pair(s), avg pair cost ${m.avg_pair_cost}, ` +
+      `fees ${m.fees.toFixed(2)} → <b>${m.locked_wr}% profitable</b>` +
+      `<small>${ok
+        ? 'Every settled pair paid — as it should, once both legs fill.'
+        : 'A pair that settles unprofitable means the fills were worse than quoted, or fees ate the gap. Check the pair-cost buckets below.'}</small>`;
   } else {
     verdict.className = 'an-verdict';
-    verdict.textContent = 'No momentum trades in this range (arb only).';
+    verdict.textContent = 'No settled arb pairs in this range yet.';
   }
   // Groups table
   const rows = (rep.groups || []).filter(g => g.n > 0);
@@ -3030,7 +2982,7 @@ function renderAnalysis(rep) {
   if (buckets.length) {
     bwrap.style.display = '';
     document.getElementById('an-buckets').innerHTML =
-      '<thead><tr><th>Entry range</th><th>N</th><th>Win %</th><th>PnL $</th>' +
+      '<thead><tr><th>Pair cost</th><th>N</th><th>Profitable %</th><th>PnL $</th>' +
       '<th>Per trade</th></tr></thead><tbody>' +
       buckets.map(b =>
         `<tr><td>${b.label}</td><td>${b.n}</td><td>${b.win_rate}%</td>` +
@@ -3049,9 +3001,6 @@ function renderAnalysis(rep) {
       `${o.total_without >= 0 ? '+' : ''}${o.total_without} vs ` +
       `${o.total >= 0 ? '+' : ''}${o.total}.`;
     if (o.dominates) txt += ' ⚠ One trade dominates — headline unproven.';
-  }
-  if (rep.stream_warning) {
-    txt += ' ⚠ High proxy_strike skips — Chainlink stream missing slot opens (momentum starved).';
   }
   notes.textContent = txt;
 }
@@ -3080,6 +3029,113 @@ document.getElementById('an-range').addEventListener('change', loadAnalysis);
 setInterval(loadAnalysis, 60000);
 loadAnalysis();
 
+/* ===== LIVE EXECUTION RECORD ===== */
+// Set from /api/learning so the tiles above can show the lock rate without a
+// second round trip. Declared before anything reads it.
+let lastArbExec = null;
+
+function renderExec(d) {
+  const sub = document.getElementById('ex-sub');
+  const verdict = document.getElementById('ex-verdict');
+  const tiles = document.getElementById('ex-tiles');
+  const funnel = document.getElementById('ex-funnel');
+  const naked = document.getElementById('ex-naked');
+  if (!sub) return;
+
+  // An unwind failure means real directional exposure may be sitting on the
+  // book unhedged. Nothing else on this page outranks it.
+  const alerts = d.arb_alerts || [];
+  if (alerts.length) {
+    naked.style.display = 'block';
+    naked.innerHTML = `<strong>&#9888; ${alerts.length} UNRESOLVED UNWIND `
+      + `FAILURE(S)</strong><br>A naked directional position may be open on `
+      + `Polymarket right now. Check the position and close it by hand.<br>`
+      + alerts.slice(0, 3).map(a => {
+          const held = (a.legs || []).find(l => l.filled) || {};
+          return `<span class="mono">${a.time_utc || ''} — ${held.side || '?'} `
+               + `${held.size || '?'} @ ${held.price || '?'}</span>`;
+        }).join('<br>');
+  } else {
+    naked.style.display = 'none';
+  }
+
+  const x = d.arb_exec || {};
+  lastArbExec = x;
+  const n = x.attempts || 0;
+  const locked = x.both_legs_locked || 0;
+  const killed = x.first_leg_killed_no_risk || 0;
+  const unwound = x.second_leg_killed_and_unwound || 0;
+  const failures = x.unwind_failures || 0;
+  sub.textContent = n ? n + ' attempts' : 'no attempts yet';
+
+  // The census tells us WHY there is no fill data — a refused order and an
+  // unfilled order look identical in a lock-rate number, and only one of them
+  // is a statement about the market.
+  const census = d.dataset || {};
+  const refused = census.refused_by_venue || 0;
+
+  if (!n) {
+    verdict.className = 'an-verdict';
+    verdict.textContent = 'No arb has been attempted yet. The scanner logs a '
+      + 'signal only when a pair clears every gate.';
+  } else if (refused && !locked) {
+    verdict.className = 'an-verdict bad';
+    verdict.innerHTML = `<b>${refused} order(s) were REFUSED by the venue and `
+      + `never reached the book.</b> That is a setup problem — region, auth, `
+      + `size or tick — not a verdict on the strategy. A lock rate computed `
+      + `from these would be meaningless. Check the leg errors in `
+      + `<span class="mono">arb_executions.jsonl</span>.`;
+  } else if (!locked) {
+    verdict.className = 'an-verdict warn';
+    verdict.innerHTML = `<b>${n} attempts, none locked yet.</b> Every one died `
+      + `on the first leg, which costs nothing — but it also means the edge has `
+      + `not yet been shown to be capturable.`;
+  } else {
+    const pos = (x.net_pnl || 0) >= 0;
+    verdict.className = 'an-verdict ' + (pos ? 'good' : 'bad');
+    verdict.innerHTML = `<b>${locked} of ${n} attempts locked `
+      + `(${x.lock_rate_pct || 0}%)</b> — net `
+      + `${pos ? '+' : ''}${Number(x.net_pnl || 0).toFixed(2)}`;
+  }
+
+  const cells = [
+    { k: 'Lock rate', v: n ? (x.lock_rate_pct || 0) + '%' : '—',
+      s: locked + ' locked', cls: locked ? 'pos' : '' },
+    { k: 'Attempts', v: n, s: 'orders actually sent' },
+    { k: 'First leg killed', v: killed, s: 'no position, no loss', cls: 'amb' },
+    { k: 'Unwound', v: unwound, s: 'stranded leg closed', cls: unwound ? 'neg' : '' },
+    { k: 'Unwind failures', v: failures,
+      s: failures ? 'NAKED — act now' : 'none',
+      cls: failures ? 'neg' : 'pos' },
+    { k: 'Net P&L', v: (x.net_pnl >= 0 ? '+' : '') + Number(x.net_pnl || 0).toFixed(2),
+      s: 'realised on execution', cls: (x.net_pnl || 0) >= 0 ? 'pos' : 'neg' },
+  ];
+  tiles.innerHTML = cells.map(t =>
+    `<div class="tile glass-card"><div class="k">${t.k}</div>` +
+    `<div class="v mono ${t.cls || ''}">${t.v}</div>` +
+    `<div class="s">${t.s}</div></div>`).join('');
+
+  // Where do opportunities die? Each row is a narrower filter than the last.
+  // A refused order never reached the book, so it cannot also be counted as a
+  // leg the market declined to fill — that double-count is exactly the
+  // confusion that made 11 geoblocked orders look like a verdict on the edge.
+  const reached = n - refused;
+  const killedAtBook = Math.max(0, reached - locked - unwound);
+  const rows = [
+    ['Attempts sent', n, ''],
+    ['Reached the book', reached,
+     refused ? refused + ' refused by the venue — never a market interaction' : ''],
+    ['Both legs locked', locked,
+     killedAtBook ? killedAtBook + ' killed at the book (no match)' : ''],
+  ];
+  funnel.innerHTML =
+    '<table><thead><tr><th>Stage</th><th>Count</th><th>Dropped here</th></tr>'
+    + '</thead><tbody>'
+    + rows.map(r => `<tr><td>${r[0]}</td><td class="mono">${r[1]}</td>`
+                  + `<td style="font-size:11px;color:var(--txt-soft)">${r[2]}</td></tr>`).join('')
+    + '</tbody></table>';
+}
+
 /* ===== SELF-TUNING & DATA EXPORT PANEL ===== */
 function renderLearning(d) {
   const sum = document.getElementById('ln-summary');
@@ -3090,28 +3146,11 @@ function renderLearning(d) {
     ptab.innerHTML = ''; jtab.innerHTML = '';
     return;
   }
-  const need = d.needed_to_tune || 0;
-  const pct = need ? Math.min(100, Math.round(100 * d.labeled / need)) : 0;
   const sup = d.supervisor || {};
-  // An unwind failure means real directional exposure may be sitting on the
-  // book unhedged. Nothing else on this page outranks it.
-  const alerts = d.arb_alerts || [];
-  const banner = document.getElementById('ln-alert');
-  if (banner) {
-    if (alerts.length) {
-      banner.style.display = 'block';
-      banner.innerHTML = `<strong>&#9888; ${alerts.length} UNRESOLVED ARB UNWIND `
-        + `FAILURE(S)</strong><br>A naked directional position may be open on `
-        + `Polymarket. Check the position and close it by hand.<br>`
-        + alerts.slice(0, 3).map(a => {
-            const held = (a.legs || []).find(l => l.filled) || {};
-            return `<span class="mono">${a.time_utc || ''} — ${held.side || '?'} `
-                 + `${held.size || '?'} @ ${held.price || '?'}</span>`;
-          }).join('<br>');
-    } else {
-      banner.style.display = 'none';
-    }
-  }
+  const census = d.dataset || {};
+  const usable = d.usable_attempts || 0;
+  const need = d.needed_to_tune || 0;
+  const pct = need ? Math.min(100, Math.round(100 * usable / need)) : 0;
 
   let s = '';
   // A deploy with no volume looks perfectly healthy until the next redeploy
@@ -3121,9 +3160,18 @@ function renderLearning(d) {
     s += '⚠ DATA IS NOT PERSISTENT — everything below is destroyed on the ' +
          'next redeploy. Attach a volume mounted at /data. ';
   }
-  s += d.labeled >= need
-    ? `Dataset ready: ${d.labeled} labeled slots of ${d.observations} recorded. `
-    : `Collecting data: ${d.labeled} labeled of ${need} needed to tune (${pct}%). `;
+  if (d.tuner_error) {
+    s += '⚠ Tuner unavailable: ' + d.tuner_error + '. ';
+  } else {
+    s += usable >= need
+      ? `Dataset ready: ${usable} scorable attempts. `
+      : `Collecting: ${usable} scorable attempts of ${need} needed (${pct}%). `;
+    if (census.refused_by_venue) {
+      s += `${census.refused_by_venue} more were refused by the venue and `
+         + `cannot be scored — a refused order says nothing about whether the `
+         + `edge was capturable. `;
+    }
+  }
   if (sup.bot_restarts != null) s += `Bot restarts: ${sup.bot_restarts}. `;
   const lt = sup.last_tune;
   if (lt && lt.action) {
@@ -3134,14 +3182,14 @@ function renderLearning(d) {
 
   // Which parameters are in force, and whether they came from the tuner.
   const act = d.active_params || {}, def = d.defaults || {};
-  let rows = '<thead><tr><th>Parameter</th><th>In force</th><th>Default</th><th></th></tr></thead><tbody>';
+  let rows = '<thead><tr><th>Gate</th><th>In force</th><th>Default</th><th></th></tr></thead><tbody>';
   Object.keys(act).forEach(k => {
     const moved = String(act[k]) !== String(def[k]);
-    rows += `<tr><td class="mono">${k.replace('LATE_MOMENTUM_', '')}</td>` +
+    rows += `<tr><td class="mono">${k.replace('ARB_', '')}</td>` +
             `<td class="mono">${act[k]}</td><td class="mono">${def[k]}</td>` +
             `<td>${moved ? '<span class="badge">learned</span>' : ''}</td></tr>`;
   });
-  ptab.innerHTML = rows + '</tbody>';
+  ptab.innerHTML = Object.keys(act).length ? rows + '</tbody>' : '';
 
   const j = d.journal || [];
   if (!j.length) { jtab.innerHTML = ''; return; }
@@ -3150,7 +3198,7 @@ function renderLearning(d) {
     let detail = '';
     if (e.action === 'apply' && e.changes) {
       detail = Object.keys(e.changes).map(k =>
-        `${k.replace('LATE_MOMENTUM_', '')} ${e.changes[k].from}→${e.changes[k].to}`).join(', ');
+        `${k.replace('ARB_', '')} ${e.changes[k].from}→${e.changes[k].to}`).join(', ');
     } else if (e.action === 'reject') {
       detail = (e.rejected_for || []).join('; ');
     } else if (e.action === 'revert') {
@@ -3167,6 +3215,7 @@ function renderLearning(d) {
 async function loadLearning() {
   try {
     const d = await fetch('/api/learning', { cache: 'no-store' }).then(r => r.json());
+    renderExec(d);
     renderLearning(d);
   } catch (e) {
     renderLearning({ ok: false, error: String(e) });
