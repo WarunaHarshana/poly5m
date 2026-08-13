@@ -179,8 +179,12 @@ class RestPub:
 
 
 def _rest_quote(pub, market, side):
+    # 0.47 a side -> pair 0.94, a 6c gap against ~3.5c of fees. It used to
+    # quote 0.49 (a 2c gap), which cleared the old flat ARB_MIN_EDGE but cannot
+    # clear the fee-aware gate — the whole point of that change is that a 2c
+    # gap at mid prices is not an arb, it is a 1.5c loss.
     pub.calls += 1
-    return {"price": 0.49, "ask_size": 25.0, "best_bid": 0.47}
+    return {"price": 0.47, "ask_size": 25.0, "best_bid": 0.45}
 
 
 bot._quote_side = _rest_quote
@@ -224,8 +228,8 @@ check("a stale socket falls back to REST", pub2.calls == 2,
       f"{pub2.calls} REST calls")
 check("the REST fallback still produces a quote", res is not None, str(res))
 check("the REST fallback carries bids too",
-      res is not None and res.get("bid_up") == 0.47
-      and res.get("bid_down") == 0.47, str(res))
+      res is not None and res.get("bid_up") == 0.45
+      and res.get("bid_down") == 0.45, str(res))
 
 # No feed at all must behave exactly as before.
 pub3 = RestPub()

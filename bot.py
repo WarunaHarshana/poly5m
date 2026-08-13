@@ -788,9 +788,22 @@ def _scan_sum_to_one_arb(pub, market, feed=None) -> dict | None:
         if not (0.0 < p_up < 1.0 and 0.0 < p_dn < 1.0):
             return None
         s = p_up + p_dn
-        min_edge = float(getattr(config, "ARB_MIN_EDGE", 0.02) or 0.02)
         edge = 1.0 - s
-        if edge >= min_edge:
+        # The gap has to beat the FEE, not a flat threshold. Fees are
+        # rate * p * (1-p) per leg, so they peak near 0.50 and collapse at the
+        # extremes: a 2c gap at 0.51/0.46 pays 3.5c in fees and loses, while
+        # the same 2c gap at 0.95/0.03 pays 0.5c and wins. Measured live, 6 of
+        # 7 signals were mid-priced pairs that could never clear — and because
+        # a signal burns the slot's one attempt, they were crowding out the
+        # lopsided books that are the only place this trade exists.
+        #
+        # A flat ARB_MIN_EDGE cannot express that; it is kept only as a floor
+        # under the fee-aware requirement.
+        floor = float(getattr(config, "ARB_MIN_EDGE", 0.02) or 0.0)
+        min_locked = float(getattr(config, "ARB_MIN_LOCKED_EDGE", 0.02) or 0.0)
+        fees = (config.taker_fee_per_share(p_up)
+                + config.taker_fee_per_share(p_dn))
+        if edge >= max(floor, fees + min_locked):
             return {
                 "ask_up": p_up,
                 "ask_down": p_dn,
@@ -1278,7 +1291,17 @@ async def run_realtime(rounds: int = 100, paper: bool = True,
                                       book_feed_client)
         if not arb:
             return False
-        arb_done_end_ts = end_ts  # one attempt per slot (signal seen)
+        # NOTE: the slot is NOT marked done here. It used to be — "one attempt
+        # per slot (signal seen)" — which meant the first gap that failed the
+        # fee check consumed the slot's only look, and a genuinely profitable
+        # pair appearing later in the same slot was never seen. Live data made
+        # that expensive: 6 of 7 observed signals were mid-priced pairs that
+        # could not clear fees, so the budget was being spent precisely on the
+        # ones that cannot work.
+        #
+        # The slot is marked done where an ORDER is actually attempted, which
+        # is what "one attempt per slot" was protecting against in the first
+        # place. Rejections that cost nothing no longer end the hunt.
         # Say WHERE the quote came from. Without this there is no way to tell a
         # socket read from a REST fallback, which is the whole point of the
         # feed — and a silently-degraded feed looks exactly like a working one.
@@ -1425,6 +1448,9 @@ async def run_realtime(rounds: int = 100, paper: bool = True,
         # Paper cannot answer the only question that matters here (does the
         # second leg actually fill?), because it assumes both do. Live runs
         # measure it; arb_executor bounds the downside while they do.
+        # From here an order goes out (or a paper fill is booked), so this is
+        # the real "one attempt per slot" boundary.
+        arb_done_end_ts = end_ts
         live_res = None
         if not paper:
             import arb_executor
