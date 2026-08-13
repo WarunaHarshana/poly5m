@@ -207,8 +207,22 @@ config.ARB_LIVE_ENABLED = True
 config.LIVE_BLACKOUT_WINDOWS_UTC = ""
 FakeArbLiveClient.calls = []
 
+# Pin the egress lookup so the suite stays offline, and point it at a region
+# Polymarket blocks: the bot must say so at startup rather than discovering it
+# one refused leg at a time. Eleven live attempts were recorded as "first leg
+# killed, no risk taken" — true, and completely misleading, because it reads as
+# a verdict on the edge when no order ever reached the book.
+bot.egress_location = lambda *a, **k: {"ip": "1.2.3.4", "loc": "US", "colo": "SJC"}
+
 stats_b = asyncio.run(bot.run_realtime(rounds=2, paper=False))
 config.MODE = "paper_live"
+
+with open(bot.STATUS_PATH, encoding="utf-8") as _f:
+    _st = _json.load(_f)
+assert _st.get("egress_loc") == "US", \
+    f"the egress region must be recorded, got {_st.get('egress_loc')!r}"
+assert _st.get("egress_blocked") is True, \
+    "a region Polymarket blocks must be flagged before any order is sent"
 
 with open(bot.TRADES_PATH, encoding="utf-8") as _f:
     live_arbs = [t for t in _json.load(_f)
@@ -249,6 +263,19 @@ assert "," in (_filled[-1].get("order_id") or ""), (
 print("PHASE_B_OK (locked live arb booked as filled) pairs=", len(live_arbs),
       "legs=", len(buys), "pnl=", round(sum(t["pnl"] for t in live_arbs), 4),
       "order_ids=", _filled[-1].get("order_id"))
+
+# ...and a permitted region must NOT be flagged. Runs last, because it places
+# more orders and would otherwise skew the leg counts asserted above.
+bot.egress_location = lambda *a, **k: {"ip": "5.6.7.8", "loc": "NL", "colo": "AMS"}
+config.MODE = "live"
+asyncio.run(bot.run_realtime(rounds=1, paper=False))
+config.MODE = "paper_live"
+with open(bot.STATUS_PATH, encoding="utf-8") as _f:
+    _st2 = _json.load(_f)
+assert _st2.get("egress_loc") == "NL" and _st2.get("egress_blocked") is False, \
+    f"a permitted region must not be flagged: {_st2.get('egress_loc')!r} " \
+    f"blocked={_st2.get('egress_blocked')!r}"
+print("PHASE_B_GEO_OK (blocked region named at startup, not discovered later)")
 
 # ---- Phase C: the scanner re-polls WITHIN one slot, and paces itself ----
 # Regression test for the loop restructure. The arb re-scan cadence used to

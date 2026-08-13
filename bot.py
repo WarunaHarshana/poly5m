@@ -665,6 +665,35 @@ async def _backoff(seconds):
     await asyncio.sleep(seconds)
 
 
+# Polymarket's CLOB refuses orders from these on legal grounds, not technical
+# ones. Being wrong in the cautious direction only costs a warning.
+GEOBLOCKED_LOCS = {"US"}
+
+
+def egress_location(timeout: float = 6.0) -> dict:
+    """Which country the VENUE will think we are in, before we ask it to trade.
+
+    Polymarket geoblocks by IP and enforces it on the ORDER, so the failure
+    arrives as an HTTP 403 on a leg — indistinguishable, in any aggregate, from
+    a leg the market simply did not fill. Eleven live attempts were spent
+    learning that: every one was recorded as "first leg killed, no risk taken",
+    which is true and also completely misleading, because it reads as a verdict
+    on the edge when no order ever reached the book.
+
+    One request at startup turns that back into a deployment fact.
+    """
+    try:
+        import urllib.request
+        with urllib.request.urlopen(
+                "https://cloudflare.com/cdn-cgi/trace", timeout=timeout) as r:
+            body = r.read().decode("utf-8", "replace")
+        kv = dict(ln.split("=", 1) for ln in body.splitlines() if "=" in ln)
+        return {"ip": kv.get("ip", ""), "loc": kv.get("loc", ""),
+                "colo": kv.get("colo", "")}
+    except Exception as e:
+        return {"error": str(e)}
+
+
 _last_contract_prices = {}  # token_id -> (price, local_ts)
 
 def validate_and_record_quote(token_id: str, q: dict) -> dict:
@@ -902,6 +931,26 @@ async def run_realtime(rounds: int = 100, paper: bool = True,
         write_status(phase="error", message=f"no BTC price source: {e}")
         cl_stream.stop()
         raise SystemExit(f"Could not reach a BTC price source: {e}")
+
+    # Live: say where the venue thinks we are BEFORE anything is sent, so a
+    # blocked region is a startup line rather than a slow drip of refusals that
+    # look like the market declining to fill us.
+    if not paper:
+        geo = await asyncio.to_thread(egress_location)
+        loc = geo.get("loc") or ""
+        if loc:
+            blocked = loc in GEOBLOCKED_LOCS
+            print(f"  [geo] container egresses from {loc} "
+                  f"(Cloudflare PoP {geo.get('colo') or '?'})"
+                  + ("\n  *** POLYMARKET REFUSES ORDERS FROM HERE. Every live "
+                     "leg will come back 403 'trading restricted in your "
+                     "region' and be recorded as an unfilled attempt. This is "
+                     "a deployment region problem, not a strategy result. ***"
+                     if blocked else "  — not on the known-blocked list"))
+            write_status(egress_loc=loc, egress_blocked=blocked)
+        else:
+            print(f"  [geo] could not determine egress region "
+                  f"({geo.get('error') or 'no answer'}); continuing")
 
     # Live: show real Polymarket USDC balance at startup
     if not paper and live_client is not None:

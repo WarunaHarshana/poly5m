@@ -3079,11 +3079,20 @@ function renderExec(d) {
     verdict.textContent = 'No arb has been attempted yet. The scanner logs a '
       + 'signal only when a pair clears every gate.';
   } else if (refused && !locked) {
+    // lastStatus carries the egress region the bot resolved at startup, which
+    // usually names the cause outright.
+    const st = lastStatus || {};
+    const where = st.egress_loc
+      ? ` This container egresses from <b>${st.egress_loc}</b>`
+        + (st.egress_blocked
+            ? ' — a region Polymarket blocks. That is almost certainly the cause.'
+            : ', which is not on the known-blocked list, so check auth, tick size and min size.')
+      : '';
     verdict.className = 'an-verdict bad';
     verdict.innerHTML = `<b>${refused} order(s) were REFUSED by the venue and `
       + `never reached the book.</b> That is a setup problem — region, auth, `
       + `size or tick — not a verdict on the strategy. A lock rate computed `
-      + `from these would be meaningless. Check the leg errors in `
+      + `from these would be meaningless.${where} Full leg errors are in `
       + `<span class="mono">arb_executions.jsonl</span>.`;
   } else if (!locked) {
     verdict.className = 'an-verdict warn';
