@@ -1059,7 +1059,11 @@ async def run_realtime(rounds: int = 100, paper: bool = True,
                          question=question, slug=trade.slug,
                          message=f"holding {trade.side} @ {mkt:.2f}")
             if config.ROUND_SECONDS > 0 and hold and hold > 0:
-                await asyncio.sleep(hold)
+                # Heartbeat, not a raw sleep: holding a pair to slot end can be
+                # most of five minutes, and this coroutine is the only thing
+                # running once the main loop has finished its rounds. That is
+                # exactly the "status.json untouched for ~300s" case.
+                await _heartbeat_sleep(hold)
 
             # Live: cancel resting leftovers and check the matched fill amount.
             # Starts at 0 for live: a fill has to be PROVEN against the venue,
@@ -1153,9 +1157,12 @@ async def run_realtime(rounds: int = 100, paper: bool = True,
                 write_status(phase="resolving",
                              message="waiting for Polymarket outcome",
                              end_ts=end_ts, question=question, side=trade.side)
-                # Brief grace — Gamma often lags end_ts by 10-30s+
+                # Brief grace — Gamma often lags end_ts by 10-30s+. Heartbeat
+                # through it: a raw sleep here left status.json untouched for
+                # the full 12s after every placement, which the dashboard reads
+                # as STALE at exactly the moment you are watching a trade.
                 if config.ROUND_SECONDS > 0:
-                    await asyncio.sleep(12.0)
+                    await _heartbeat_sleep(12.0)
                 print(f"  [resolve] polling official outcome up to "
                       f"~{poll_attempts * 3}s...")
                 for attempt in range(poll_attempts):
@@ -1609,7 +1616,19 @@ async def run_realtime(rounds: int = 100, paper: bool = True,
         # ARB_MIN_REMAINING now belongs to arb.
         scan_gap = max(0.2, float(getattr(config, "ARB_SCAN_INTERVAL_S", 1.0) or 1.0))
         scans = 0
+        last_beat = 0.0
         while True:
+            # _heartbeat_sleep only refreshes status.json when the sleep is
+            # LONGER than its 5s chunk, so a 1s scan cadence never touched it:
+            # the dashboard read STALE through 119 perfectly healthy scans, and
+            # its clock offset — derived from status.updated_at — drifted by the
+            # whole slot. Beat here instead, at the rate the file actually needs.
+            _now_wall = time.time()
+            if _now_wall - last_beat >= 5.0:
+                last_beat = _now_wall
+                write_status(phase="analyzing", question=question,
+                             slug=market.get("slug"), end_ts=end_ts,
+                             message=f"scanning for an arb ({scans} so far)")
             remaining = (end_ts - _now(cl_stream)) if end_ts else None
             if remaining is not None and remaining < arb_min_rem:
                 print(f"  [arb] {scans} scan(s) this slot; {remaining:.0f}s left "

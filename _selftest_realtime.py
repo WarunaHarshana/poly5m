@@ -347,6 +347,57 @@ assert min(seen_remaining) >= 2 - 0.3, (
 print("PHASE_D_OK (stops at the floor) scans=", scan_calls["n"],
       "min_remaining_seen=", round(min(seen_remaining), 2))
 
+# ---- Phase E: the scan loop must keep status.json fresh ----
+# Regression. _heartbeat_sleep only refreshes status when the sleep is LONGER
+# than its 5s chunk, so the 1s scan cadence never touched it: production ran
+# 119 healthy scans while the dashboard showed STALE and its clock offset —
+# derived from status.updated_at — drifted by the whole slot.
+scan_calls["n"] = 0
+writes = []
+_real_write = bot.write_status
+
+
+def _counting_write(*a, **k):
+    writes.append((time.time(), k.get("phase") or k.get("message") or ""))
+    return _real_write(*a, **k)
+
+
+def _slow_scan(pub, market, feed=None):
+    # Scans for a good while, then signals — the run has to END, and the only
+    # thing that ends it is reaching `rounds`. A stub that never signals just
+    # spins through slots until max_slots.
+    scan_calls["n"] += 1
+    if scan_calls["n"] < 55:
+        return None
+    return {"ask_up": 0.44, "ask_down": 0.44, "sum": 0.88, "edge": 0.12,
+            "up_size": 500.0, "down_size": 500.0,
+            "bid_up": 0.43, "bid_down": 0.43, "src": "test"}
+
+
+bot.write_status = _counting_write
+bot._scan_sum_to_one_arb = _slow_scan
+config.ARB_MIN_REMAINING = 1
+config.ARB_SCAN_INTERVAL_S = 0.05     # floored to 0.2s
+FakePubArb.slot_seconds = 12.0
+_t0 = time.time()
+asyncio.run(bot.run_realtime(rounds=1, paper=True))
+_elapsed = time.time() - _t0
+bot.write_status = _real_write
+
+_beats = [w for w in writes if w[0] >= _t0]
+_gaps = [(b[0] - a[0], a[1], b[1]) for a, b in zip(_beats, _beats[1:])]
+_gaps.sort(reverse=True)
+_worst = _gaps[0][0] if _gaps else _elapsed
+assert scan_calls["n"] > 10, \
+    f"expected a long scan window to exercise this, got {scan_calls['n']} scans"
+assert _worst <= 8.0, (
+    "status.json went %.1fs without a write — the dashboard reads that as "
+    "STALE during entirely normal operation.\nWorst gaps (seconds, "
+    "phase-before -> phase-after):\n  %s" % (
+        _worst, "\n  ".join(f"{g:.1f}s  {a!r} -> {b!r}" for g, a, b in _gaps[:5])))
+print("PHASE_E_OK (status stays fresh while scanning) scans=", scan_calls["n"],
+      "writes=", len(_beats), "worst gap=", round(_worst, 2), "s")
+
 bot._scan_sum_to_one_arb = _real_scan
 config.ROUND_SECONDS = 0
 

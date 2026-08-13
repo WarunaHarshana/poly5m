@@ -872,10 +872,40 @@ def _stop(tf: str | None = None) -> dict:
                 "message": f"Stopped the {b['timeframe']} bot."}
 
 
+def _supervised(tf: str | None = None) -> dict:
+    """A bot the SUPERVISOR started, which app.py did not spawn and cannot see.
+
+    On Railway the supervisor owns the bot process, so `_bots` is empty and the
+    dashboard reported "idle" with Start enabled while real money was trading.
+    Clicking Start there would have raced a second bot against the same state
+    directory and lock. There is no child handle to check, so liveness comes
+    from the two artefacts the running bot does maintain: the supervisor's
+    recorded pid, and a status.json that is still being written.
+    """
+    state_dir = _state_dir_for(tf)
+    try:
+        with open(os.path.join(state_dir, "supervisor.json"), encoding="utf-8") as f:
+            sup = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    pid = sup.get("bot_pid")
+    if not pid:
+        return {}
+    try:
+        with open(os.path.join(state_dir, "status.json"), encoding="utf-8") as f:
+            age = time.time() - float(json.load(f).get("updated_at") or 0)
+    except (OSError, ValueError, TypeError):
+        return {}
+    # Generous: a slot-end wait plus a restart is well under this.
+    if age > 300:
+        return {}
+    return {"pid": pid, "mode": sup.get("mode"), "status_age_s": round(age, 1)}
+
+
 def _state(tf: str | None = None) -> dict:
     b = _slot(tf)
     p = b["proc"]
-    return {
+    out = {
         "running": _running(b["timeframe"]),
         "pid": p.pid if p else None,
         "mode": b["mode"],
@@ -884,7 +914,14 @@ def _state(tf: str | None = None) -> dict:
         "exit_code": (p.poll() if p else None),
         # So the UI can show that another series is still trading.
         "running_timeframes": _running_timeframes(),
+        "managed_by": "dashboard" if _running(b["timeframe"]) else None,
     }
+    if not out["running"]:
+        sup = _supervised(b["timeframe"])
+        if sup:
+            out.update(running=True, managed_by="supervisor", pid=sup["pid"],
+                       mode=sup["mode"], status_age_s=sup["status_age_s"])
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1535,6 +1572,7 @@ body.trade-flash-lose { animation: page-flash-down 1.6s ease-out; }
           <option value="paper_live">paper_live · real data, fake fills</option>
           <option value="live" class="mode-live-opt">live · REAL MONEY</option>
         </select>
+        <span id="c-mode-note" class="hint" style="display:none;color:var(--accent2)"></span>
       </div>
       <div class="ctl-field">
         <span class="ctl-label">Asset</span>
@@ -2527,16 +2565,39 @@ function setCtl(running, s) {
     stEl.className = 'ctl-status';
     return;
   }
+  // A supervisor-managed bot is not ours to stop: the supervisor would just
+  // restart it. Start must stay disabled either way — a second bot would race
+  // the first for the same state directory and lock.
+  const sup = s && s.managed_by === 'supervisor';
   startBtn.disabled = running;
-  stopBtn.disabled = !running;
+  stopBtn.disabled = !running || sup;
   // Status is per timeframe; note any OTHER series still trading so Stop
   // is never ambiguous about which bot it targets.
   const others = ((s && s.running_timeframes) || []).filter(t => t !== curTf());
   const extra = others.length ? (' · also running: ' + others.join(', ')) : '';
   stEl.textContent = (running
-    ? (curTf() + ' running · pid ' + ((s && s.pid) || '?'))
+    ? (curTf() + (sup ? ' running under the supervisor · ' : ' running · pid ')
+       + (sup ? ((s.mode || '?') + ' · pid ' + (s.pid || '?')) : ((s && s.pid) || '?')))
     : (curTf() + ' idle')) + extra;
   stEl.className = 'ctl-status ' + (running ? 'on' : '');
+
+  // The Mode dropdown is an input for launching a bot, not a readout of the
+  // running one — which read as a flat contradiction next to a LIVE badge.
+  // While something is running, show what it actually is.
+  const modeSel = document.getElementById('c-mode');
+  const note = document.getElementById('c-mode-note');
+  if (note) {
+    if (running && s && s.mode) {
+      note.textContent = sup
+        ? `running ${s.mode} (started by the supervisor, not from here)`
+        : `running ${s.mode}`;
+      note.style.display = '';
+      if (modeSel) modeSel.disabled = true;
+    } else {
+      note.style.display = 'none';
+      if (modeSel) modeSel.disabled = false;
+    }
+  }
 }
 
 async function ctlState() {
