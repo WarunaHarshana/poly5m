@@ -163,6 +163,67 @@ def _verify_filled(client, order_id, shares) -> bool | None:
     return total + 1e-9 >= float(shares)
 
 
+def _read_fill(client, resp, shares) -> tuple[bool, object, str | None]:
+    """Decide, conservatively, whether an order response means MATCHED.
+
+    Shared by the entry legs and the unwind, because the question and the
+    danger are identical: believing an order filled when it did not. On the way
+    IN that sends the second leg against a hedge that does not exist; on the way
+    OUT it reports a naked position as closed and clears the alert that was the
+    last line of defence.
+
+    Returns ``(filled, order_id, error)``. A fill must be POSITIVELY confirmed;
+    anything ambiguous is resolved against the venue, and anything still
+    unresolved after that counts as NOT filled.
+    """
+    oid = None
+    status = ""
+    matched = None
+    if isinstance(resp, dict):
+        oid = resp.get("orderID") or resp.get("orderId") or resp.get("id")
+        status = str(resp.get("status") or resp.get("state") or "").lower()
+        # Only fields whose UNITS are known. `makingAmount` and friends are
+        # conventionally raw token base units (6-decimal USDC), so a $5 order
+        # would report 5000000 and `5000000 >= 5 shares` would read as a full
+        # fill on an order that never matched. matched_amount is the one
+        # corroborated elsewhere in this codebase (bot.py's live fill check
+        # reads it from get_trades), and a value that cannot be a plausible
+        # share count is discarded rather than trusted.
+        for k in ("matched_amount", "size_matched", "filled_size"):
+            if resp.get(k) is not None:
+                try:
+                    val = float(resp[k])
+                except (TypeError, ValueError):
+                    continue
+                if 0 <= val <= max(float(shares) * 100.0, 1000.0):
+                    matched = val
+                    break
+        if resp.get("success") is False or resp.get("errorMsg"):
+            return False, oid, str(resp.get("errorMsg") or "rejected")
+
+    # Only words that unambiguously mean MATCHED. "success" and "complete" were
+    # here and had to go: on most order APIs "success" means the request was
+    # accepted, not that anything traded — which is precisely the assume-a-fill
+    # bug this function exists to prevent. Anything else falls through to
+    # _verify_filled, which asks the venue.
+    POSITIVE = ("matched", "filled")
+    NEGATIVE = ("unmatched", "cancelled", "canceled", "killed", "rejected",
+                "expired", "failed")
+    if matched is not None:
+        return (matched + 1e-9 >= float(shares)), oid, None
+    if status in NEGATIVE:
+        return False, oid, None
+    if status in POSITIVE:
+        return True, oid, None
+    # Unknown shape. Ask the venue what actually happened rather than picking
+    # the convenient answer.
+    filled = _verify_filled(client, oid, shares)
+    if filled is None:
+        return False, oid, (f"unverifiable response (status={status!r}); "
+                            f"treated as UNFILLED")
+    return bool(filled), oid, None
+
+
 def execute(client, market: dict, ask_up: float, ask_down: float,
             shares: float, depth_up: float | None = None,
             depth_down: float | None = None,
@@ -200,73 +261,14 @@ def execute(client, market: dict, ask_up: float, ask_down: float,
         return res
 
     def _fok_buy(side, token, price):
-        """Send one FOK leg and decide, conservatively, whether it filled.
-
-        A fill must be POSITIVELY confirmed. An earlier version used
-        `bool(resp.get("success", True))` and a deny-list of status strings,
-        which meant any response shape the venue had not been anticipated to
-        return — a new status, a missing field, a wrapped payload — counted as
-        a fill. Believing an unfilled leg filled is the worst error available
-        here: it sends the second leg against a hedge that does not exist.
-
-        Ambiguity is therefore resolved against the venue, not guessed.
-        """
+        """Send one FOK leg and decide, conservatively, whether it filled."""
         try:
             resp = client.buy(token, price, shares, cond, order_type="FOK")
         except Exception as e:
             return LegResult(side, token, price, shares, False, error=str(e))
-
-        oid = None
-        status = ""
-        matched = None
-        if isinstance(resp, dict):
-            oid = resp.get("orderID") or resp.get("orderId") or resp.get("id")
-            status = str(resp.get("status") or resp.get("state") or "").lower()
-            # Only fields whose UNITS are known. `makingAmount` and friends are
-            # conventionally raw token base units (6-decimal USDC), so a $5
-            # order would report 5000000 and `5000000 >= 5 shares` would read
-            # as a full fill on an order that never matched. matched_amount is
-            # the one corroborated elsewhere in this codebase (bot.py's live
-            # fill check reads it from get_trades), and a value that cannot be
-            # a plausible share count is discarded rather than trusted.
-            for k in ("matched_amount", "size_matched", "filled_size"):
-                if resp.get(k) is not None:
-                    try:
-                        val = float(resp[k])
-                    except (TypeError, ValueError):
-                        continue
-                    if 0 <= val <= max(float(shares) * 100.0, 1000.0):
-                        matched = val
-                        break
-            if resp.get("success") is False or resp.get("errorMsg"):
-                return LegResult(side, token, price, shares, False,
-                                 order_id=oid,
-                                 error=str(resp.get("errorMsg") or "rejected"))
-
-        # Only words that unambiguously mean MATCHED. "success" and "complete"
-        # were here and had to go: on most order APIs "success" means the
-        # request was accepted, not that anything traded — which is precisely
-        # the assume-a-fill bug this function exists to prevent. Anything else
-        # falls through to _verify_filled, which asks the venue.
-        POSITIVE = ("matched", "filled")
-        NEGATIVE = ("unmatched", "cancelled", "canceled", "killed", "rejected",
-                    "expired", "failed")
-        if matched is not None:
-            filled = matched + 1e-9 >= float(shares)
-        elif status in NEGATIVE:
-            filled = False
-        elif status in POSITIVE:
-            filled = True
-        else:
-            # Unknown shape. Ask the venue what actually happened rather than
-            # picking the convenient answer.
-            filled = _verify_filled(client, oid, shares)
-            if filled is None:
-                return LegResult(side, token, price, shares, False,
-                                 order_id=oid,
-                                 error=f"unverifiable response (status={status!r}); "
-                                       f"treated as UNFILLED")
-        return LegResult(side, token, price, shares, bool(filled), order_id=oid)
+        filled, oid, err = _read_fill(client, resp, shares)
+        return LegResult(side, token, price, shares, filled,
+                         order_id=oid, error=err)
 
     leg1 = _fok_buy(first[0], first[1], first[2])
     if not leg1.filled:
@@ -289,25 +291,44 @@ def execute(client, market: dict, ask_up: float, ask_down: float,
     # Second leg killed: we are holding a naked directional position. Get out
     # now — an unhedged position in a market resolving in minutes is exactly
     # the risk this design exists to avoid.
+    # Sell into the real bid when the caller quoted one. The fallback below is
+    # a GUESS at where the book is, and a FAK priced above the true bid matches
+    # nothing — so it is a last resort, not a default.
     unwind_px = first[4] if first[4] is not None else max(0.01, first[2] - 0.02)
+    px_src = "book bid" if first[4] is not None else "ESTIMATED (no bid quoted)"
     unwind_pnl = 0.0
     unwound = False
+
+    def _naked(why: str) -> ArbResult:
+        r = ArbResult(ok=False,
+                      reason=f"second leg killed AND unwind {why} — "
+                             f"HOLDING NAKED {first[0]} {shares} shares",
+                      pair_cost=pair, locked_edge=locked, shares=shares,
+                      legs=[leg1, leg2])
+        _log({"action": "unwind_failed", "severity": "critical", **r.to_dict()})
+        return r
+
     try:
-        client.sell(first[1], float(unwind_px), shares, cond, order_type="FAK")
-        unwound = True
-        # Bought at the ask, sold at the bid: the loss is the spread plus the
-        # fee already paid on the way in.
-        unwind_pnl = round(shares * (float(unwind_px) - first[2])
-                           - shares * taker_fee_per_share(first[2]), 4)
+        sell_resp = client.sell(first[1], float(unwind_px), shares, cond,
+                                order_type="FAK")
     except Exception as e:
-        res = ArbResult(ok=False,
-                        reason=f"second leg killed AND unwind failed ({e}) — "
-                               f"HOLDING NAKED {first[0]} {shares} shares",
-                        pair_cost=pair, locked_edge=locked, shares=shares,
-                        legs=[leg1, leg2])
-        _log({"action": "unwind_failed", "severity": "critical",
-              **res.to_dict()})
-        return res
+        return _naked(f"failed ({e})")
+
+    # A FAK that matches nothing returns NORMALLY — no exception, no error.
+    # Reading "the call returned" as "the position is closed" is the same
+    # assume-a-fill bug the entry legs guard against, on the side where it is
+    # worst: it books a loss, clears the alert, and leaves a real naked leg
+    # riding into a resolution minutes away.
+    sold, _sell_oid, sell_err = _read_fill(client, sell_resp, shares)
+    if not sold:
+        return _naked(f"did not fill at {unwind_px:.3f} [{px_src}]"
+                      + (f" ({sell_err})" if sell_err else ""))
+
+    unwound = True
+    # Bought at the ask, sold at the bid: the loss is the spread plus the
+    # fee already paid on the way in.
+    unwind_pnl = round(shares * (float(unwind_px) - first[2])
+                       - shares * taker_fee_per_share(first[2]), 4)
 
     res = ArbResult(ok=False,
                     reason=f"second leg ({second[0]}) killed; unwound {first[0]}",

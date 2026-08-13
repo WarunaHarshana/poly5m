@@ -805,12 +805,18 @@ def _scan_sum_to_one_arb(pub, market, feed=None) -> dict | None:
     try:
         p_up = p_dn = None
         up_sz = dn_sz = None
+        # The BIDS are what an unwind sells into. Without them arb_executor
+        # falls back to guessing (ask - 0.02), and a FAK sell priced above the
+        # real bid matches nothing — which is how a "successful unwind" ends up
+        # still holding a naked leg.
+        b_up = b_dn = None
         src = "rest"
         if feed is not None:
             snap = feed.pair(market["tokens"]["UP"], market["tokens"]["DOWN"])
             if snap is not None:
                 p_up, p_dn = snap.ask_up, snap.ask_down
                 up_sz, dn_sz = snap.size_up, snap.size_down
+                b_up, b_dn = snap.bid_up, snap.bid_down
                 src = f"ws({snap.age_s * 1000:.0f}ms)"
                 _scan_src["ws"] += 1
             else:
@@ -828,6 +834,7 @@ def _scan_sum_to_one_arb(pub, market, feed=None) -> dict | None:
             p_up = float(q_up["price"])
             p_dn = float(q_dn["price"])
             up_sz, dn_sz = q_up.get("ask_size"), q_dn.get("ask_size")
+            b_up, b_dn = q_up.get("best_bid"), q_dn.get("best_bid")
         if not (0.0 < p_up < 1.0 and 0.0 < p_dn < 1.0):
             return None
         s = p_up + p_dn
@@ -841,6 +848,8 @@ def _scan_sum_to_one_arb(pub, market, feed=None) -> dict | None:
                 "edge": edge,
                 "up_size": up_sz,
                 "down_size": dn_sz,
+                "bid_up": b_up,
+                "bid_down": b_dn,
                 "src": src,
             }
     except Exception:
@@ -1127,7 +1136,8 @@ async def run_realtime(rounds: int = 100, paper: bool = True,
 
     async def _settle_trade(trade, stake, shares, order_id, market, question,
                             end_ts, slot_start_time, slot_open_ref, strike_src,
-                            price_before, was_late, mkt, edge):
+                            price_before, was_late, mkt, edge,
+                            verified_fill=None, leg_order_ids=None):
         """Hold to slot end, check live fills, resolve, book PnL, persist.
 
         Runs as a background task for real slots so the main loop can keep
@@ -1151,7 +1161,21 @@ async def run_realtime(rounds: int = 100, paper: bool = True,
             # not assumed from the fact that we sent an order. (Paper keeps the
             # requested size — its fills are simulated by definition.)
             matched_shares = float(shares) if paper else 0.0
-            if not paper and live_client is not None:
+            if verified_fill is not None:
+                # Already PROVEN against the venue by whoever placed it. An arb
+                # pair is two FOK legs, each positively confirmed by
+                # arb_executor before this coroutine is spawned, and a FOK
+                # leaves nothing resting — so there is nothing to cancel and
+                # nothing left to look up.
+                #
+                # Re-deriving the fill here from a single `order_id` (which a
+                # two-leg pair does not have, and so passed as None) sent it
+                # down the "no order id — book nothing" branch below: a pair
+                # the venue confirmed on BOTH legs was recorded as UNFILLED
+                # with its shares and stake zeroed, while the wallet held the
+                # real position.
+                matched_shares = float(verified_fill)
+            elif not paper and live_client is not None:
                 try:
                     if order_id:
                         print(f"  [live fill] cancelling order {order_id} to check fills...")
@@ -1219,8 +1243,13 @@ async def run_realtime(rounds: int = 100, paper: bool = True,
             if not paper:
                 trade.shares = matched_shares
                 trade.stake_usd = round(matched_shares * trade.entry_price, 4)
+                # An arb has no single order id — it has one per leg. Record
+                # both, so the trail names the orders the venue actually
+                # matched instead of an empty string.
+                _oid_str = (",".join(str(x) for x in leg_order_ids if x)
+                            if leg_order_ids else str(order_id or ""))
                 _st_common = dict(round_id=trade.round_id, slug=trade.slug,
-                                  side=trade.side, order_id=str(order_id or ""),
+                                  side=trade.side, order_id=_oid_str,
                                   requested_shares=shares,
                                   filled_shares=matched_shares,
                                   price=trade.entry_price, mode=config.MODE)
@@ -1543,6 +1572,7 @@ async def run_realtime(rounds: int = 100, paper: bool = True,
         # Paper cannot answer the only question that matters here (does the
         # second leg actually fill?), because it assumes both do. Live runs
         # measure it; arb_executor bounds the downside while they do.
+        live_res = None
         if not paper:
             import arb_executor
             live_res = await asyncio.to_thread(
@@ -1613,12 +1643,22 @@ async def run_realtime(rounds: int = 100, paper: bool = True,
             strategy="arb",
             message=f"ARB pair @ {pair_cost:.3f} (edge {edge_after:+.3f})",
         )
+        # Both legs were positively confirmed against the venue by
+        # arb_executor. Hand that verdict to the settler rather than making it
+        # re-derive a fill from a single order id, which a two-leg pair does
+        # not have — that is what booked a locked pair as UNFILLED.
+        arb_verified = None
+        arb_leg_ids = None
+        if not paper and live_res is not None:
+            arb_verified = float(live_res.shares or shares)
+            arb_leg_ids = [lg.order_id for lg in live_res.legs if lg.order_id]
         settle_coro = _settle_trade(
             trade=trade, stake=stake, shares=shares, order_id=None,
             market=market, question=question, end_ts=end_ts,
             slot_start_time=slot_start_time, slot_open_ref=0.0,
             strike_src="n/a-arb", price_before=0.0,
             was_late=False, mkt=pair_cost, edge=edge_after,
+            verified_fill=arb_verified, leg_order_ids=arb_leg_ids,
         )
         if config.ROUND_SECONDS <= 0 or not end_ts:
             await settle_coro

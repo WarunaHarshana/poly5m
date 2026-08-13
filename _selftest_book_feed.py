@@ -180,7 +180,7 @@ class RestPub:
 
 def _rest_quote(pub, market, side):
     pub.calls += 1
-    return {"price": 0.49, "ask_size": 25.0}
+    return {"price": 0.49, "ask_size": 25.0, "best_bid": 0.47}
 
 
 bot._quote_side = _rest_quote
@@ -207,6 +207,13 @@ if res:
     check("the pair matches the socket book",
           abs(res["sum"] - 0.94) < 1e-9, str(res["sum"]))
     check("depth comes from the socket", res["up_size"] == 80.0, str(res))
+    # The BIDS are what an unwind sells into. Without them arb_executor
+    # guesses (ask - 0.02), and a FAK priced above the real bid matches
+    # nothing — a naked leg dressed up as a closed one.
+    check("the scan carries the bid for UP", res.get("bid_up") == 0.42,
+          str(res.get("bid_up")))
+    check("the scan carries the bid for DOWN", res.get("bid_down") == 0.48,
+          str(res.get("bid_down")))
 
 # Stale socket -> REST fallback, rather than no scan at all.
 with feed._lock:
@@ -216,6 +223,9 @@ res = bot._scan_sum_to_one_arb(pub2, MARKET, feed)
 check("a stale socket falls back to REST", pub2.calls == 2,
       f"{pub2.calls} REST calls")
 check("the REST fallback still produces a quote", res is not None, str(res))
+check("the REST fallback carries bids too",
+      res is not None and res.get("bid_up") == 0.47
+      and res.get("bid_down") == 0.47, str(res))
 
 # No feed at all must behave exactly as before.
 pub3 = RestPub()

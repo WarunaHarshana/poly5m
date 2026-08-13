@@ -254,6 +254,79 @@ f10, _ = first_leg_filled({"orderID": "o10", "matched_amount": 5000000.0},
 check("an implausible matched size is rejected, not trusted", f10 is False,
       str(f10))
 
+# ---------------------------------------------------------------------------
+print("T10 an unwind that matches nothing is NOT a successful unwind")
+# A FAK that matches nothing returns NORMALLY. If "the call returned" counts as
+# "the position is closed", the bot books a small loss, clears its own alert,
+# and rides a naked directional leg into a resolution minutes away — the exact
+# risk this module exists to prevent.
+class _SellRespClient(FakeClient):
+    """Fills the first leg, kills the second, and scripts the unwind reply."""
+    def __init__(self, sell_resp, trades=None):
+        super().__init__({"TOK_DN": True, "TOK_UP": False})
+        self.sell_resp = sell_resp
+        self._trades = trades
+
+    def sell(self, token_id, price, size, condition_id, order_type="FAK"):
+        self.sells.append((token_id, price, size, order_type))
+        return self.sell_resp
+
+    def _client(self):
+        outer = self
+
+        class _C:
+            def get_trades(self):
+                if outer._trades is None:
+                    raise RuntimeError("CLOB unreachable")
+                return outer._trades
+        return _C()
+
+
+def _ack_all():
+    for a in ax.open_alerts():
+        ax.acknowledge(a["ts"])
+
+
+c = _SellRespClient({"success": True, "status": "unmatched"})
+r = ax.execute(c, MARKET, 0.44, 0.44, 5.0, depth_up=500.0, depth_down=7.0,
+               bid_up=0.43, bid_down=0.43)
+check("a killed unwind is not reported as unwound", not r.unwound, str(r.unwound))
+check("it is reported as a naked position", "NAKED" in r.reason, r.reason)
+check("no pnl is booked for a sale that never happened",
+      r.unwind_pnl == 0.0 and r.realized_pnl == 0.0,
+      f"{r.unwind_pnl} / {r.realized_pnl}")
+check("the reason names the price it tried", "0.430" in r.reason, r.reason)
+check("it raises an open alert", len(ax.open_alerts()) == 1,
+      str(len(ax.open_alerts())))
+_ack_all()
+
+# An unwind the venue will not confirm is naked until proven otherwise.
+c = _SellRespClient({"orderID": "s1", "status": "pending_new"}, trades=[])
+r = ax.execute(c, MARKET, 0.44, 0.44, 5.0, depth_up=500.0, depth_down=7.0,
+               bid_up=0.43, bid_down=0.43)
+check("an unconfirmed unwind is treated as naked, not closed",
+      not r.unwound and "NAKED" in r.reason, r.reason)
+_ack_all()
+
+# ...but a genuine confirmation from the venue still closes it cleanly.
+c = _SellRespClient({"orderID": "s2", "status": "odd_shape"},
+                    trades=[{"taker_order_id": "s2", "size": 5.0}])
+r = ax.execute(c, MARKET, 0.44, 0.44, 5.0, depth_up=500.0, depth_down=7.0,
+               bid_up=0.43, bid_down=0.43)
+check("an unwind the venue confirms IS closed", r.unwound, r.reason)
+check("no alert is raised for a real unwind", ax.open_alerts() == [],
+      str(ax.open_alerts()))
+
+# ---------------------------------------------------------------------------
+print("T11 a missing bid is a guess, and must not masquerade as the book")
+c = _SellRespClient({"success": True, "status": "unmatched"})
+r = ax.execute(c, MARKET, 0.44, 0.44, 5.0, depth_up=500.0, depth_down=7.0)
+check("the fallback price is flagged as estimated", "ESTIMATED" in r.reason,
+      r.reason)
+check("the estimate sits below the ask it bought at", "0.420" in r.reason,
+      r.reason)
+_ack_all()
+
 print()
 if FAIL:
     raise SystemExit(f"SELFTEST_FAILED arb_exec: {FAIL}")

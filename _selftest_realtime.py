@@ -459,4 +459,104 @@ print("PHASE_H_OK (unverified live fill is not booked) "
       "booked_positions=", len(booked),
       "unfilled_skips=", stats_h["skips"].get("unfilled"))
 
+# ---- Phase I: a LIVE arb whose BOTH legs fill must be booked as FILLED ----
+# Regression test, and the exact mirror of Phase H. An arb has no single order
+# id — it has one per leg — so _try_arb passed order_id=None to the settler.
+# The live settle path read a falsy order id as "nothing to verify", called
+# cancel_all() and zeroed the position: a pair the venue confirmed on BOTH legs
+# was booked as UNFILLED with pnl = -fee, while the wallet held the real thing.
+# Phase H guards against believing a fill that did not happen; this guards
+# against disbelieving one that did.
+import order_state  # noqa: E402
+
+
+class FakeArbClobInner:
+    def get_trades(self):
+        return []
+
+
+class FakeArbLiveClient:
+    calls = []
+
+    def __init__(self, *a, **k):
+        pass
+
+    def buy(self, token_id, price, size, condition_id, order_type="GTC"):
+        FakeArbLiveClient.calls.append(("buy", token_id, price, size, order_type))
+        return {"status": "matched", "orderID": "arb-%s" % token_id}
+
+    def sell(self, token_id, price, size, condition_id, order_type="FAK"):
+        FakeArbLiveClient.calls.append(("sell", token_id, price, size, order_type))
+        return {"status": "matched", "orderID": "unwind-%s" % token_id}
+
+    def cancel_order(self, order_id):
+        FakeArbLiveClient.calls.append(("cancel", order_id))
+        return {}
+
+    def cancel_all(self):
+        FakeArbLiveClient.calls.append(("cancel_all", None))
+        return {}
+
+    def get_usdc_balance(self, refresh=True):
+        return {"ok": True, "balance_usd": 25.0, "funder": "0xtest"}
+
+    def _client(self):
+        return FakeArbClobInner()
+
+
+polymarket_client.PolymarketClient = FakeArbLiveClient
+polymarket_client.PolymarketPublic = FakePubArb
+config.MODE = "live"
+config.ARB_TRADE_ENABLED = True
+config.ARB_LIVE_ENABLED = True
+config.LIVE_BLACKOUT_WINDOWS_UTC = ""
+config.LATE_MOMENTUM_MIN_MOVE = 1e9   # momentum can never fire
+config.MOMENTUM_OBSERVE_ONLY = False
+config.MAKER_FIRST_ENABLED = False
+FakeArbLiveClient.calls = []
+
+stats_i = asyncio.run(bot.run_realtime(rounds=2, paper=False))
+config.MODE = "paper_live"
+
+with open(bot.TRADES_PATH, encoding="utf-8") as _f:
+    arb_rows = [t for t in _json.load(_f) if t.get("side") == "ARB"]
+live_arbs = [t for t in arb_rows if t.get("mode") != "paper_live"]
+assert stats_i["trades"] >= 1, \
+    f"a live arb with both legs filling must trade, got {stats_i}"
+assert live_arbs, "no live ARB row was written at all"
+
+# The whole bug in one assertion: the position must survive settlement.
+zeroed = [t for t in live_arbs if not t.get("shares")]
+assert not zeroed, (
+    "a venue-confirmed ARB pair was booked with zero shares: %r"
+    % [{k: t.get(k) for k in ('shares', 'stake_usd', 'pnl', 'fill_unverified')}
+       for t in zeroed[:3]])
+assert all(t.get("stake_usd", 0) > 0 for t in live_arbs), \
+    f"live arb stake was zeroed: {[t.get('stake_usd') for t in live_arbs]}"
+assert all(not t.get("fill_unverified") for t in live_arbs), \
+    "both legs were confirmed by the venue; nothing here is unverified"
+assert all(t.get("pnl", 0) > 0 for t in live_arbs), \
+    f"a locked arb pays either way: {[t.get('pnl') for t in live_arbs]}"
+assert stats_i["skips"].get("unfilled", 0) == 0, \
+    f"a filled pair must not count as unfilled: {stats_i['skips']}"
+
+# Two FOK buys per pair, and nothing sold — there was no stranded leg.
+buys = [c for c in FakeArbLiveClient.calls if c[0] == "buy"]
+sells = [c for c in FakeArbLiveClient.calls if c[0] == "sell"]
+assert len(buys) == 2 * len(live_arbs), f"expected 2 legs per pair, got {buys}"
+assert all(b[4] == "FOK" for b in buys), f"arb legs must be FOK: {buys}"
+assert not sells, f"nothing was stranded, so nothing should be sold: {sells}"
+
+# ...and the order trail must name the orders the venue actually matched,
+# rather than the empty string a two-leg pair used to leave behind.
+_trail = order_state.trail(live_arbs[-1]["round_id"])
+_filled = [e for e in _trail if e.get("state") == order_state.FILLED]
+assert _filled, f"a filled arb pair should record a FILLED event: {_trail}"
+assert "," in (_filled[-1].get("order_id") or ""), (
+    "the trail should carry BOTH leg order ids, got %r"
+    % _filled[-1].get("order_id"))
+print("PHASE_I_OK (locked live arb is booked as filled) pairs=", len(live_arbs),
+      "legs=", len(buys), "pnl=", round(sum(t["pnl"] for t in live_arbs), 4),
+      "order_ids=", _filled[-1].get("order_id"))
+
 print("\nSELFTEST_OK momentum+arb+live+maker+venue-min+observability")
