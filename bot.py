@@ -1441,6 +1441,14 @@ async def run_realtime(rounds: int = 100, paper: bool = True,
             print("  [arb] live execution disabled (ARB_LIVE_ENABLED=0) — "
                   "logged only")
             return False
+        if not paper:
+            _blocked, _win = config.in_live_blackout()
+            if _blocked:
+                print(f"  [arb] venue maintenance window {_win} UTC — no live "
+                      f"orders. A 503 between the two legs is the one path "
+                      f"that strands a naked position, and with order status "
+                      f"also down we could not even tell. Signal logged only.")
+                return False
         if risk.halted or not risk.daily_loss_ok():
             return False
         # Arb used to skip this. size_late_scalp calls max_trades_ok() for

@@ -339,6 +339,47 @@ ARB_LIVE_ENABLED = _env_bool("ARB_LIVE_ENABLED", False)
 # at the live stake cap is the intent.
 ARB_MAX_EXPOSURE_USD = float(os.getenv("ARB_MAX_EXPOSURE_USD", "20.0"))
 
+# Venue maintenance blackouts: "HH:MM-HH:MM" UTC windows (comma separated) in
+# which NO live order may be sent.
+#
+# This is not caution for its own sake. Polymarket's maintenance notice says
+# users may get HTTP 503 when placing OR cancelling orders, and when viewing
+# order status. The placing failure is harmless here — a killed first leg costs
+# nothing. The dangerous one is the combination: leg one fills, leg two 503s,
+# and the unwind 503s too. That is the single path in this design that leaves a
+# naked directional position. Worse, with order status also unavailable,
+# _verify_filled cannot tell us what we are holding, so we would not even know.
+#
+# Paper is unaffected — it sends nothing, so it keeps collecting data.
+LIVE_BLACKOUT_WINDOWS_UTC = (os.getenv("LIVE_BLACKOUT_WINDOWS_UTC", "") or "").strip()
+
+
+def in_live_blackout(now=None) -> tuple[bool, str]:
+    """Is `now` inside a configured no-live-orders window? -> (bool, label)."""
+    import datetime as _dt
+    if not LIVE_BLACKOUT_WINDOWS_UTC:
+        return False, ""
+    t = (now or _dt.datetime.now(_dt.timezone.utc))
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=_dt.timezone.utc)
+    mins = t.hour * 60 + t.minute
+    for win in LIVE_BLACKOUT_WINDOWS_UTC.split(","):
+        win = win.strip()
+        if not win or "-" not in win:
+            continue
+        try:
+            a, b = win.split("-", 1)
+            ah, am = (int(x) for x in a.strip().split(":"))
+            bh, bm = (int(x) for x in b.strip().split(":"))
+        except (ValueError, TypeError):
+            continue
+        start, end = ah * 60 + am, bh * 60 + bm
+        # A window may wrap midnight (e.g. 23:30-00:30).
+        inside = (start <= mins < end) if start <= end else (mins >= start or mins < end)
+        if inside:
+            return True, win
+    return False, ""
+
 # Pushed order book over the venue's market WebSocket. Falls back to REST per
 # scan when the socket is down or the book is stale, so an outage degrades the
 # bot instead of stopping it.

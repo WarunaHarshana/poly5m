@@ -765,6 +765,46 @@ check("the deployed image installs the CLOB client",
               for l in reqs.splitlines() if "py-clob-client-v2" in l),
       "py-clob-client-v2 missing from requirements.txt")
 
+# ---------------------------------------------------------------------------
+print("T21 venue maintenance blackout")
+# Polymarket's maintenance notice warns of HTTP 503 when placing OR cancelling
+# orders and when viewing order status. A failed placement is harmless here.
+# The dangerous combination is leg one filling, leg two 503ing, and the unwind
+# 503ing too — the one path that strands a naked position — with order status
+# also down, so we could not even tell what we hold.
+import datetime as _dt  # noqa: E402
+
+_UTC = _dt.timezone.utc
+
+
+def blackout_at(window, hh, mm):
+    os.environ["LIVE_BLACKOUT_WINDOWS_UTC"] = window
+    importlib.reload(config)
+    got, _label = config.in_live_blackout(
+        _dt.datetime(2026, 8, 13, hh, mm, tzinfo=_UTC))
+    return got
+
+
+check("inside the window blocks", blackout_at("04:30-05:00", 4, 45) is True)
+check("the start edge is inclusive", blackout_at("04:30-05:00", 4, 30) is True)
+check("the end edge is exclusive", blackout_at("04:30-05:00", 5, 0) is False)
+check("a minute before is fine", blackout_at("04:30-05:00", 4, 29) is False)
+check("unrelated hours are fine", blackout_at("04:30-05:00", 12, 0) is False)
+check("a window may wrap midnight",
+      blackout_at("23:30-00:30", 0, 15) is True
+      and blackout_at("23:30-00:30", 23, 45) is True
+      and blackout_at("23:30-00:30", 1, 0) is False)
+check("multiple windows are honoured",
+      blackout_at("01:00-02:00,04:30-05:00", 4, 45) is True
+      and blackout_at("01:00-02:00,04:30-05:00", 1, 30) is True
+      and blackout_at("01:00-02:00,04:30-05:00", 3, 0) is False)
+check("malformed entries are ignored, not crashed on",
+      blackout_at("garbage,04:30-05:00", 4, 45) is True)
+
+os.environ.pop("LIVE_BLACKOUT_WINDOWS_UTC", None)
+importlib.reload(config)
+check("unset means never blocked", config.in_live_blackout()[0] is False)
+
 print()
 if FAIL:
     raise SystemExit(f"SELFTEST_FAILED ops: {FAIL}")
