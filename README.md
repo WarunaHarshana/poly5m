@@ -94,24 +94,29 @@ cannot manufacture edge that is not there.
 | `supervisor.py` | 24/7 entrypoint: dashboard + supervised bot + learning cycle |
 | `observations.py` | Per-slot feature log + official-outcome labeling |
 | `tuner.py` | Walk-forward parameter search with anti-overfit guardrails |
-| `price_feed.py` | Live BTC spot (Chainlink Data Stream first, multi-source fallback) **or** offline simulator |
-| `signal_engine.py` | Drift/diffusion CDF fair value → model probability for the momentum side |
-| `risk.py` | Edge-scaled sizing, exposure cap, daily-loss circuit breaker |
+| `price_feed.py` | Live BTC spot (Chainlink Data Stream first, multi-source fallback) |
+| `book_feed.py` | WebSocket order book — both sides of a pair from one instant |
+| `arb_executor.py` | Live two-leg FOK execution, unwind on a stranded leg, naked-position alerts |
+| `risk.py` | Exposure cap, daily-loss circuit breaker, trade-count caps |
 | `polymarket_client.py` | Public read-only client (no auth) + live CLOB V2 trading client |
 | `executor.py` | Paper fills and live order routing |
-| `bot.py` | Main loop: `run_sim` (offline) + `run_realtime` (real data, background settlement) |
+| `reconcile.py` | Re-checks provisional outcomes against Polymarket and corrects them |
+| `bot.py` | Main loop: scan each slot for a sum-to-one arb, background settlement |
 | `discover.py` | Prints the current auto-discovered 5-min market (debugging) |
 | `app.py` | **All-in-one dashboard server + control API** (start/stop the bot from the browser) |
 | `_selftest_*.py` | Offline self-tests (network stubbed) |
 
 ## Quick start
 
-### 1. Offline paper sim (no deps, no network)
+### 1. Offline self-tests (no deps, no network)
 
 ```bash
-python3 bot.py --mode paper --rounds 200
-python3 app.py                   # then open http://localhost:8000 to view the run
+python3 _selftest_realtime.py
 ```
+
+There is no offline simulator any more. It drove a synthetic **directional**
+book, which only meant anything for momentum; an arb needs two real, live-quoted
+sides before simulating it says anything at all. `paper_live` is the paper mode.
 
 ### 2. Real data, paper money (recommended test)
 
