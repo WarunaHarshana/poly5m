@@ -232,6 +232,12 @@ STRATEGY_FIELDS = [
     {"key": "BOOK_FEED_MAX_AGE_S", "label": "Max book age (s)", "type": "float",
      "default": "2.0", "group": "execution",
      "hint": "Older than this and the scan falls back to REST rather than trusting it"},
+    {"key": "ARB_REQUIRE_ATOMIC_BOOK", "label": "Only trade socket-priced pairs",
+     "type": "bool", "default": "1", "group": "execution",
+     "hint": "REST reads the two legs in separate round trips, so a price move "
+             "between them invents a gap. 236 of 236 logged signals came from "
+             "REST and none from the socket — turning this off means trading "
+             "quotes that may never have coexisted."},
     # --- Live safety ---
     {"key": "ARB_LIVE_ENABLED", "label": "Send REAL orders", "type": "bool",
      "default": "0", "group": "live",
@@ -1899,6 +1905,7 @@ let lastTopRound = null;
 let slotEndTs = null;
 let lastStatusTs = 0;
 let lastStatus = null;   // most recent status.json, for the book-feed badge
+let lastStats = null;    // most recent stats.json, for the skip counters
 let botBtcPrice = null;
 let currentPhase = '';
 let serverTimeOffset = 0;
@@ -2326,11 +2333,8 @@ function maxDrawdown(trades, start) {
 function render(stats, trades) {
   if (!stats || typeof stats !== 'object') stats = {};
   if (!Array.isArray(trades)) trades = [];
+  lastStats = stats;
   document.getElementById('mode').textContent = 'MODE: ' + (stats.mode || '—').toUpperCase();
-  if ((stats.mode || '') === 'paper') {
-    document.getElementById('datanote').textContent =
-      'Offline random-walk price model (not real market data).';
-  }
 
   const start = stats.starting_bankroll || 100;
   const pnl = stats.realized_pnl || 0;
@@ -3191,13 +3195,20 @@ function renderExec(d) {
   // confusion that made 11 geoblocked orders look like a verdict on the edge.
   const reached = n - refused;
   const killedAtBook = Math.max(0, reached - locked - unwound);
+  // Phantoms are counted in stats.json's skips, not in the execution record —
+  // they never became an attempt, because they were never real.
+  const phantom = (lastStats && lastStats.skips
+                   && lastStats.skips.arb_rest_phantom) || 0;
   const rows = [
+    phantom ? ['Gaps seen but not real', phantom,
+               'priced from two separate REST reads — the legs may never have '
+               + 'coexisted, so never traded'] : null,
     ['Attempts sent', n, ''],
     ['Reached the book', reached,
      refused ? refused + ' refused by the venue — never a market interaction' : ''],
     ['Both legs locked', locked,
      killedAtBook ? killedAtBook + ' killed at the book (no match)' : ''],
-  ];
+  ].filter(Boolean);
   funnel.innerHTML =
     '<table><thead><tr><th>Stage</th><th>Count</th><th>Dropped here</th></tr>'
     + '</thead><tbody>'

@@ -998,20 +998,19 @@ async def run_realtime(rounds: int = 100, paper: bool = True,
     placed = len(trades)
     lookup_fails = 0
     slots_seen = 0
+    # Only the counters the arb path actually writes. The momentum keys that
+    # used to live here have been permanently zero since it was retired, and a
+    # row of zeroes reads like "we checked and it never happens" rather than
+    # "nothing writes this any more".
     skips = {
-        "slot_closing": 0,
-        "slot_too_early": 0,
-        "bad_samples": 0,
-        "proxy_strike": 0,
-        "thin_move": 0,
-        "quote_fail": 0,
-        "quote_range": 0,
-        "wide_spread": 0,
-        "thin_book": 0,
-        "no_edge": 0,
-        "order_fail": 0,
-        "unfilled": 0,
+        # A gap the socket never saw: priced from two separate REST reads, so
+        # the pair may never have simultaneously existed. Every signal in the
+        # logged history was one of these.
+        "arb_rest_phantom": 0,
+        # Real pair, refused: fees, depth, venue minimum, or a risk cap.
         "arb_thin": 0,
+        # Live order sent, nothing came back filled.
+        "unfilled": 0,
     }
     max_slots = max(rounds * 30, 300)  # safety cap so a dead market can't spin forever
 
@@ -1040,6 +1039,8 @@ async def run_realtime(rounds: int = 100, paper: bool = True,
     obs_written: dict = {"end_ts": None}
     last_counted_end_ts = None  # count real slots, not poll iterations
     arb_done_end_ts = None      # arb: at most one attempt per slot
+    # Boxed so the nested _try_arb can update it without a nonlocal decl.
+    rest_phantom_slot = [None]  # last slot whose REST-priced signal was logged
     early_seen_end_ts = None    # count slot_too_early once per slot
     time_guard_seen_end_ts = None  # log the time-guard verdict once per slot
 
@@ -1308,6 +1309,26 @@ async def run_realtime(rounds: int = 100, paper: bool = True,
         print(f"  [arb] sum-to-one edge={arb['edge']:+.3f} "
               f"UP@{arb['ask_up']:.3f}+DOWN@{arb['ask_down']:.3f}="
               f"{arb['sum']:.3f}  [{arb.get('src', 'rest')}]")
+
+        # A pair is only real if BOTH legs were priced from one instant. The
+        # REST fallback reads UP and then DOWN in separate round trips, so a
+        # price move between them manufactures a gap that never existed. Across
+        # all logged history that is where every single signal came from: 236
+        # of 236 from REST, zero from the socket, which was doing most of the
+        # scanning. These are measurement error, not mispricings — and acting
+        # on one means sending a first leg into a book that was never there.
+        src = str(arb.get("src") or "rest")
+        if (bool(getattr(config, "ARB_REQUIRE_ATOMIC_BOOK", True))
+                and not src.startswith("ws")):
+            skips["arb_rest_phantom"] = skips.get("arb_rest_phantom", 0) + 1
+            # Log once per slot: the same phantom can persist for many scans.
+            if end_ts != rest_phantom_slot[0]:
+                rest_phantom_slot[0] = end_ts
+                print(f"  [arb] priced from {src.upper()}, not one socket "
+                      f"snapshot — the two legs were read in separate round "
+                      f"trips, so this gap may never have existed. Logged, "
+                      f"not traded (ARB_REQUIRE_ATOMIC_BOOK=1).")
+            return False
         # Too-good-to-be-true gate: a 15c+ "free" gap is makers pulling quotes
         # (dust levels), not a real fill. R8-style +$5.87 outliers were paper
         # fiction — a live taker would catch pennies of it.

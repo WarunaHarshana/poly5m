@@ -393,6 +393,20 @@ BOOK_FEED_MAX_AGE_S = float(os.getenv("BOOK_FEED_MAX_AGE_S", "2.0"))
 # missed and the ones caught were stale by construction. With a pushed book the
 # check is a cheap in-memory read, so it can run far more often.
 ARB_SCAN_INTERVAL_S = float(os.getenv("ARB_SCAN_INTERVAL_S", "1.0"))
+# Only trade a pair both of whose legs were priced from ONE instant.
+#
+# The REST fallback reads UP and then DOWN in separate round trips. The price
+# moves between them, and when it moves the right way the two quotes describe a
+# pair that never simultaneously existed — a gap that looks exactly like an arb
+# and is not one. This is not theoretical: across the whole logged history,
+# 236 of 236 sum-to-one signals came from REST and ZERO from the socket, while
+# the socket did the large majority of the scanning. The book is tight; the
+# "opportunities" were our own measurement error.
+#
+# The fallback still runs, because knowing the socket is down is worth having.
+# It just may not authorise a trade. Turning this off re-enables trading on
+# quotes that cannot be trusted to have coexisted.
+ARB_REQUIRE_ATOMIC_BOOK = _env_bool("ARB_REQUIRE_ATOMIC_BOOK", True)
 
 # How many timestamped backup folders to keep under archive/copies/ (0 = none).
 # Each one holds a full copy of the trade history, written on every settled

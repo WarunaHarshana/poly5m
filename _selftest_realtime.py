@@ -63,6 +63,10 @@ config.ARB_MIN_REMAINING = 20
 config.ARB_MAX_STAKE_USD = 10.0
 config.ARB_SCAN_INTERVAL_S = 1.0
 config.TAKER_FEE_RATE = 0.07            # real crypto_fees_v2 rate
+# Phases A-F drive the loop through a stubbed quote source, which reports as
+# REST. They are exercising sizing, fills, settlement and pacing — not where
+# the price came from. Phase G turns this on and owns that question.
+config.ARB_REQUIRE_ATOMIC_BOOK = False
 
 rng = random.Random(7)
 
@@ -457,6 +461,63 @@ bot._scan_sum_to_one_arb = _real_scan
 print("PHASE_F_OK (live prices the FOK, paper keeps its slippage) "
       "live_trades=", stats_f["trades"], "paper_trades=", stats_g["trades"],
       "locked=", round(_locked, 4))
+
+# ---- Phase G: a REST-priced pair is not a pair ----
+# The REST fallback reads UP and then DOWN in separate round trips, so a price
+# move between them manufactures a gap that never existed. Across the whole
+# logged history 236 of 236 sum-to-one signals came from REST and ZERO from the
+# socket, while the socket did most of the scanning — these are measurement
+# error, and acting on one sends a first leg into a book that was never there.
+config.ARB_REQUIRE_ATOMIC_BOOK = True
+
+
+def _scan_from(src):
+    def _s(pub, market, feed=None):
+        return {"ask_up": ASK_UP, "ask_down": ASK_DN, "sum": ASK_UP + ASK_DN,
+                "edge": 1 - (ASK_UP + ASK_DN), "up_size": 500.0,
+                "down_size": 500.0, "bid_up": ASK_UP - 0.01,
+                "bid_down": ASK_DN - 0.01, "src": src}
+    return _s
+
+
+# Identical, profitable pair — the ONLY difference is where the price came from.
+bot._scan_sum_to_one_arb = _scan_from("rest")
+FakeArbLiveClient.calls = []
+config.MODE = "live"
+stats_rest = asyncio.run(bot.run_realtime(rounds=1, paper=False))
+config.MODE = "paper_live"
+assert stats_rest["trades"] == 0, \
+    f"a REST-priced pair must never be traded: {stats_rest}"
+assert not [c for c in FakeArbLiveClient.calls if c[0] == "buy"], \
+    f"no order may be sent on a REST-priced pair: {FakeArbLiveClient.calls}"
+assert stats_rest["skips"].get("arb_rest_phantom", 0) >= 1, \
+    f"the phantom must be COUNTED, not silently dropped: {stats_rest['skips']}"
+
+bot._scan_sum_to_one_arb = _scan_from("ws(120ms)")
+FakeArbLiveClient.calls = []
+config.MODE = "live"
+stats_ws = asyncio.run(bot.run_realtime(rounds=1, paper=False))
+config.MODE = "paper_live"
+assert stats_ws["trades"] == 1, \
+    f"the same pair from ONE socket snapshot must trade: {stats_ws}"
+assert len([c for c in FakeArbLiveClient.calls if c[0] == "buy"]) == 2, \
+    f"both legs should go out: {FakeArbLiveClient.calls}"
+
+# The escape hatch still works, for anyone who wants the old behaviour.
+config.ARB_REQUIRE_ATOMIC_BOOK = False
+bot._scan_sum_to_one_arb = _scan_from("rest")
+config.MODE = "live"
+stats_off = asyncio.run(bot.run_realtime(rounds=1, paper=False))
+config.MODE = "paper_live"
+config.ARB_REQUIRE_ATOMIC_BOOK = True
+assert stats_off["trades"] == 1, \
+    f"with the guard off, REST should trade again: {stats_off}"
+
+bot._scan_sum_to_one_arb = _real_scan
+print("PHASE_G_OK (socket-only arbs) rest_trades=", stats_rest["trades"],
+      "ws_trades=", stats_ws["trades"],
+      "phantoms_counted=", stats_rest["skips"].get("arb_rest_phantom"),
+      "guard_off_trades=", stats_off["trades"])
 
 bot._scan_sum_to_one_arb = _real_scan
 config.ROUND_SECONDS = 0

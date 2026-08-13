@@ -211,8 +211,6 @@ def compute_report(hours: float | None = None,
             s = json.loads(_raw) if _raw and _raw[:1] != "\x00" else {}
             out["session_id"] = s.get("session_id")
             out["skips"] = {k: v for k, v in (s.get("skips") or {}).items() if v}
-            out["stream_warning"] = (
-                (s.get("skips") or {}).get("proxy_strike", 0) > 10)
         except Exception:
             pass
     return out
