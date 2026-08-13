@@ -228,18 +228,27 @@ def execute(client, market: dict, ask_up: float, ask_down: float,
             shares: float, depth_up: float | None = None,
             depth_down: float | None = None,
             bid_up: float | None = None, bid_down: float | None = None,
-            dry_run: bool = False) -> ArbResult:
+            dry_run: bool = False, context: dict | None = None) -> ArbResult:
     """Buy both legs atomically, or end up holding nothing.
 
     ``client`` needs .buy(token_id, price, size, condition_id, order_type) and
     .sell(token_id, price, size, condition_id, order_type) for the unwind.
+
+    ``context`` is merged into every log line — the caller knows things this
+    module does not (how much slot was left, whether the quote came from the
+    socket or REST) and the tuner cannot learn a gate whose value was never
+    recorded next to the outcome it produced.
     """
+    ctx = dict(context or {})
+
+    def _emit(entry: dict) -> None:
+        _log({**ctx, **entry})
     viable, locked, why = evaluate(ask_up, ask_down, shares)
     pair = float(ask_up) + float(ask_down)
     if not viable:
         res = ArbResult(ok=False, reason=why, pair_cost=pair,
                         locked_edge=locked, shares=shares)
-        _log({"action": "reject", **res.to_dict()})
+        _emit({"action": "reject", **res.to_dict()})
         return res
 
     tokens = market.get("tokens") or {}
@@ -276,7 +285,7 @@ def execute(client, market: dict, ask_up: float, ask_down: float,
                                          f"nothing bought, no risk taken",
                         pair_cost=pair, locked_edge=locked, shares=shares,
                         legs=[leg1])
-        _log({"action": "first_leg_killed", **res.to_dict()})
+        _emit({"action": "first_leg_killed", **res.to_dict()})
         return res
 
     leg2 = _fok_buy(second[0], second[1], second[2])
@@ -285,7 +294,7 @@ def execute(client, market: dict, ask_up: float, ask_down: float,
         res = ArbResult(ok=True, reason="both legs filled — profit locked",
                         pair_cost=pair, locked_edge=locked, shares=shares,
                         legs=[leg1, leg2], realized_pnl=realized)
-        _log({"action": "locked", **res.to_dict()})
+        _emit({"action": "locked", **res.to_dict()})
         return res
 
     # Second leg killed: we are holding a naked directional position. Get out
@@ -305,7 +314,7 @@ def execute(client, market: dict, ask_up: float, ask_down: float,
                              f"HOLDING NAKED {first[0]} {shares} shares",
                       pair_cost=pair, locked_edge=locked, shares=shares,
                       legs=[leg1, leg2])
-        _log({"action": "unwind_failed", "severity": "critical", **r.to_dict()})
+        _emit({"action": "unwind_failed", "severity": "critical", **r.to_dict()})
         return r
 
     try:
@@ -335,7 +344,7 @@ def execute(client, market: dict, ask_up: float, ask_down: float,
                     pair_cost=pair, locked_edge=locked, shares=shares,
                     legs=[leg1, leg2], unwound=unwound,
                     unwind_pnl=unwind_pnl, realized_pnl=unwind_pnl)
-    _log({"action": "unwound", **res.to_dict()})
+    _emit({"action": "unwound", **res.to_dict()})
     return res
 
 

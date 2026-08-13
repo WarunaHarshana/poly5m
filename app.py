@@ -3369,41 +3369,53 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # Learning state: dataset size, parameters in force, recent decisions.
         # Without this the self-tuning loop is invisible unless you SSH in.
         if path == "/api/learning":
+            # The naked-position alert is the highest-severity thing on the
+            # whole dashboard, and it used to be computed INSIDE the same try
+            # block as the tuner import — so any tuner error took the alert down
+            # with it, silently, exactly when something had gone wrong enough to
+            # throw. The arb half now stands on its own.
+            out = {"ok": True, "arb_alerts": [], "arb_exec": {}}
             try:
-                import observations
+                import arb_executor
+                out["arb_alerts"] = arb_executor.open_alerts()
+                out["arb_exec"] = arb_executor.stats()
+            except Exception as e:
+                out["arb_error"] = str(e)
+
+            try:
+                with open(os.path.join(STATE_DIR, "supervisor.json"),
+                          encoding="utf-8") as f:
+                    out["supervisor"] = json.load(f)
+            except (OSError, ValueError):
+                out["supervisor"] = {}
+
+            try:
                 import tuner
-                rows = observations.load()
-                labeled = [r for r in rows if r.get("outcome") in ("UP", "DOWN")]
-                journal = tuner.read_journal()[-20:]
-                tuned = tuner.load_tuned()
-                sup = {}
-                try:
-                    with open(os.path.join(STATE_DIR, "supervisor.json"),
-                              encoding="utf-8") as f:
-                        sup = json.load(f)
-                except (OSError, ValueError):
-                    pass
-                try:
-                    import arb_executor
-                    arb_alerts = arb_executor.open_alerts()
-                    arb_exec = arb_executor.stats()
-                except Exception:
-                    arb_alerts, arb_exec = [], {}
-                return self._json({
-                    "ok": True,
-                    "arb_alerts": arb_alerts,
-                    "arb_exec": arb_exec,
-                    "observations": len(rows),
-                    "labeled": len(labeled),
-                    "needed_to_tune": tuner.MIN_LABELED_ROWS,
+                usable, census = tuner.load_attempts()
+                out.update({
+                    "dataset": census,
+                    "usable_attempts": len(usable),
+                    "needed_to_tune": tuner.MIN_USABLE_ROWS,
                     "active_params": tuner.active_params(),
                     "defaults": tuner.DEFAULTS,
-                    "tuned": tuned,
-                    "journal": list(reversed(journal)),
-                    "supervisor": sup,
+                    "tuned": tuner.load_tuned(),
+                    "journal": list(reversed(tuner.read_journal()[-20:])),
                 })
             except Exception as e:
-                return self._json({"ok": False, "error": str(e)}, 500)
+                out["tuner_error"] = str(e)
+
+            # Observations are the retired momentum dataset. Kept because the
+            # archive is still worth counting, but nothing tunes on it now.
+            try:
+                import observations
+                rows = observations.load()
+                out["observations"] = len(rows)
+                out["labeled"] = sum(
+                    1 for r in rows if r.get("outcome") in ("UP", "DOWN"))
+            except Exception:
+                out["observations"] = out["labeled"] = 0
+
+            return self._json(out)
 
         # Control API
         if path == "/api/control":

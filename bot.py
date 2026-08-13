@@ -1365,6 +1365,12 @@ async def run_realtime(rounds: int = 100, paper: bool = True,
                 float(arb["ask_up"]), float(arb["ask_down"]), shares,
                 arb.get("up_size"), arb.get("down_size"),
                 arb.get("bid_up"), arb.get("bid_down"),
+                False,
+                # The tuner cannot learn a gate whose value was never recorded
+                # beside the outcome it produced. ARB_MIN_REMAINING in
+                # particular is unlearnable without remaining_s on the row.
+                {"remaining_s": round(float(remaining), 1) if remaining else None,
+                 "quote_src": arb.get("src"), "slug": market.get("slug")},
             )
             print(f"  [arb/live] {live_res.reason}")
             # Say WHY, per leg. "not filled" covers two opposite situations —

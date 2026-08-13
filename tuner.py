@@ -1,34 +1,58 @@
-"""Nightly walk-forward parameter tuner.
+"""Nightly walk-forward tuner for the arb gates.
 
-Reads the labeled observation log, replays the momentum strategy over it under
-candidate parameter sets, and — only when the evidence clears every guardrail —
-writes new parameters to ``state/tuned_params.json``, which ``config.py`` loads
-at import so the next bot restart picks them up.
+Reads the live execution log, replays the arb gate stack over it under candidate
+parameter sets, and — only when the evidence clears every guardrail — writes new
+parameters to ``state/tuned_params.json``, which ``config.py`` loads at import so
+the next bot restart picks them up.
 
-WHY THIS IS BUILT THE WAY IT IS
+WHAT CHANGED WHEN MOMENTUM WAS RETIRED
+--------------------------------------
+The momentum tuner learned from *counterfactual* slots: it knew the outcome of
+every slot it declined, because the outcome was just "did BTC go up". An arb has
+no such luxury and does not need one. Once both legs fill, the payout is
+arithmetic — one leg pays $1/share whichever way the slot lands — so the only
+thing worth learning is **at what locked edge both legs actually fill**. That is
+measured directly, per attempt, in ``archive/arb_executions.jsonl``.
+
+So the dataset is attempts, not slots, and the question is fill rate, not
+direction.
+
+REFUSED ORDERS ARE NOT EVIDENCE
 -------------------------------
-Optimising parameters on your own trade history is the classic way to build a
-bot that looks brilliant on the data it was fitted to and loses money live.
-Every design choice here exists to make that harder:
+An attempt whose leg carries an ``error`` was REFUSED by the venue — wrong
+region, bad auth, bad size, bad tick — and never reached the matching engine. A
+leg that was *killed* reaches the book, finds nothing to match, and comes back
+with no error at all. Only the second kind says anything about whether an edge
+was capturable.
 
-* **Counterfactual data, not just trades.** The search runs over every
-  evaluated slot (see observations.py), so widening a gate is scored on the
-  slots it would newly admit — not on a sample that already passed the old gate.
-* **Chronological holdout.** Parameters are fitted on the older portion and
-  must *also* win on a newer slice they never saw. A random split would leak
-  future information through overlapping market regimes.
-* **Coordinate ascent, not a full grid.** One dimension at a time over a
-  handful of passes. A 7000-cell grid search on a few thousand rows finds
-  noise; a shallow search cannot chase it as far.
-* **Step limits.** No parameter moves more than one notch per night, so a
-  single odd day cannot swing the strategy somewhere strange.
-* **Minimum sample sizes.** A configuration that trades 4 slots in the holdout
+This distinction is not academic. Every live attempt up to 2026-08-13 was an
+HTTP 403 "trading restricted in your region": eleven orders, none of which ever
+reached the book. Scored naively that reads as "this edge never fills at any
+level", and the tuner's correct-looking response would have been to drive
+ARB_MIN_LOCKED_EDGE up until it stopped trading entirely — a confident
+conclusion drawn from a dataset containing no market information whatsoever.
+``load_attempts`` drops them and reports the count instead.
+
+WHY THE REST IS BUILT THE WAY IT IS
+-----------------------------------
+Optimising parameters on your own history is the classic way to build a bot that
+looks brilliant on the data it was fitted to and loses money live. Every design
+choice here exists to make that harder:
+
+* **Chronological holdout.** Parameters are fitted on the older portion and must
+  *also* win on a newer slice they never saw.
+* **Coordinate ascent, not a full grid.** One dimension at a time over a handful
+  of passes. A deep search on a few hundred rows finds noise.
+* **Step limits.** No parameter moves more than one notch per night.
+* **Minimum sample sizes.** A configuration that attempts 4 arbs in the holdout
   is not evidence, however good those 4 look.
-* **Auto-revert.** Every change is journalled with the bankroll at the time.
-  If realised results after a change are worse and negative, it is rolled back.
+* **Significance, not just sign.** The holdout mean must stand clear of its own
+  standard error.
+* **Auto-revert.** Every change is journalled; if realised results after a change
+  are worse and negative, it is rolled back.
 
-The honest limitation: this tunes *thresholds on an existing signal*. It cannot
-invent edge that is not there. If the strategy has no edge, a well-behaved
+The honest limitation: this tunes *thresholds on an existing edge*. It cannot
+invent one. If sum-to-one arbs do not fill at any threshold, a well-behaved
 tuner's correct output is "no change" — and it will keep saying that.
 """
 from __future__ import annotations
@@ -39,56 +63,59 @@ import os
 import time
 from datetime import datetime, timezone
 
-import observations
 import paths
 
 STATE_DIR = paths.state_dir()
 ARCHIVE_DIR = paths.archive_dir()
 TUNED_PATH = os.path.join(STATE_DIR, "tuned_params.json")
 TUNING_LOG = os.path.join(ARCHIVE_DIR, "tuning_log.jsonl")
+ARB_LOG = os.path.join(ARCHIVE_DIR, "arb_executions.jsonl")
 
 # --- guardrails ------------------------------------------------------------
-MIN_LABELED_ROWS = int(os.getenv("TUNER_MIN_ROWS", "300"))
+# NOTE: these count ATTEMPTS that reached the book, not slots scanned. Arbs are
+# far rarer than slots, so these floors are correspondingly lower than the
+# momentum tuner's — but they are still floors, and lowering them to "get a
+# result" is how you get a result that means nothing.
+MIN_USABLE_ROWS = int(os.getenv("TUNER_MIN_ROWS", "100"))
 MIN_TRAIN_TRADES = int(os.getenv("TUNER_MIN_TRAIN_TRADES", "40"))
 MIN_HOLDOUT_TRADES = int(os.getenv("TUNER_MIN_HOLDOUT_TRADES", "15"))
 HOLDOUT_FRAC = float(os.getenv("TUNER_HOLDOUT_FRAC", "0.30"))
-# Required improvement in expectancy ($/trade) over the incumbent, on BOTH
-# slices, before anything is written. Small enough to make progress, large
-# enough that noise does not clear it.
+# Required improvement in expectancy ($/attempt) over the incumbent, on BOTH
+# slices, before anything is written.
 MIN_IMPROVEMENT = float(os.getenv("TUNER_MIN_IMPROVEMENT", "0.02"))
 # How many standard errors the holdout expectancy must clear zero by. The
 # coordinate search takes dozens of looks at the data, so "positive on both
-# slices" happens by chance far more often than intuition suggests — measured
-# at 25% of runs on synthetic pure noise with this gate absent. See
-# _selftest_tuner.py T2, which holds the false-positive rate to the stated
-# bound; lowering this without re-running that test re-opens the hole.
+# slices" happens by chance far more often than intuition suggests — measured at
+# 25% of runs on synthetic pure noise with this gate absent. See
+# _selftest_tuner.py, which holds the false-positive rate to the stated bound;
+# lowering this without re-running that test re-opens the hole.
 MIN_T_STAT = float(os.getenv("TUNER_MIN_T_STAT", "2.0"))
 PASSES = int(os.getenv("TUNER_PASSES", "2"))
-# Simulation economics — a fixed notional makes parameter sets comparable.
-UNIT_STAKE = float(os.getenv("TUNER_UNIT_STAKE", "10.0"))
-SLIPPAGE = float(os.getenv("TUNER_SLIPPAGE", "0.01"))
 FEE_RATE = float(os.getenv("TUNER_FEE_RATE", "0.07"))
 
 # The knobs the tuner is allowed to touch, each with an ordered ladder of
 # candidate values. Ordered so "one notch per night" is well defined, and
 # deliberately bounded — the tuner cannot propose a value not on this ladder.
 LADDERS: dict[str, list] = {
-    "LATE_MOMENTUM_MIN_MOVE":  [5.0, 6.0, 8.0, 10.0, 12.0, 15.0, 20.0, 25.0],
-    "LATE_MOMENTUM_MIN_ENTRY": [0.45, 0.50, 0.55, 0.60, 0.65, 0.70],
-    "LATE_MOMENTUM_MAX_ENTRY": [0.75, 0.80, 0.84, 0.88, 0.90, 0.92],
-    "LATE_MOMENTUM_MIN_EDGE":  [-0.30, -0.20, -0.10, -0.05, 0.0, 0.02, 0.05],
-    "LATE_MOMENTUM_MAX_EDGE":  [0.04, 0.06, 0.10, 0.15, 0.20, 0.30],
-    "LATE_MOMENTUM_MAX_CHOP":  [1, 2, 3, 4, 6, 99],
+    # Raw gap (1 - pair cost) required before an attempt is even considered.
+    "ARB_MIN_EDGE":        [0.010, 0.015, 0.020, 0.030, 0.040, 0.050],
+    # Edge left AFTER both taker fees — the number that actually has to be
+    # positive for the trade to be worth doing.
+    "ARB_MIN_LOCKED_EDGE": [0.005, 0.010, 0.020, 0.030, 0.040, 0.050],
+    # Too-good-to-be-true ceiling: a very wide "free" gap is makers pulling
+    # quotes, not a fillable arb.
+    "ARB_MAX_EDGE":        [0.08, 0.10, 0.15, 0.20, 0.30],
+    # Seconds of slot that must remain: below this there is not enough time to
+    # get two legs done.
+    "ARB_MIN_REMAINING":   [10, 15, 20, 30, 45, 60],
 }
 MAX_STEPS_PER_RUN = int(os.getenv("TUNER_MAX_STEPS", "1"))
 
 DEFAULTS = {
-    "LATE_MOMENTUM_MIN_MOVE": 10.0,
-    "LATE_MOMENTUM_MIN_ENTRY": 0.55,
-    "LATE_MOMENTUM_MAX_ENTRY": 0.88,
-    "LATE_MOMENTUM_MIN_EDGE": -0.20,
-    "LATE_MOMENTUM_MAX_EDGE": 0.10,
-    "LATE_MOMENTUM_MAX_CHOP": 3,
+    "ARB_MIN_EDGE": 0.02,
+    "ARB_MIN_LOCKED_EDGE": 0.02,
+    "ARB_MAX_EDGE": 0.15,
+    "ARB_MIN_REMAINING": 20,
 }
 
 
@@ -164,94 +191,157 @@ def read_journal() -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Strategy replay
+# The dataset: attempts that actually reached the book
 # ---------------------------------------------------------------------------
+SCORABLE_ACTIONS = ("locked", "first_leg_killed", "unwound", "unwind_failed")
+
+
+def _was_refused(row: dict) -> bool:
+    """True when the VENUE refused the order rather than failing to match it.
+
+    arb_executor records the venue's own words on a leg it could not place, and
+    records nothing at all on a leg that reached the book and was killed. So a
+    non-empty leg error is the signal that this attempt never became a real
+    market interaction — and therefore carries no information about whether the
+    edge was capturable.
+    """
+    for leg in (row.get("legs") or []):
+        if leg.get("error"):
+            return True
+    return False
+
+
+def load_attempts(since_ts: float | None = None) -> tuple[list[dict], dict]:
+    """Scorable attempts (oldest first) plus a census of what was dropped.
+
+    The census is not decoration: when the tuner holds, the operator needs to
+    know whether it held because the market said no or because the orders never
+    got there.
+    """
+    census = {"total": 0, "refused_by_venue": 0, "not_an_attempt": 0,
+              "usable": 0, "by_action": {}}
+    rows: list[dict] = []
+    if not os.path.isfile(ARB_LOG):
+        return rows, census
+    try:
+        with open(ARB_LOG, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    r = json.loads(line)
+                except ValueError:
+                    continue
+                census["total"] += 1
+                if since_ts is not None and float(r.get("ts") or 0) < since_ts:
+                    continue
+                act = r.get("action")
+                if act not in SCORABLE_ACTIONS:
+                    # "reject" = our own economics gate refused before sending.
+                    census["not_an_attempt"] += 1
+                    continue
+                if _was_refused(r):
+                    census["refused_by_venue"] += 1
+                    continue
+                census["usable"] += 1
+                census["by_action"][act] = census["by_action"].get(act, 0) + 1
+                rows.append(r)
+    except OSError:
+        return rows, census
+    rows.sort(key=lambda r: float(r.get("ts") or 0))
+    return rows, census
+
+
 def _taker_fee_per_share(price: float, rate: float = FEE_RATE) -> float:
     """Polymarket's documented shape: rate * price * (1 - price) per share.
 
-    Delegates to config so the backtest prices trades exactly the way the live
-    gate does. A tuner that scores candidates on a different fee curve than the
-    bot pays is optimising the wrong problem.
+    Delegates to config so the tuner prices trades exactly the way the live gate
+    does. A tuner that scores candidates on a different fee curve than the bot
+    pays is optimising the wrong problem.
     """
     import config as _c
     return _c.taker_fee_per_share(price, rate)
 
 
-def would_trade(row: dict, p: dict) -> bool:
-    """Would this parameter set have taken this slot?"""
-    ask = row.get("ask")
-    move = row.get("move_usd")
-    side = row.get("side")
-    if ask is None or move is None or side not in ("UP", "DOWN"):
+def _attempt_pnl(row: dict) -> float:
+    """What this attempt actually cost or made."""
+    act = row.get("action")
+    shares = float(row.get("shares") or 0.0)
+    if act == "locked":
+        return float(row.get("realized_pnl") or 0.0)
+    if act == "unwound":
+        return float(row.get("unwind_pnl") or row.get("realized_pnl") or 0.0)
+    if act == "first_leg_killed":
+        return 0.0            # nothing bought, nothing risked
+    if act == "unwind_failed":
+        # A naked leg riding into resolution is worth $1/share or $0, and we do
+        # not know which. Score the worst case rather than the average: this is
+        # the one outcome the whole design exists to avoid, and letting the
+        # tuner treat it as roughly free is how it would learn to court it.
+        legs = row.get("legs") or []
+        px = float((legs[0] or {}).get("price") or 0.0) if legs else 0.0
+        return -(shares * px)
+    return 0.0
+
+
+# ---------------------------------------------------------------------------
+# Gate replay
+# ---------------------------------------------------------------------------
+def would_attempt(row: dict, p: dict) -> bool:
+    """Would this parameter set have tried this arb?"""
+    pair = row.get("pair_cost")
+    locked = row.get("locked_edge")
+    if pair is None or locked is None:
         return False
-    # The recorded requirement was scaled by sqrt(remaining/20) at decision
-    # time; recompute that scaling for the candidate threshold so the
-    # comparison is exactly what the live bot would have done.
-    remaining = row.get("remaining_s")
-    scale = math.sqrt(max(float(remaining), 1.0) / 20.0) if remaining else 1.0
-    if abs(float(move)) < float(p["LATE_MOMENTUM_MIN_MOVE"]) * scale:
+    raw_edge = 1.0 - float(pair)
+    if raw_edge < float(p["ARB_MIN_EDGE"]):
         return False
-    ask = float(ask)
-    if ask < float(p["LATE_MOMENTUM_MIN_ENTRY"]):
+    max_edge = float(p["ARB_MAX_EDGE"])
+    if max_edge > 0 and raw_edge > max_edge:
         return False
-    if ask > float(p["LATE_MOMENTUM_MAX_ENTRY"]):
+    if float(locked) < float(p["ARB_MIN_LOCKED_EDGE"]):
         return False
-    edge = row.get("edge")
-    edge_net = row.get("edge_net")
-    if edge_net is not None and float(edge_net) < float(p["LATE_MOMENTUM_MIN_EDGE"]):
-        return False
-    max_edge = float(p["LATE_MOMENTUM_MAX_EDGE"])
-    if max_edge > 0 and edge is not None and float(edge) > max_edge:
-        return False
-    chop = row.get("chop_crosses")
-    max_chop = int(p["LATE_MOMENTUM_MAX_CHOP"])
-    if chop is not None and max_chop > 0 and int(chop) > max_chop:
+    rem = row.get("remaining_s")
+    if rem is not None and float(rem) < float(p["ARB_MIN_REMAINING"]):
         return False
     return True
 
 
 def simulate(rows: list[dict], p: dict) -> dict:
-    """Replay a parameter set over labeled observations.
+    """Replay a parameter set over recorded attempts.
 
-    Prices every row identically — raw ask plus the same pessimistic slippage
-    and the real taker fee — so traded and skipped rows are directly
-    comparable. Returns aggregate stats; ``expectancy`` is $/trade.
+    ``expectancy`` is $/attempt — including the attempts that cost nothing,
+    because a gate that admits ten free misses to catch one lock is a different
+    proposition from one that catches the lock alone, and the average is where
+    that shows up.
     """
-    n = wins = 0
+    n = locks = 0
     pnl = 0.0
     staked = 0.0
-    per_trade: list[float] = []
+    per_attempt: list[float] = []
     for r in rows:
-        if r.get("won_if_taken") is None:
+        if not would_attempt(r, p):
             continue
-        if not would_trade(r, p):
-            continue
-        fill = min(0.99, float(r["ask"]) + SLIPPAGE)
-        if fill <= 0:
-            continue
-        shares = UNIT_STAKE / fill
-        fee = shares * _taker_fee_per_share(fill)
-        won = bool(r["won_if_taken"])
-        trade_pnl = (shares if won else 0.0) - UNIT_STAKE - fee
+        v = _attempt_pnl(r)
         n += 1
-        wins += 1 if won else 0
-        pnl += trade_pnl
-        staked += UNIT_STAKE
-        per_trade.append(trade_pnl)
-    # Standard error of the mean PnL. Binary payouts are violently skewed —
-    # at ask 0.60 a win is +$6.67 and a loss is -$10 — so a difference of a
-    # few cents per trade over a few hundred trades is well inside the noise.
-    # Without this the acceptance test cannot tell signal from luck.
+        if r.get("action") == "locked":
+            locks += 1
+        pnl += v
+        staked += float(r.get("shares") or 0.0) * float(r.get("pair_cost") or 0.0)
+        per_attempt.append(v)
     exp = pnl / n if n else 0.0
     if n > 1:
-        var = sum((x - exp) ** 2 for x in per_trade) / (n - 1)
+        var = sum((x - exp) ** 2 for x in per_attempt) / (n - 1)
         stderr = math.sqrt(var / n)
     else:
         stderr = float("inf") if n else 0.0
     return {
+        # Key names match the momentum tuner's so the dashboard's learning
+        # panel keeps rendering; "wins" is a LOCK here, not a direction call.
         "trades": n,
-        "wins": wins,
-        "win_rate": round(100.0 * wins / n, 2) if n else 0.0,
+        "wins": locks,
+        "win_rate": round(100.0 * locks / n, 2) if n else 0.0,
         "pnl": round(pnl, 4),
         "expectancy": round(exp, 4),
         "stderr": round(stderr, 4) if stderr != float("inf") else None,
@@ -345,8 +435,7 @@ def check_revert(min_trades: int = 25) -> dict | None:
     if not prev or not changed_at:
         return None
 
-    rows = [r for r in observations.load(since_ts=float(changed_at))
-            if r.get("decision") == "trade" and r.get("won_if_taken") is not None]
+    rows, _census = load_attempts(since_ts=float(changed_at))
     if len(rows) < min_trades:
         return None
 
@@ -382,14 +471,31 @@ def run(verbose: bool = True) -> dict:
         say("rolled back the last parameter change (see tuning_log.jsonl)")
         return {"action": "revert", "detail": reverted}
 
-    rows = [r for r in observations.load(labeled_only=True)
-            if r.get("won_if_taken") is not None]
-    rows.sort(key=lambda r: float(r.get("ts") or 0))
-    if len(rows) < MIN_LABELED_ROWS:
-        msg = (f"only {len(rows)} labeled slots; need {MIN_LABELED_ROWS} "
-               f"before tuning anything")
+    rows, census = load_attempts()
+
+    # Say WHY there is no data, when there is no data. "0 usable attempts"
+    # because the venue refused every order is a completely different problem
+    # from "0 usable attempts" because no arb ever appeared, and only one of
+    # them is fixed by waiting.
+    if census["refused_by_venue"] and not rows:
+        msg = (f"{census['refused_by_venue']} of {census['total']} attempts were "
+               f"REFUSED by the venue and never reached the book, and none "
+               f"remain to learn from. That is a setup problem (region, auth, "
+               f"size or tick), not a verdict on the edge — check the leg "
+               f"errors in arb_executions.jsonl. Tuning nothing.")
         say(msg)
-        return {"action": "wait", "labeled_rows": len(rows), "reason": msg}
+        return {"action": "wait", "reason": msg, "census": census,
+                "params": active_params()}
+
+    if len(rows) < MIN_USABLE_ROWS:
+        msg = (f"only {len(rows)} usable attempt(s); need {MIN_USABLE_ROWS} "
+               f"before tuning anything"
+               + (f" ({census['refused_by_venue']} more were refused by the "
+                  f"venue and cannot be scored)"
+                  if census["refused_by_venue"] else ""))
+        say(msg)
+        return {"action": "wait", "usable_rows": len(rows), "reason": msg,
+                "census": census, "params": active_params()}
 
     split = int(len(rows) * (1.0 - HOLDOUT_FRAC))
     train_rows, holdout_rows = rows[:split], rows[split:]
@@ -397,11 +503,13 @@ def run(verbose: bool = True) -> dict:
 
     cur_train = simulate(train_rows, current)
     cur_holdout = simulate(holdout_rows, current)
-    say(f"{len(rows)} labeled slots  (train {len(train_rows)} / holdout "
-        f"{len(holdout_rows)})")
+    say(f"{len(rows)} usable attempts  (train {len(train_rows)} / holdout "
+        f"{len(holdout_rows)})  [{census['refused_by_venue']} refused, "
+        f"not scored]")
     say(f"current: train exp ${cur_train['expectancy']:+.4f} "
-        f"(n={cur_train['trades']})  holdout exp "
-        f"${cur_holdout['expectancy']:+.4f} (n={cur_holdout['trades']})")
+        f"(n={cur_train['trades']}, {cur_train['win_rate']}% locked)  "
+        f"holdout exp ${cur_holdout['expectancy']:+.4f} "
+        f"(n={cur_holdout['trades']}, {cur_holdout['win_rate']}% locked)")
 
     best, metrics = search(train_rows, holdout_rows, current)
     tr, ho = metrics["train"], metrics["holdout"]
@@ -409,23 +517,22 @@ def run(verbose: bool = True) -> dict:
     changes = {k: (current[k], best[k]) for k in best if best[k] != current[k]}
     if not changes:
         # Distinguish "nothing was better" from "nothing could be judged".
-        # With too few trades in a slice, _eligible() rejects every candidate
+        # With too few attempts in a slice, _eligible() rejects every candidate
         # and the search returns the incumbent unchanged — which looks exactly
-        # like a considered decision but is not one. Reporting it as such made
-        # the supervisor back off a full day on a holdout of 9 trades.
+        # like a considered decision but is not one.
         starved = not _eligible(cur_train, cur_holdout)
         if starved:
-            msg = (f"not enough trades to judge yet "
+            msg = (f"not enough attempts to judge yet "
                    f"(train {cur_train['trades']}/{MIN_TRAIN_TRADES}, "
                    f"holdout {cur_holdout['trades']}/{MIN_HOLDOUT_TRADES})")
             say(msg)
             return {"action": "wait", "params": current, "reason": msg,
-                    "labeled_rows": len(rows),
+                    "usable_rows": len(rows), "census": census,
                     "train": cur_train, "holdout": cur_holdout}
         say("no parameter change clears the guardrails — keeping current set")
         _journal({"action": "hold", "params": current,
                   "train": cur_train, "holdout": cur_holdout})
-        return {"action": "hold", "params": current,
+        return {"action": "hold", "params": current, "census": census,
                 "train": cur_train, "holdout": cur_holdout}
 
     # Final gates, applied to the winner only.
@@ -438,16 +545,14 @@ def run(verbose: bool = True) -> dict:
         reasons.append(f"train gain {gain_train:+.4f} < {MIN_IMPROVEMENT}")
     if gain_holdout < MIN_IMPROVEMENT:
         reasons.append(f"holdout gain {gain_holdout:+.4f} < {MIN_IMPROVEMENT}")
-    # Significance, not just sign. The search takes dozens of looks at the
-    # data, so on noise alone some candidate will beat the incumbent on both
-    # slices — measured at 25% of runs before this gate existed. Requiring the
-    # holdout mean to stand clear of its own standard error is what separates
-    # an effect from a lucky subset.
+    # Significance, not just sign. The search takes dozens of looks at the data,
+    # so on noise alone some candidate will beat the incumbent on both slices —
+    # measured at 25% of runs before this gate existed.
     if (ho.get("t_stat") or 0) < MIN_T_STAT:
         reasons.append(
             f"holdout t-stat {ho.get('t_stat')} < {MIN_T_STAT} "
             f"(expectancy {ho['expectancy']:+.4f} +/- {ho.get('stderr')} "
-            f"per trade — indistinguishable from luck)")
+            f"per attempt — indistinguishable from luck)")
     if (tr.get("t_stat") or 0) < MIN_T_STAT:
         reasons.append(f"train t-stat {tr.get('t_stat')} < {MIN_T_STAT}")
     if reasons:
@@ -460,12 +565,12 @@ def run(verbose: bool = True) -> dict:
         "previous_params": current,
         "reason": "walk-forward improvement on both train and holdout",
         "train": tr, "holdout": ho,
-        "labeled_rows": len(rows),
+        "usable_rows": len(rows),
     })
     _journal({"action": "apply", "params": best, "previous": current,
               "changes": {k: {"from": v[0], "to": v[1]}
                           for k, v in changes.items()},
-              "train": tr, "holdout": ho, "labeled_rows": len(rows)})
+              "train": tr, "holdout": ho, "usable_rows": len(rows)})
     for k, (old, new) in changes.items():
         say(f"  {k}: {old} -> {new}")
     say(f"applied. holdout expectancy ${cur_holdout['expectancy']:+.4f} -> "
@@ -477,8 +582,10 @@ def run(verbose: bool = True) -> dict:
 if __name__ == "__main__":
     import sys
     if "--status" in sys.argv:
+        _rows, _census = load_attempts()
         print(json.dumps({"tuned": load_tuned(),
-                          "active": active_params()}, indent=2, default=str))
+                          "active": active_params(),
+                          "dataset": _census}, indent=2, default=str))
     elif "--revert" in sys.argv:
         print(json.dumps(check_revert(min_trades=0) or {"action": "none"},
                          indent=2, default=str))
