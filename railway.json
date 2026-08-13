@@ -9,6 +9,7 @@
     "healthcheckPath": "/healthz",
     "healthcheckTimeout": 120,
     "restartPolicyType": "ALWAYS",
-    "numReplicas": 1
+    "numReplicas": 1,
+    "region": "europe-west4-drams3a"
   }
 }
