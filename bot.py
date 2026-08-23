@@ -65,6 +65,10 @@ class _TeeOut:
     def write(self, s):
         self.target.write(s)
         self.target.flush()
+        # Avoid duplicate writes if target is already the log file or if not a tty
+        target_name = getattr(self.target, "name", None)
+        if target_name and os.path.abspath(str(target_name)) == os.path.abspath(self.log_path):
+            return
         try:
             with open(self.log_path, "a", encoding="utf-8", errors="ignore") as f:
                 f.write(s)
@@ -76,7 +80,9 @@ class _TeeOut:
 
 import sys
 if not getattr(sys.stdout, "_is_tee", False):
-    sys.stdout = _TeeOut(sys.stdout, LOG_FILE_PATH)
+    target_name = getattr(sys.stdout, "name", None)
+    if sys.stdout.isatty() or (not target_name) or (os.path.abspath(str(target_name)) != os.path.abspath(LOG_FILE_PATH)):
+        sys.stdout = _TeeOut(sys.stdout, LOG_FILE_PATH)
 
 _session_id: str | None = None
 _archived_keys: set[str] = set()
@@ -331,6 +337,8 @@ def write_status(**kw):
     """Merge + persist a live snapshot for the dashboard status bar."""
     _status.update(kw)
     _status["mode"] = config.MODE
+    if _status.get("end_ts"):
+        _status["remaining_s"] = max(0.0, float(_status["end_ts"]) - time.time())
     # Always current, never stale-merged like the rest of the snapshot.
     _status["open_positions"] = list(_open_positions.values())
     _status["updated_at"] = time.time()
@@ -1378,6 +1386,24 @@ async def run_realtime(rounds: int = 100, paper: bool = True,
             except Exception as e:
                 print(f"  [obs] record failed: {e}")
 
+        write_status(
+            phase="analyzing",
+            question=question,
+            slug=market.get("slug"),
+            end_ts=end_ts,
+            remaining_s=remaining,
+            spot_price=round(spot, 2) if spot is not None else None,
+            strike_price=round(strike, 2) if strike is not None else None,
+            z_score=round(signal.z_score, 2),
+            sigma_tau=round(signal.sigma_tau, 2),
+            model_prob=round(signal.model_prob, 4),
+            edge_net=round(signal.edge_net, 4),
+            session_name=signal.session_name,
+            chop_crosses=chop_crosses,
+            strategy="diffusion_momentum",
+            message=f"Z={signal.z_score:.2f} ({signal.side}) prob={signal.model_prob:.2f}",
+        )
+
         if verbose or signal.passed_gates:
             print(f"  [diffusion] Z={signal.z_score:.2f} (|move|=${abs(move_usd):.2f}, "
                   f"sigma_tau=${signal.sigma_tau:.2f}, chop={chop_crosses}) "
@@ -1596,10 +1622,25 @@ async def run_realtime(rounds: int = 100, paper: bool = True,
         reg_mult = calculate_regime_multiplier(prev_slot_abs_move)
 
         print(f"\nslot: {question} ({rem_txt}) [{session_tag} | PrevMove=${prev_slot_abs_move or 0.0:.1f} ({reg_mult:.2f}x)]")
-        write_status(phase="analyzing", question=question, slug=market.get("slug"),
-                     end_ts=end_ts, side=None, edge=None, mkt=None,
-                     strategy="diffusion_momentum",
-                     message=f"monitoring {session_tag} ({rem_txt})")
+        spot_init = None
+        try:
+            spot_init = feed.price()
+        except Exception:
+            pass
+        write_status(
+            phase="analyzing",
+            question=question,
+            slug=market.get("slug"),
+            end_ts=end_ts,
+            remaining_s=remaining,
+            spot_price=round(spot_init, 2) if spot_init is not None else None,
+            session_name=session_tag,
+            side=None,
+            edge=None,
+            mkt=None,
+            strategy="diffusion_momentum",
+            message=f"monitoring {session_tag} ({rem_txt})",
+        )
 
         # ---- Dedicated Terminal Diffusion Execution ----
         term_max_s = int(getattr(config, "TERMINAL_WINDOW_MAX_S", 60) or 60)

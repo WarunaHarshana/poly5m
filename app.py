@@ -1482,9 +1482,20 @@ tr:hover td { background: rgba(255,255,255,0.02); }
 let lastStats = {}, lastTrades = [], lastStatus = {};
 let topRoundSeen = -1;
 
+let currentEndTs = null;
+
 function fmtUsd(v) {
   if (v == null || isNaN(v)) return '$0.00';
   return (v < 0 ? '-$' : '$') + Math.abs(v).toFixed(2);
+}
+
+function getSessionFromUtc() {
+  const h = new Date().getUTCHours();
+  if (h >= 0 && h < 8) return "Asian Session";
+  if (h >= 8 && h < 13) return "London Session";
+  if (h >= 13 && h < 17) return "US-Europe Overlap";
+  if (h >= 17 && h < 22) return "US Afternoon Session";
+  return "Asian Open Pre-Session";
 }
 
 function updateClock() {
@@ -1498,6 +1509,28 @@ function updateClock() {
 }
 setInterval(updateClock, 1000);
 updateClock();
+
+function updateCountdown() {
+  const el = document.getElementById('hero-countdown');
+  if (!el) return;
+  if (!currentEndTs) {
+    el.textContent = '--:--';
+    return;
+  }
+  const now = Date.now() / 1000;
+  const rem = Math.max(0, Math.round(currentEndTs - now));
+  const mm = String(Math.floor(rem / 60)).padStart(2, '0');
+  const ss = String(rem % 60).padStart(2, '0');
+  el.textContent = `${mm}:${ss}`;
+  if (rem <= 20 && rem >= 5) {
+    el.style.color = 'var(--green)';
+  } else if (rem < 5) {
+    el.style.color = 'var(--red)';
+  } else {
+    el.style.color = 'var(--cyan)';
+  }
+}
+setInterval(updateCountdown, 500);
 
 /* ===== DRAW SVG EQUITY CURVE ===== */
 function drawCurve(trades, startBankroll) {
@@ -1526,7 +1559,6 @@ function drawCurve(trades, startBankroll) {
 
   const isUp = pts[pts.length - 1] >= startBankroll;
   const strokeCol = isUp ? '#10b981' : '#f43f5e';
-  const fillGrad = isUp ? 'rgba(16, 185, 129, 0.15)' : 'rgba(244, 63, 94, 0.15)';
 
   svg.innerHTML = `
     <defs>
@@ -1555,29 +1587,31 @@ function render(stats, trades, status) {
   modeBadge.className = 'badge mode ' + (isLive ? 'live' : 'paper');
 
   // Hero Status
-  const q = status.question || status.slug || 'Waiting for active 5m slot…';
+  const q = status.question || status.slug || 'BTC 5-minute Up/Down (monitoring)';
   document.getElementById('hero-market-name').textContent = q;
   
-  const rem = status.remaining_s != null ? Math.max(0, Math.round(status.remaining_s)) : null;
-  if (rem != null) {
-    const mm = String(Math.floor(rem / 60)).padStart(2, '0');
-    const ss = String(rem % 60).padStart(2, '0');
-    document.getElementById('hero-countdown').textContent = `${mm}:${ss}`;
-    document.getElementById('hero-countdown').style.color = (rem <= 20 && rem >= 5) ? 'var(--green)' : 'var(--cyan)';
-  } else {
-    document.getElementById('hero-countdown').textContent = '--:--';
+  if (status.end_ts) {
+    currentEndTs = status.end_ts;
+  } else if (status.remaining_s != null) {
+    currentEndTs = (Date.now() / 1000) + status.remaining_s;
   }
+  updateCountdown();
 
   const spot = status.spot_price;
   const strike = status.strike_price;
   if (spot != null) {
     document.getElementById('hero-spot').textContent = fmtUsd(spot);
-    if (strike != null) {
+    if (strike != null && strike > 0) {
       const delta = spot - strike;
       const dSign = delta >= 0 ? '+' : '-';
       document.getElementById('hero-strike-delta').textContent = `Strike: ${fmtUsd(strike)} (${dSign}${fmtUsd(Math.abs(delta))})`;
       document.getElementById('hero-strike-delta').style.color = delta >= 0 ? 'var(--green)' : 'var(--red)';
+    } else {
+      document.getElementById('hero-strike-delta').textContent = 'Waiting for verified strike…';
+      document.getElementById('hero-strike-delta').style.color = 'var(--txt-dim)';
     }
+  } else {
+    document.getElementById('hero-spot').textContent = 'Connecting…';
   }
 
   // Z-Score & Probability
@@ -1598,38 +1632,52 @@ function render(stats, trades, status) {
       pill.textContent = 'SUB-HURDLE';
       pill.className = 'pill-tag pill-quiet';
     }
+  } else {
+    document.getElementById('hero-z').textContent = 'Z = 0.00';
+    document.getElementById('hero-z-pill').textContent = 'SCANNING';
+    document.getElementById('hero-z-pill').className = 'pill-tag pill-quiet';
   }
+
   if (status.sigma_tau != null) {
     document.getElementById('hero-sigma').textContent = `σ_τ: ${fmtUsd(status.sigma_tau)} (scale collapse)`;
+  } else {
+    document.getElementById('hero-sigma').textContent = 'σ_τ: waiting for late window (≤60s)';
   }
 
   const prob = status.model_prob;
   if (prob != null) {
     document.getElementById('hero-prob').textContent = `${(prob * 100).toFixed(1)}%`;
+  } else {
+    document.getElementById('hero-prob').textContent = '50.0%';
   }
+
   if (status.edge_net != null) {
     const edgeSign = status.edge_net >= 0 ? '+' : '';
     document.getElementById('hero-edge').textContent = `Net Edge: ${edgeSign}${(status.edge_net * 100).toFixed(1)}% (post-fee)`;
+  } else {
+    document.getElementById('hero-edge').textContent = 'Net Edge: +0.0% vs Book';
   }
 
   // Session & Chop
-  if (status.session_name) {
-    document.getElementById('hero-session').textContent = status.session_name;
-  }
+  const sessName = status.session_name || getSessionFromUtc();
+  document.getElementById('hero-session').textContent = sessName;
   if (status.chop_crosses != null) {
     const safeTxt = status.chop_crosses <= 3 ? 'Safe &le; 3' : 'Pin-Risk Gated';
     document.getElementById('hero-chop').innerHTML = `Chop: ${status.chop_crosses} crosses (${safeTxt})`;
     document.getElementById('hero-chop').style.color = status.chop_crosses <= 3 ? 'var(--txt-muted)' : 'var(--amber)';
+  } else {
+    document.getElementById('hero-chop').innerHTML = 'Chop: 0 crosses (Safe &le; 3)';
+    document.getElementById('hero-chop').style.color = 'var(--txt-muted)';
   }
 
   // KPI Tiles
   const startBk = stats.starting_bankroll || 250;
-  const curBk = stats.bankroll != null ? stats.bankroll : startBk;
+  const curBk = (isLive && status.wallet_balance_usd != null) ? status.wallet_balance_usd : (stats.bankroll != null ? stats.bankroll : startBk);
   const pnl = stats.realized_pnl || (curBk - startBk);
   const pnlPct = startBk ? (100 * pnl / startBk) : 0;
 
   document.getElementById('kpi-bankroll').textContent = fmtUsd(curBk);
-  document.getElementById('kpi-bankroll-sub').textContent = `Start: ${fmtUsd(startBk)}`;
+  document.getElementById('kpi-bankroll-sub').textContent = isLive && status.wallet_balance_usd != null ? 'Polymarket USDC Wallet' : `Start: ${fmtUsd(startBk)}`;
 
   const pnlEl = document.getElementById('kpi-pnl');
   pnlEl.textContent = (pnl >= 0 ? '+' : '-') + fmtUsd(Math.abs(pnl));
@@ -1667,7 +1715,7 @@ function render(stats, trades, status) {
   // Render Blotter Rows
   const tbody = document.getElementById('blotter-rows');
   if (!trades || trades.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="9" style="text-align:center;color:var(--txt-dim);padding:24px">Waiting for trades… start the bot above.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="9" style="text-align:center;color:var(--txt-dim);padding:24px">Waiting for trades… monitoring slot gates.</td></tr>';
   } else {
     const sorted = [...trades].reverse();
     tbody.innerHTML = sorted.map(t => {
@@ -1694,6 +1742,7 @@ function render(stats, trades, status) {
 }
 
 /* ===== LOG STREAM POLLER ===== */
+let prevLogLength = 0;
 async function fetchLogs() {
   try {
     const res = await fetch('/api/logs?tf=' + document.getElementById('ctl-tf').value, { cache: 'no-store' });
@@ -1701,7 +1750,10 @@ async function fetchLogs() {
       const text = await res.text();
       const el = document.getElementById('console-logs');
       el.textContent = text || 'Log stream initialized. Waiting for bot output…';
-      el.scrollTop = el.scrollHeight;
+      if (text.length !== prevLogLength) {
+        prevLogLength = text.length;
+        el.scrollTop = el.scrollHeight;
+      }
     }
   } catch(e) {}
 }
