@@ -79,10 +79,8 @@ class _TeeOut:
         self.target.flush()
 
 import sys
-if not getattr(sys.stdout, "_is_tee", False):
-    target_name = getattr(sys.stdout, "name", None)
-    if sys.stdout.isatty() or (not target_name) or (os.path.abspath(str(target_name)) != os.path.abspath(LOG_FILE_PATH)):
-        sys.stdout = _TeeOut(sys.stdout, LOG_FILE_PATH)
+if sys.stdout.isatty() and not getattr(sys.stdout, "_is_tee", False):
+    sys.stdout = _TeeOut(sys.stdout, LOG_FILE_PATH)
 
 _session_id: str | None = None
 _archived_keys: set[str] = set()
