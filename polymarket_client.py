@@ -427,6 +427,10 @@ class PolymarketPublic:
                               params={"token_id": token_id}, timeout=self.timeout)
         return r.json()
 
+    def get_order_book(self, token_id: str) -> dict:
+        """Alias for book() to match Polymarket CLOB conventions."""
+        return self.book(token_id)
+
 
 class PolymarketClient:
     """Authenticated trading client (live mode only)."""

@@ -1278,19 +1278,27 @@ async def run_realtime(rounds: int = 100, paper: bool = True,
 
         if ask is None and token_id:
             try:
-                book = await asyncio.to_thread(pub.get_order_book, token_id)
-                if book:
-                    asks = book.get("asks", [])
-                    bids = book.get("bids", [])
-                    if asks:
-                        ask = float(asks[0]["price"])
-                        ask_size = float(asks[0].get("size", 0))
-                    if bids:
-                        bid = float(bids[0]["price"])
-                    if ask is not None and bid is not None:
-                        spread = round(ask - bid, 4)
+                q = await asyncio.to_thread(pub.buy_quote, token_id)
+                if q:
+                    ask = q.get("best_ask") or q.get("price")
+                    bid = q.get("best_bid")
+                    spread = q.get("spread")
+                    ask_size = q.get("ask_size")
             except Exception:
-                pass
+                try:
+                    book = await asyncio.to_thread(pub.get_order_book, token_id)
+                    if book:
+                        asks = book.get("asks", [])
+                        bids = book.get("bids", [])
+                        if asks:
+                            ask = float(asks[0]["price"])
+                            ask_size = float(asks[0].get("size", 0))
+                        if bids:
+                            bid = float(bids[0]["price"])
+                        if ask is not None and bid is not None:
+                            spread = round(ask - bid, 4)
+                except Exception:
+                    pass
 
         fee_rate = float(market.get("fee_rate")
                          if market.get("fee_rate") is not None
