@@ -1472,11 +1472,13 @@ async def run_realtime(rounds: int = 100, paper: bool = True,
         # If live, route to live_client
         if not paper:
             try:
+                cond_id = market.get("conditionId") or market.get("condition_id") or ""
                 order_res = await asyncio.to_thread(
                     live_client.buy,
                     token_id,
                     entry_price,
                     shares,
+                    cond_id,
                 )
                 if not order_res or not order_res.get("order_id"):
                     print(f"  [diffusion/live] order placement failed: {order_res}")
