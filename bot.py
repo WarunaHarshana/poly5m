@@ -32,6 +32,7 @@ from price_feed import LivePriceFeed, ChainlinkDataStream
 from risk import RiskManager
 from executor import PaperExecutor, Trade, stamp_trade_times
 from decision_journal import log_decision
+from pricing_model import DiffusionPricingModel, classify_session, calculate_regime_multiplier
 
 # Parallel timeframe instances MUST NOT share state files or they overwrite
 # each other's trades/stats. STATE_SUBDIR (or --timeframe on a non-5m run)
@@ -53,6 +54,29 @@ HISTORY_JSONL = os.path.join(ARCHIVE_DIR, "trades_history.jsonl")
 HISTORY_CSV = os.path.join(ARCHIVE_DIR, "trades_history.csv")
 SESSIONS_DIR = os.path.join(ARCHIVE_DIR, "sessions")
 os.makedirs(SESSIONS_DIR, exist_ok=True)
+LOG_FILE_PATH = os.path.join(STATE_DIR, "bot.log")
+
+class _TeeOut:
+    def __init__(self, target_stream, log_path):
+        self.target = target_stream
+        self.log_path = log_path
+        self._is_tee = True
+
+    def write(self, s):
+        self.target.write(s)
+        self.target.flush()
+        try:
+            with open(self.log_path, "a", encoding="utf-8", errors="ignore") as f:
+                f.write(s)
+        except Exception:
+            pass
+
+    def flush(self):
+        self.target.flush()
+
+import sys
+if not getattr(sys.stdout, "_is_tee", False):
+    sys.stdout = _TeeOut(sys.stdout, LOG_FILE_PATH)
 
 _session_id: str | None = None
 _archived_keys: set[str] = set()
@@ -741,83 +765,7 @@ def _quote_side(pub, market, side: str) -> dict | None:
         return None
 
 
-def _scan_sum_to_one_arb(pub, market, feed=None) -> dict | None:
-    """Tier 2: detect ask_UP + ask_DOWN < 1 - fee (structural mispricing).
 
-    Prefers the pushed WebSocket book, which gives BOTH sides from a single
-    instant. The REST path reads UP and then DOWN in separate round trips, so a
-    pair priced from it may never have existed simultaneously — a correctness
-    problem, not just a latency one. REST remains the fallback so a socket
-    outage degrades the bot rather than stopping it.
-    """
-    if not getattr(config, "ARB_SCAN_ENABLED", True):
-        return None
-    try:
-        p_up = p_dn = None
-        up_sz = dn_sz = None
-        # The BIDS are what an unwind sells into. Without them arb_executor
-        # falls back to guessing (ask - 0.02), and a FAK sell priced above the
-        # real bid matches nothing — which is how a "successful unwind" ends up
-        # still holding a naked leg.
-        b_up = b_dn = None
-        src = "rest"
-        if feed is not None:
-            snap = feed.pair(market["tokens"]["UP"], market["tokens"]["DOWN"])
-            if snap is not None:
-                p_up, p_dn = snap.ask_up, snap.ask_down
-                up_sz, dn_sz = snap.size_up, snap.size_down
-                b_up, b_dn = snap.bid_up, snap.bid_down
-                src = f"ws({snap.age_s * 1000:.0f}ms)"
-                _scan_src["ws"] += 1
-            else:
-                # Counted, because only signal-FINDING scans get logged and
-                # those are rare — two REST lines told us nothing about whether
-                # the socket was being used 99% of the time or 0% of it.
-                _scan_src["rest"] += 1
-        else:
-            _scan_src["no_feed"] += 1
-        if p_up is None or p_dn is None:
-            q_up = _quote_side(pub, market, "UP")
-            q_dn = _quote_side(pub, market, "DOWN")
-            if not q_up or not q_dn:
-                return None
-            p_up = float(q_up["price"])
-            p_dn = float(q_dn["price"])
-            up_sz, dn_sz = q_up.get("ask_size"), q_dn.get("ask_size")
-            b_up, b_dn = q_up.get("best_bid"), q_dn.get("best_bid")
-        if not (0.0 < p_up < 1.0 and 0.0 < p_dn < 1.0):
-            return None
-        s = p_up + p_dn
-        edge = 1.0 - s
-        # The gap has to beat the FEE, not a flat threshold. Fees are
-        # rate * p * (1-p) per leg, so they peak near 0.50 and collapse at the
-        # extremes: a 2c gap at 0.51/0.46 pays 3.5c in fees and loses, while
-        # the same 2c gap at 0.95/0.03 pays 0.5c and wins. Measured live, 6 of
-        # 7 signals were mid-priced pairs that could never clear — and because
-        # a signal burns the slot's one attempt, they were crowding out the
-        # lopsided books that are the only place this trade exists.
-        #
-        # A flat ARB_MIN_EDGE cannot express that; it is kept only as a floor
-        # under the fee-aware requirement.
-        floor = float(getattr(config, "ARB_MIN_EDGE", 0.02) or 0.0)
-        min_locked = float(getattr(config, "ARB_MIN_LOCKED_EDGE", 0.02) or 0.0)
-        fees = (config.taker_fee_per_share(p_up)
-                + config.taker_fee_per_share(p_dn))
-        if edge >= max(floor, fees + min_locked):
-            return {
-                "ask_up": p_up,
-                "ask_down": p_dn,
-                "sum": s,
-                "edge": edge,
-                "up_size": up_sz,
-                "down_size": dn_sz,
-                "bid_up": b_up,
-                "bid_down": b_dn,
-                "src": src,
-            }
-    except Exception:
-        return None
-    return None
 
 
 def _journal(session_id: str, mode: str, strategy: str, **kw):
@@ -887,34 +835,23 @@ async def run_realtime(rounds: int = 100, paper: bool = True,
         risk = RiskManager(config.STARTING_BANKROLL)
         live_client = PolymarketClient()
 
-    # --- arb parameters ---
-    arb_on = bool(getattr(config, "ARB_TRADE_ENABLED", True))
-    arb_min_edge = float(getattr(config, "ARB_MIN_EDGE", 0.02) or 0.02)
-    arb_min_rem = int(getattr(config, "ARB_MIN_REMAINING", 20))
-    arb_max_stake = float(getattr(config, "ARB_MAX_STAKE_USD", 10.0) or 10.0)
+    # --- diffusion momentum model parameters (H-001 - H-005) ---
+    diffusion_model = DiffusionPricingModel(
+        alpha=float(getattr(config, "DIFFUSION_ALPHA", 1.75)),
+        min_sigma_usd=float(getattr(config, "DIFFUSION_MIN_SIGMA_USD", 2.5)),
+        min_z=float(getattr(config, "DIFFUSION_Z_MIN", 1.8)),
+        high_z_breakout=float(getattr(config, "DIFFUSION_Z_BREAKOUT", 2.2)),
+        max_chop_marginal=int(getattr(config, "DIFFUSION_MAX_CHOP_MARGINAL", 3)),
+    )
+    mom_on = bool(getattr(config, "MOMENTUM_TRADE_ENABLED", True))
+    mom_observe_only = bool(getattr(config, "MOMENTUM_OBSERVE_ONLY", False))
 
-    print(f"[STRATEGY: sum-to-one arb] scanning each slot from open down to "
-          f"{arb_min_rem}s left")
-    # This banner used to say "LIVE: log-only (leg risk)" unconditionally,
-    # left over from before live arb was wired. With ARB_LIVE_ENABLED=1 the bot
-    # really does place FOK orders, so the banner was telling the operator that
-    # nothing would trade while real money was about to move.
-    if paper:
-        _arb_exec_label = "PAPER exec (simulated fills)"
-    elif bool(getattr(config, "ARB_LIVE_ENABLED", False)):
-        _arb_exec_label = ("LIVE EXEC — REAL ORDERS (FOK both legs, "
-                           "unwind on a stranded leg)")
-    else:
-        _arb_exec_label = "LIVE: log-only (ARB_LIVE_ENABLED=0)"
-    print(f"  [arb] sum-to-one scanner: {'ON' if arb_on else 'off'}  "
-          f"min_edge={arb_min_edge:.3f}  max_stake=${arb_max_stake:.2f}  "
-          f"max_exposure=${float(getattr(config, 'ARB_MAX_EXPOSURE_USD', 0) or 0):.2f}  "
-          f"{_arb_exec_label}")
-    # Print the modes that change WHETHER we trade, not just how — otherwise a
-    # gate silently holding everything back is indistinguishable from a quiet
-    # market.
-    print(f"  [modes] scan_interval={float(getattr(config, 'ARB_SCAN_INTERVAL_S', 1.0)):.2f}s"
-          f"  min_shares_sizing={'ON' if getattr(config, 'MIN_SHARES_SIZING', False) else 'off'}"
+    print(f"[STRATEGY: Regime-Conditioned Terminal Diffusion Engine (H-001 - H-005)]")
+    print(f"  [diffusion] min_z={diffusion_model.min_z:.2f}  breakout_z={diffusion_model.high_z_breakout:.2f}  "
+          f"max_chop={diffusion_model.max_chop_marginal}  alpha={diffusion_model.alpha:.2f}  "
+          f"window=[{config.TERMINAL_WINDOW_MAX_S}s..{config.TERMINAL_WINDOW_MIN_S}s]  "
+          f"status={'OBSERVE-ONLY' if mom_observe_only else ('ON' if mom_on else 'OFF')}")
+    print(f"  [modes] min_shares_sizing={'ON' if getattr(config, 'MIN_SHARES_SIZING', False) else 'off'}"
           f"  book_feed={'ON' if getattr(config, 'BOOK_FEED_ENABLED', True) else 'off'}"
           f"  min_order_shares={float(getattr(config, 'MIN_ORDER_SHARES', 5)):.0f}")
 
@@ -1039,6 +976,7 @@ async def run_realtime(rounds: int = 100, paper: bool = True,
     obs_written: dict = {"end_ts": None}
     last_counted_end_ts = None  # count real slots, not poll iterations
     arb_done_end_ts = None      # arb: at most one attempt per slot
+    momentum_done_end_ts = None # momentum: at most one attempt per slot
     # Boxed so the nested _try_arb can update it without a nonlocal decl.
     rest_phantom_slot = [None]  # last slot whose REST-priced signal was logged
     early_seen_end_ts = None    # count slot_too_early once per slot
@@ -1279,291 +1217,264 @@ async def run_realtime(rounds: int = 100, paper: bool = True,
             _clear_open(trade)
             write_status()
 
-    async def _try_arb(market, question, end_ts, remaining):
-        """Detect and (paper-)execute a sum-to-one arb. One attempt per slot.
+    prev_slot_abs_move: float | None = None
+    last_counted_end_ts = None
+    momentum_done_end_ts = None
+    early_seen_end_ts = None
+    time_guard_seen_end_ts = None
 
-        Buys EQUAL shares of UP and DOWN at their asks when the pair costs
-        less than $1 after simulated slippage; exactly one leg pays $1/share
-        at resolution, so pnl = shares * (1 - pair_cost) regardless of
-        direction. Returns True if a trade was placed.
-        """
-        nonlocal arb_done_end_ts, placed
-        arb = await asyncio.to_thread(_scan_sum_to_one_arb, pub, market,
-                                      book_feed_client)
-        if not arb:
-            return False
-        # NOTE: the slot is NOT marked done here. It used to be — "one attempt
-        # per slot (signal seen)" — which meant the first gap that failed the
-        # fee check consumed the slot's only look, and a genuinely profitable
-        # pair appearing later in the same slot was never seen. Live data made
-        # that expensive: 6 of 7 observed signals were mid-priced pairs that
-        # could not clear fees, so the budget was being spent precisely on the
-        # ones that cannot work.
-        #
-        # The slot is marked done where an ORDER is actually attempted, which
-        # is what "one attempt per slot" was protecting against in the first
-        # place. Rejections that cost nothing no longer end the hunt.
-        # Say WHERE the quote came from. Without this there is no way to tell a
-        # socket read from a REST fallback, which is the whole point of the
-        # feed — and a silently-degraded feed looks exactly like a working one.
-        print(f"  [arb] sum-to-one edge={arb['edge']:+.3f} "
-              f"UP@{arb['ask_up']:.3f}+DOWN@{arb['ask_down']:.3f}="
-              f"{arb['sum']:.3f}  [{arb.get('src', 'rest')}]")
-
-        # A pair is only real if BOTH legs were priced from one instant. The
-        # REST fallback reads UP and then DOWN in separate round trips, so a
-        # price move between them manufactures a gap that never existed. Across
-        # all logged history that is where every single signal came from: 236
-        # of 236 from REST, zero from the socket, which was doing most of the
-        # scanning. These are measurement error, not mispricings — and acting
-        # on one means sending a first leg into a book that was never there.
-        src = str(arb.get("src") or "rest")
-        if (bool(getattr(config, "ARB_REQUIRE_ATOMIC_BOOK", True))
-                and not src.startswith("ws")):
-            skips["arb_rest_phantom"] = skips.get("arb_rest_phantom", 0) + 1
-            # Log once per slot: the same phantom can persist for many scans.
-            if end_ts != rest_phantom_slot[0]:
-                rest_phantom_slot[0] = end_ts
-                print(f"  [arb] priced from {src.upper()}, not one socket "
-                      f"snapshot — the two legs were read in separate round "
-                      f"trips, so this gap may never have existed. Logged, "
-                      f"not traded (ARB_REQUIRE_ATOMIC_BOOK=1).")
-            return False
-        # Too-good-to-be-true gate: a 15c+ "free" gap is makers pulling quotes
-        # (dust levels), not a real fill. R8-style +$5.87 outliers were paper
-        # fiction — a live taker would catch pennies of it.
-        max_edge = float(getattr(config, "ARB_MAX_EDGE", 0.15) or 0)
-        if max_edge > 0 and float(arb["edge"]) > max_edge:
-            print(f"  [arb] edge {arb['edge']:+.3f} > {max_edge:.2f} — "
-                  f"degenerate/emptying book, not a fillable arb; skip")
-            skips["arb_thin"] = skips.get("arb_thin", 0) + 1
-            return False
-        try:
-            _journal(
-                _ensure_session_id(),
-                "paper_live" if paper else "live",
-                "arb",
-                phase="arb", action="signal", reason="sum_to_one",
-                slug=market.get("slug") or "", question=question,
-                ask=arb["sum"], edge=arb["edge"], arb_sum=arb["sum"],
-                remaining_s=remaining, shadow=not paper,
-            )
-        except Exception:
-            pass
-        if not paper and not bool(getattr(config, "ARB_LIVE_ENABLED", False)):
-            print("  [arb] live execution disabled (ARB_LIVE_ENABLED=0) — "
-                  "logged only")
-            return False
-        if not paper:
-            _blocked, _win = config.in_live_blackout()
-            if _blocked:
-                print(f"  [arb] venue maintenance window {_win} UTC — no live "
-                      f"orders. A 503 between the two legs is the one path "
-                      f"that strands a naked position, and with order status "
-                      f"also down we could not even tell. Signal logged only.")
-                return False
-        if risk.halted or not risk.daily_loss_ok():
-            return False
-        # Arb used to skip this. size_late_scalp calls max_trades_ok() for
-        # momentum, but arb never goes through the sizer, so a live arb could
-        # run past MAX_TRADES_PER_DAY unchecked — the cap silently applied to
-        # the strategy that no longer trades and not to the one that does.
-        if not risk.max_trades_ok():
-            print(f"  [arb] {risk.halt_reason or 'max trades/day'}; skip")
-            return False
-
-        # Slippage models a SIMULATED fill. A live leg goes out as FOK at the
-        # quoted ask, so it fills at that price or not at all — there is no
-        # slippage to pay, and charging it here made the gate reject arbs on a
-        # price the bot would never have paid. Measured live: a pair at 0.950
-        # with 0.030 fees scored -0.000 against the slipped cost and was
-        # skipped, while its real locked edge was +0.020 — which is exactly
-        # what arb_executor.evaluate() computes from the raw asks moments
-        # later, so the two gates disagreed with each other.
-        #
-        # The protection against a stale quote is the order type, not a made-up
-        # cost: if the pair is not really there, the FOK is killed and the
-        # attempt is free.
-        slip = (float(getattr(config, "PAPER_FILL_SLIPPAGE", 0.01) or 0.0)
-                if paper else 0.0)
-        leg_up = float(arb["ask_up"]) + slip
-        leg_dn = float(arb["ask_down"]) + slip
-        pair_cost = leg_up + leg_dn
-        # REAL taker fees, per leg: rate * p * (1-p) per share, the venue's
-        # documented curve. Near 0.5/0.5 this is ~3.5c/pair — it kills thin
-        # arbs, so it must be inside the gate, not discovered live.
-        fee_rate = float(market.get("fee_rate")
-                         if market.get("fee_rate") is not None
-                         else getattr(config, "TAKER_FEE_RATE", 0.07))
-        fee_pair = (config.taker_fee_per_share(leg_up, fee_rate)
-                    + config.taker_fee_per_share(leg_dn, fee_rate))
-        edge_after = 1.0 - pair_cost - fee_pair
-        min_locked = max(0.005, float(getattr(config, "ARB_MIN_LOCKED_EDGE", 0.02) or 0.0))
-        if edge_after < min_locked:
-            print(f"  [arb] locked edge {edge_after:+.3f} < {min_locked:.3f} "
-                  f"after slippage+fees (pair=${pair_cost:.3f} "
-                  f"fees=${fee_pair:.3f}/pair rate={fee_rate:.2f}); skip")
-            skips["arb_thin"] = skips.get("arb_thin", 0) + 1
-            return False
-
-        shares = arb_max_stake / pair_cost
-        up_sz, dn_sz = arb.get("up_size"), arb.get("down_size")
-        if up_sz is None or dn_sz is None:
-            # Can't verify depth on both legs — size at the venue minimum
-            # only, never full stake into an unverifiable book.
-            shares = min(shares, float(getattr(config, "MIN_ORDER_SHARES", 5) or 5))
-        else:
-            # Take at most half of each visible ask level.
-            shares = min(shares, float(up_sz) * 0.5, float(dn_sz) * 0.5)
-        min_sh = float(getattr(config, "MIN_ORDER_SHARES", 5) or 5)
-        if shares < min_sh:
-            if getattr(config, "ENFORCE_MIN_SHARES", True):
-                need = round(min_sh * pair_cost, 2)
-                if need <= arb_max_stake and need <= risk.bankroll - risk.open_exposure:
-                    shares = min_sh
-                else:
-                    print(f"  [arb] book too thin for venue min "
-                          f"({shares:.1f} < {min_sh:.0f} shares); skip")
-                    skips["arb_thin"] = skips.get("arb_thin", 0) + 1
-                    return False
-        shares = round(shares, 2)
-        stake = round(shares * pair_cost, 2)
-        if stake < 0.5 or stake > risk.bankroll - risk.open_exposure:
-            print(f"  [arb] stake ${stake:.2f} not affordable "
-                  f"(bankroll ${risk.bankroll:.2f}, open ${risk.open_exposure:.2f}); skip")
-            skips["arb_thin"] = skips.get("arb_thin", 0) + 1
-            return False
-        # Arb gets its OWN exposure cap, not the momentum one. MAX_EXPOSURE_USD
-        # is sized for a single directional leg ($1 under the live profile),
-        # while the cheapest legal arb pair is 5 shares a side — about $4.50.
-        # Reusing it here rejected every possible live arb, which would have
-        # looked like "live mode does nothing" rather than like a bug. The two
-        # risks are not comparable: a hedged pair cannot lose the way a naked
-        # leg can, so it earns its own limit.
-        exp_cap = float(getattr(config, "ARB_MAX_EXPOSURE_USD", 0) or 0)
-        if exp_cap > 0 and risk.open_exposure + stake > exp_cap + 1e-9:
-            print(f"  [arb] open ${risk.open_exposure:.2f} + ${stake:.2f} "
-                  f"exceeds ARB_MAX_EXPOSURE_USD ${exp_cap:.2f}; skip")
-            skips["arb_thin"] = skips.get("arb_thin", 0) + 1
+    async def _try_momentum(market, question, end_ts, remaining):
+        """Evaluate and execute regime-conditioned terminal diffusion momentum (H-001 - H-005)."""
+        nonlocal momentum_done_end_ts, placed
+        if end_ts is None:
             return False
 
         slot_start_time = (end_ts - config.SLOT_SECONDS) if end_ts else None
+        strike = None
+        strike_src = "none"
+        if slot_start_time:
+            try:
+                strike = await asyncio.to_thread(feed.get_slot_start_price, slot_start_time)
+                if strike is not None:
+                    strike_src = "chainlink-data-stream" if cl_stream.ready else "proxy"
+            except Exception as e:
+                print(f"  [diffusion] strike fetch failed: {e}")
+
+        if strike is None or strike <= 0:
+            print("  [diffusion] no verified slot strike available; skipping")
+            return False
+
+        spot = None
+        try:
+            spot = await asyncio.to_thread(feed.price)
+        except Exception as e:
+            print(f"  [diffusion] spot fetch failed: {e}")
+            return False
+
+        chop_crosses = feed.strike_crossings_since(slot_start_time, strike) if slot_start_time else 0
+        var_sec = feed.var_per_sec_since(slot_start_time) if slot_start_time else None
+        realized_vol = feed.realized_vol_daily_since(slot_start_time) if slot_start_time else None
+
+        move_usd = spot - strike
+        side_candidate = "UP" if move_usd >= 0 else "DOWN"
+        tokens = market.get("tokens") or {}
+        token_id = tokens.get(side_candidate)
+
+        # Read best ask / bid
+        ask = None
+        bid = None
+        spread = None
+        ask_size = None
+        if book_feed_client is not None and token_id:
+            try:
+                top = book_feed_client.get_top(token_id)
+                if top:
+                    ask = top.get("ask")
+                    bid = top.get("bid")
+                    spread = top.get("spread")
+                    ask_size = top.get("ask_size")
+            except Exception:
+                pass
+
+        if ask is None and token_id:
+            try:
+                book = await asyncio.to_thread(pub.get_order_book, token_id)
+                if book:
+                    asks = book.get("asks", [])
+                    bids = book.get("bids", [])
+                    if asks:
+                        ask = float(asks[0]["price"])
+                        ask_size = float(asks[0].get("size", 0))
+                    if bids:
+                        bid = float(bids[0]["price"])
+                    if ask is not None and bid is not None:
+                        spread = round(ask - bid, 4)
+            except Exception:
+                pass
+
+        fee_rate = float(market.get("fee_rate")
+                         if market.get("fee_rate") is not None
+                         else getattr(config, "TAKER_FEE_RATE", 0.07))
+
+        utc_hour = int(time.strftime("%H", time.gmtime(_now(cl_stream))))
+
+        signal = diffusion_model.evaluate(
+            spot=spot,
+            strike=strike,
+            remaining_s=remaining or 10.0,
+            ask=ask,
+            chop_crosses=chop_crosses,
+            realized_vol_daily=realized_vol,
+            var_per_sec=var_sec,
+            strike_src=strike_src,
+            require_verified_strike=getattr(config, "MOMENTUM_REQUIRE_VERIFIED_STRIKE", True),
+            prev_slot_abs_move=prev_slot_abs_move,
+            utc_hour=utc_hour,
+            min_entry=config.LATE_MOMENTUM_MIN_ENTRY,
+            max_entry=config.LATE_MOMENTUM_MAX_ENTRY,
+            min_edge=config.LATE_MOMENTUM_MIN_EDGE,
+            max_edge=config.LATE_MOMENTUM_MAX_EDGE,
+            fee_rate=fee_rate,
+        )
+
+        mom_trade_on = bool(getattr(config, "MOMENTUM_TRADE_ENABLED", True))
+        mom_observe = bool(getattr(config, "MOMENTUM_OBSERVE_ONLY", False))
+
+        # Log observation once per slot for the learning archive
+        if obs_written.get("end_ts") != end_ts:
+            obs_written["end_ts"] = end_ts
+            try:
+                import observations
+                obs_row = {
+                    "slug": market.get("slug"),
+                    "end_ts": end_ts,
+                    "slot_start_ts": slot_start_time,
+                    "mode": "paper_live" if paper else "live",
+                    "timeframe": getattr(config, "TIMEFRAME", "5m"),
+                    "asset": getattr(config, "ASSET", "btc"),
+                    "strike": strike,
+                    "strike_src": strike_src,
+                    "spot": spot,
+                    "move_usd": move_usd,
+                    "abs_move": abs(move_usd),
+                    "remaining_s": remaining,
+                    "chop_crosses": chop_crosses,
+                    "realized_vol_daily": realized_vol,
+                    "side": signal.side,
+                    "model_prob": signal.model_prob,
+                    "edge": signal.edge,
+                    "edge_net": signal.edge_net,
+                    "ask": ask,
+                    "bid": bid,
+                    "spread": spread,
+                    "ask_size": ask_size,
+                    "session": signal.session_name,
+                    "regime_mult": signal.regime_mult,
+                    "decision": "trade" if (signal.passed_gates and mom_trade_on and not mom_observe) else "skip",
+                    "skip_reason": signal.skip_reason if not signal.passed_gates else ("momentum_observe_only" if mom_observe else None),
+                }
+                observations.record(obs_row)
+            except Exception as e:
+                print(f"  [obs] record failed: {e}")
+
+        print(f"  [diffusion] Z={signal.z_score:.2f} (|move|=${abs(move_usd):.2f}, "
+              f"sigma_tau=${signal.sigma_tau:.2f}, chop={chop_crosses}) "
+              f"{signal.side} @ ask={ask if ask is not None else 0.0:.3f} "
+              f"(prob={signal.model_prob:.3f}, edge={signal.edge_net:+.3f}, "
+              f"session='{signal.session_name}', regime={signal.regime_mult:.2f}x)")
+
+        if not signal.passed_gates:
+            print(f"  [diffusion] skipped: {signal.skip_reason}")
+            skips["diffusion_gates"] = skips.get("diffusion_gates", 0) + 1
+            return False
+
+        if mom_observe or not mom_trade_on:
+            print("  [diffusion] observe-only (MOMENTUM_OBSERVE_ONLY=1) — signal logged, not traded")
+            skips["momentum_observe_only"] = skips.get("momentum_observe_only", 0) + 1
+            return False
+
+        if risk.halted or not risk.daily_loss_ok() or not risk.max_trades_ok():
+            print(f"  [diffusion] {risk.halt_reason or 'risk limit reached'}; skip")
+            return False
+
+        entry_price = float(ask)
+        if paper:
+            slip = float(getattr(config, "PAPER_FILL_SLIPPAGE", 0.01) or 0.0)
+            entry_price = min(0.999, entry_price + slip)
+
+        base_stake = float(config.FIXED_STAKE_USD or config.BASE_TRADE_USD)
+        # Apply regime multiplier if enabled
+        if getattr(config, "MOMENTUM_USE_REGIME_SIZING", True):
+            base_stake = round(base_stake * signal.regime_mult, 2)
+
+        stake = min(base_stake, risk.bankroll - risk.open_exposure)
+        if stake < 0.5:
+            print("  [diffusion] stake below $0.50 floor; skip")
+            return False
+
+        shares = round(stake / entry_price, 2)
+        min_sh = float(getattr(config, "MIN_ORDER_SHARES", 5) or 5)
+        if shares < min_sh:
+            shares = min_sh
+            stake = round(shares * entry_price, 2)
+
+        if stake > risk.bankroll - risk.open_exposure:
+            print(f"  [diffusion] stake ${stake:.2f} not affordable "
+                  f"(bankroll ${risk.bankroll:.2f}, open ${risk.open_exposure:.2f}); skip")
+            return False
+
+        fee_usd = round(shares * config.taker_fee_per_share(entry_price, fee_rate), 4)
         trade = Trade(
             ts=time.time(),
             round_id=placed + 1,
-            side="ARB",
-            entry_price=round(pair_cost, 4),  # sum of both legs incl. slippage
-            shares=shares,                    # PAIRS of contracts
-            stake_usd=stake,
-            model_prob=1.0,                   # pays whichever way it resolves
-            edge=round(edge_after, 4),        # locked edge net of slip + fees
-            fee_usd=round(shares * fee_pair, 4),
+            side=signal.side,
+            entry_price=round(entry_price, 4),
+            shares=shares,
+            stake_usd=round(stake, 2),
+            model_prob=round(signal.model_prob, 4),
+            edge=round(signal.edge_net, 4),
+            fee_usd=fee_usd,
             slug=market.get("slug") or "",
             question=question,
             slot_start_ts=slot_start_time,
             end_ts=end_ts,
         )
         stamp_trade_times(trade)
+        momentum_done_end_ts = end_ts
 
-        # --- LIVE: both legs FOK, or hold nothing ---
-        # Paper cannot answer the only question that matters here (does the
-        # second leg actually fill?), because it assumes both do. Live runs
-        # measure it; arb_executor bounds the downside while they do.
-        # From here an order goes out (or a paper fill is booked), so this is
-        # the real "one attempt per slot" boundary.
-        arb_done_end_ts = end_ts
-        live_res = None
+        # If live, route to live_client
         if not paper:
-            import arb_executor
-            live_res = await asyncio.to_thread(
-                arb_executor.execute,
-                live_client, market,
-                float(arb["ask_up"]), float(arb["ask_down"]), shares,
-                arb.get("up_size"), arb.get("down_size"),
-                arb.get("bid_up"), arb.get("bid_down"),
-                False,
-                # The tuner cannot learn a gate whose value was never recorded
-                # beside the outcome it produced. ARB_MIN_REMAINING in
-                # particular is unlearnable without remaining_s on the row.
-                {"remaining_s": round(float(remaining), 1) if remaining else None,
-                 "quote_src": arb.get("src"), "slug": market.get("slug")},
-            )
-            print(f"  [arb/live] {live_res.reason}")
-            # Say WHY, per leg. "not filled" covers two opposite situations —
-            # the venue killed a FOK because nothing matched (the edge is not
-            # capturable) versus the venue REJECTED the order (a fixable setup
-            # problem: allowance, signing, tick size, min size). Without the
-            # venue's own words those are indistinguishable, and the first is a
-            # verdict on the strategy while the second is a bug in ours.
-            for _lg in live_res.legs:
-                print(f"    leg {_lg.side} px={_lg.price:.3f} "
-                      f"size={_lg.size} filled={_lg.filled}"
-                      + (f"  order_id={_lg.order_id}" if _lg.order_id else "")
-                      + (f"\n      venue said: {str(_lg.error)[:300]}"
-                         if _lg.error else "  (no error — order was killed, "
-                                           "not rejected)"))
-            if not live_res.ok:
-                # Either nothing was bought, or the stranded leg was unwound.
-                # Book the realised unwind cost (0 when no leg filled) and
-                # move on — there is no pair to settle.
-                if live_res.realized_pnl:
-                    risk.on_close(0.0, live_res.realized_pnl)
-                    print(f"  [arb/live] unwind cost "
-                          f"{live_res.realized_pnl:+.2f}; "
-                          f"bankroll ${risk.bankroll:.2f}")
-                st = arb_executor.stats()
-                print(f"  [arb/live] execution record: "
-                      f"{st['both_legs_locked']}/{st['attempts']} locked "
-                      f"({st['lock_rate_pct']}%), "
-                      f"{st['second_leg_killed_and_unwound']} unwound, "
-                      f"net {st['net_pnl']:+.2f}")
-                skips["arb_thin"] = skips.get("arb_thin", 0) + 1
+            try:
+                order_res = await asyncio.to_thread(
+                    live_client.buy,
+                    token_id,
+                    entry_price,
+                    shares,
+                )
+                if not order_res or not order_res.get("order_id"):
+                    print(f"  [diffusion/live] order placement failed: {order_res}")
+                    return False
+            except Exception as e:
+                print(f"  [diffusion/live] order error: {e}")
                 return False
 
         risk.on_open(stake)
         _register_open(trade, end_ts)
         placed += 1
-        print(f"  TRADE PLACED [arb] R{trade.round_id} ARB "
-              f"{shares:.2f} pairs @ {pair_cost:.3f} ${stake:.2f} "
-              f"(locked edge {edge_after:+.3f}/pair)  "
+        print(f"  TRADE PLACED [diffusion] R{trade.round_id} {trade.side} "
+              f"{shares:.2f} shares @ {entry_price:.3f} ${stake:.2f} "
+              f"(prob {signal.model_prob:.3f}, edge {signal.edge_net:+.3f})  "
               f"{trade.time_et or trade.time_utc}")
+
         try:
             _journal(
                 _ensure_session_id(),
                 "paper_live" if paper else "live",
-                "arb",
-                phase="arb", action="trade", reason="placed",
-                slug=trade.slug, question=question, side="ARB",
-                ask=pair_cost, fill_price=pair_cost, edge=edge_after,
+                "diffusion_momentum",
+                phase="momentum", action="trade", reason="placed",
+                slug=trade.slug, question=question, side=trade.side,
+                ask=entry_price, fill_price=entry_price, edge=signal.edge_net,
                 stake=stake, remaining_s=remaining, shadow=False,
             )
         except Exception:
             pass
+
         write_status(
             phase="holding", trade_event="placed",
             trade_event_id=f"placed-{trade.round_id}-{int(trade.ts)}",
-            end_ts=end_ts, side="ARB", mkt=round(pair_cost, 4),
-            edge=round(edge_after, 4), stake=stake, question=question,
+            end_ts=end_ts, side=trade.side, mkt=round(entry_price, 4),
+            edge=round(signal.edge_net, 4), stake=stake, question=question,
             slug=trade.slug, event_url=trade.event_url,
             time_et=trade.time_et, time_utc=trade.time_utc,
-            strategy="arb",
-            message=f"ARB pair @ {pair_cost:.3f} (edge {edge_after:+.3f})",
+            strategy="diffusion_momentum",
+            message=f"{trade.side} @ {entry_price:.3f} (Z={signal.z_score:.2f}, prob={signal.model_prob:.2f})",
         )
-        # Both legs were positively confirmed against the venue by
-        # arb_executor. Hand that verdict to the settler rather than making it
-        # re-derive a fill from a single order id, which a two-leg pair does
-        # not have — that is what booked a locked pair as UNFILLED.
-        arb_verified = None
-        arb_leg_ids = None
-        if not paper and live_res is not None:
-            arb_verified = float(live_res.shares or shares)
-            arb_leg_ids = [lg.order_id for lg in live_res.legs if lg.order_id]
+
         settle_coro = _settle_trade(
             trade=trade, stake=stake, shares=shares,
             market=market, question=question, end_ts=end_ts,
             slot_start_time=slot_start_time,
-            mkt=pair_cost, edge=edge_after,
-            verified_fill=arb_verified, leg_order_ids=arb_leg_ids,
+            mkt=entry_price, edge=signal.edge_net,
         )
         if config.ROUND_SECONDS <= 0 or not end_ts:
             await settle_coro
@@ -1648,69 +1559,47 @@ async def run_realtime(rounds: int = 100, paper: bool = True,
         if end_ts is None or end_ts != last_counted_end_ts:
             slots_seen += 1
             last_counted_end_ts = end_ts
-        if end_ts is not None and end_ts == arb_done_end_ts:
-            # Arb takes at most one attempt per market. Nothing left to do on
+        if end_ts is not None and end_ts == momentum_done_end_ts:
+            # A trade was attempted on this slot. Nothing left to do on
             # this slot but wait it out.
             write_status(phase="waiting",
-                         message="arb attempted on this slot; waiting for slot end")
+                         message="slot trade evaluated; waiting for slot end")
             await _sleep_until_slot_end(end_ts, cl_stream)
             continue
 
         rem_txt = f"{remaining:.0f}s left" if remaining is not None else "no end time"
-        print(f"\nslot: {question}  ({rem_txt})")
+        utc_hour = int(time.strftime("%H", time.gmtime(_now(cl_stream))))
+        session_tag, _ = classify_session(utc_hour)
+        reg_mult = calculate_regime_multiplier(prev_slot_abs_move)
+
+        print(f"\nslot: {question} ({rem_txt}) [{session_tag} | PrevMove=${prev_slot_abs_move or 0.0:.1f} ({reg_mult:.2f}x)]")
         write_status(phase="analyzing", question=question, slug=market.get("slug"),
-                     end_ts=end_ts, side=None, edge=None, mkt=None)
+                     end_ts=end_ts, side=None, edge=None, mkt=None,
+                     strategy="diffusion_momentum",
+                     message=f"monitoring {session_tag} ({rem_txt})")
 
-        if not arb_on:
-            print("  [arb] scanner disabled (ARB_TRADE_ENABLED=0); idling this slot")
-            await _sleep_until_slot_end(end_ts, cl_stream)
-            continue
+        # ---- Dedicated Terminal Diffusion Execution ----
+        term_max_s = int(getattr(config, "TERMINAL_WINDOW_MAX_S", 20) or 20)
+        term_min_s = int(getattr(config, "TERMINAL_WINDOW_MIN_S", 5) or 5)
 
-        # ---- ARB SCAN: poll this slot's book until it pays or time runs out ----
-        # The re-scan cadence used to live INSIDE momentum's "slot too early"
-        # branch, which only ran while more than late_max (40s) remained. Two
-        # consequences: the last 40s..ARB_MIN_REMAINING of every slot was never
-        # re-scanned at all, and deleting the momentum block would have silently
-        # dropped arb to a single scan per slot. Scanning is an in-memory read of
-        # the pushed book, so poll it properly — the whole slot down to
-        # ARB_MIN_REMAINING now belongs to arb.
-        scan_gap = max(0.2, float(getattr(config, "ARB_SCAN_INTERVAL_S", 1.0) or 1.0))
-        scans = 0
-        last_beat = 0.0
-        while True:
-            # _heartbeat_sleep only refreshes status.json when the sleep is
-            # LONGER than its 5s chunk, so a 1s scan cadence never touched it:
-            # the dashboard read STALE through 119 perfectly healthy scans, and
-            # its clock offset — derived from status.updated_at — drifted by the
-            # whole slot. Beat here instead, at the rate the file actually needs.
-            _now_wall = time.time()
-            if _now_wall - last_beat >= 5.0:
-                last_beat = _now_wall
-                write_status(phase="analyzing", question=question,
-                             slug=market.get("slug"), end_ts=end_ts,
-                             message=f"scanning for an arb ({scans} so far)")
+        # Wait until terminal window opens
+        while remaining is not None and remaining > term_max_s:
+            wait_step = min(5.0, remaining - term_max_s)
+            if wait_step > 0 and config.ROUND_SECONDS > 0:
+                await _heartbeat_sleep(wait_step)
             remaining = (end_ts - _now(cl_stream)) if end_ts else None
-            if remaining is not None and remaining < arb_min_rem:
-                print(f"  [arb] {scans} scan(s) this slot; {remaining:.0f}s left "
-                      f"is under the {arb_min_rem}s floor — waiting it out")
+            if config.ROUND_SECONDS <= 0:
                 break
-            scans += 1
-            try:
-                if await _try_arb(market, question, end_ts, remaining):
-                    break
-            except Exception as e:
-                print(f"  [arb] scan error: {e}")
-            if end_ts is not None and end_ts == arb_done_end_ts:
-                # A signal was seen and declined (edge too wide, book too thin,
-                # a risk cap). One attempt per slot, so stop re-reading a book
-                # we have already decided not to act on.
-                break
-            if config.ROUND_SECONDS <= 0 or end_ts is None:
-                break  # fast/deterministic test mode: single pass, no sleeping
-            await _heartbeat_sleep(scan_gap)
 
-        # No point waiting out a slot we are done with — the loop is about to
-        # exit anyway once the round count is reached.
+        # In the terminal window: evaluate and execute
+        remaining = (end_ts - _now(cl_stream)) if end_ts else None
+        if remaining is not None and remaining >= term_min_s:
+            try:
+                await _try_momentum(market, question, end_ts, remaining)
+            except Exception as e:
+                print(f"  [diffusion] evaluation error: {e}")
+
+        # Sleep out remainder of slot
         if placed < rounds:
             await _sleep_until_slot_end(end_ts, cl_stream)
 

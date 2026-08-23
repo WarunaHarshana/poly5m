@@ -160,39 +160,53 @@ _ENV_KEYS = (
 # retired (negative or simulation-inflated expectancy) — the bot now runs
 # late_momentum plus a sum-to-one arb scanner. Their settings are gone too.
 STRATEGY_FIELDS = [
-    # --- Gates: what counts as an arb worth attempting ---
-    {"key": "ARB_SCAN_ENABLED", "label": "Scan for arbs", "type": "bool",
+    # --- Diffusion Model & Quantitative Gates (H-001 - H-005) ---
+    {"key": "MOMENTUM_TRADE_ENABLED", "label": "Execute trades", "type": "bool",
      "default": "1", "group": "gates",
-     "hint": "Master switch for the scanner. Off = the bot watches nothing."},
-    {"key": "ARB_TRADE_ENABLED", "label": "Act on what it finds", "type": "bool",
-     "default": "1", "group": "gates",
-     "hint": "Off = signals are logged but never traded, in any mode"},
-    {"key": "ARB_MIN_EDGE", "label": "Min raw gap", "type": "float",
-     "default": "0.02", "group": "gates",
-     "hint": "Required 1 − (ask_UP + ask_DOWN) BEFORE fees. The cheap first look."},
-    {"key": "ARB_MIN_LOCKED_EDGE", "label": "Min locked edge / pair", "type": "float",
-     "default": "0.02", "group": "gates",
-     "hint": "Profit per pair AFTER slippage and both taker fees — the number "
-             "that actually has to be positive"},
-    {"key": "ARB_MAX_EDGE", "label": "Max believable gap (0=off)", "type": "float",
-     "default": "0.15", "group": "gates",
-     "hint": "A 15c+ 'free' gap is makers pulling quotes, not a fillable arb"},
-    {"key": "ARB_MIN_REMAINING", "label": "Min seconds left", "type": "int",
+     "hint": "Master switch for executing terminal diffusion trades."},
+    {"key": "MOMENTUM_OBSERVE_ONLY", "label": "Observe only", "type": "bool",
+     "default": "0", "group": "gates",
+     "hint": "When on, signals are evaluated and logged for research without placing orders."},
+    {"key": "DIFFUSION_Z_MIN", "label": "Min Z-score hurdle", "type": "float",
+     "default": "1.80", "group": "gates",
+     "hint": "Minimum standardized displacement hurdle Z = |spot-strike|/sigma_tau (~98%+ empirical win rate)."},
+    {"key": "DIFFUSION_Z_BREAKOUT", "label": "Breakout Z hurdle", "type": "float",
+     "default": "2.20", "group": "gates",
+     "hint": "High-conviction breakout threshold where chop pinning no longer degrades signal."},
+    {"key": "DIFFUSION_MAX_CHOP_MARGINAL", "label": "Max chop crosses (marginal)", "type": "int",
+     "default": "3", "group": "gates",
+     "hint": "Max intra-slot strike crossings permitted when 1.8 <= Z < 2.2 (H-002 pin-risk filter)."},
+    {"key": "DIFFUSION_ALPHA", "label": "S-curve alpha", "type": "float",
+     "default": "1.75", "group": "gates",
+     "hint": "Logistic steepness calibrated across 2,439 historical slots."},
+    {"key": "TERMINAL_WINDOW_MAX_S", "label": "Terminal window max (s)", "type": "int",
      "default": "20", "group": "gates",
-     "hint": "Below this there is not enough slot left to get two legs done"},
-    {"key": "ARB_SCAN_INTERVAL_S", "label": "Scan interval (s)", "type": "float",
-     "default": "1.0", "group": "gates",
-     "hint": "How often to re-read the book within a slot (floored at 0.2s)"},
-    # --- General ---
+     "hint": "Seconds remaining before slot resolution when evaluation begins (default 20s)."},
+    {"key": "TERMINAL_WINDOW_MIN_S", "label": "Terminal window min (s)", "type": "int",
+     "default": "5", "group": "gates",
+     "hint": "Seconds remaining when order placement cuts off (default 5s)."},
+    {"key": "MOMENTUM_USE_REGIME_SIZING", "label": "Inter-slot regime sizing", "type": "bool",
+     "default": "1", "group": "gates",
+     "hint": "H-003: Scales stake up 1.20x after high-volatility slots (prev move >= $30)."},
+    {"key": "MOMENTUM_REQUIRE_VERIFIED_STRIKE", "label": "Require RTDS strike", "type": "bool",
+     "default": "1", "group": "gates",
+     "hint": "H-005: Rejects exchange proxy strikes to prevent 9.6% settlement skew."},
+    {"key": "LATE_MOMENTUM_MIN_ENTRY", "label": "Min entry price", "type": "float",
+     "default": "0.50", "group": "gates",
+     "hint": "Lowest contract ask price accepted."},
+    {"key": "LATE_MOMENTUM_MAX_ENTRY", "label": "Max entry price", "type": "float",
+     "default": "0.99", "group": "gates",
+     "hint": "Highest contract ask price accepted (skips micro-payouts 0.995+)."},
+    {"key": "LATE_MOMENTUM_MIN_EDGE", "label": "Min net edge", "type": "float",
+     "default": "0.00", "group": "gates",
+     "hint": "Minimum net edge after subtracting Polymarket taker fees."},
+    # --- General & Execution ---
     {"key": "ASSET", "label": "Default asset", "type": "str",
      "default": "btc", "group": "general",
      "hint": "btc | eth | sol (Start menu can override)"},
     {"key": "TAKER_FEE_RATE", "label": "Taker fee rate", "type": "float",
      "default": "0.07", "group": "execution",
-     "hint": "Polymarket’s documented curve: rate × p × (1−p) per share, charged on BOTH legs. Gamma’s per-market rate overrides this."},
-    {"key": "ARB_MAX_STAKE_USD", "label": "Max stake / pair $", "type": "float",
-     "default": "5.0", "group": "sizing",
-     "hint": "Total across BOTH legs of one pair"},
+     "hint": "Polymarket crypto taker fee curve: 0.07 * p * (1-p) per share."},
     # --- Sizing & risk ---
     {"key": "PAPER_FILL_SLIPPAGE", "label": "Paper fill slippage", "type": "float",
      "default": "0.01", "group": "execution",
@@ -1557,8 +1571,8 @@ body.trade-flash-lose { animation: page-flash-down 1.6s ease-out; }
   <div class="header glass-card">
     <div class="brand">
       <span class="brand-icon">&#9889;</span>
-      <span class="brand-text">ARB <span>DESK</span></span>
-      <span class="badge" title="Every directional strategy was retired on measurement. Sum-to-one arb is the only one left: buy BOTH sides when they cost under $1 together, and one leg pays $1/share whichever way the slot lands.">sum-to-one arb</span>
+      <span class="brand-text">DIFFUSION <span>MOMENTUM</span></span>
+      <span class="badge" title="Regime-Conditioned Terminal Diffusion Engine (H-001 through H-005): Standardized Z-Score Brownian scaling + selective chop pin-risk filter + session & inter-slot volatility clustering.">H-001 - H-005 Diffusion Model</span>
     </div>
     <div class="header-right">
       <span class="badge mode" id="mode">MODE: —</span>
@@ -1777,16 +1791,16 @@ body.trade-flash-lose { animation: page-flash-down 1.6s ease-out; }
       </div>
     </div>
     <div class="panel glass-card strat animate-in delay-4">
-      <div class="phead"><span>Strategy</span><span>Sum-to-one Arb</span></div>
+      <div class="phead"><span>Strategy</span><span>Terminal Diffusion Momentum</span></div>
       <div class="pbody">
-        <div class="lbl">The trade</div>
-        <p>Whenever <span class="arb">ask UP + ask DOWN &lt; $1</span>, buy equal shares of both. Exactly one leg pays $1/share whichever way the slot resolves, so the profit is <b>arithmetic, not a prediction</b> — it is set the moment both legs fill.</p>
-        <div class="lbl">Why it can still lose</div>
-        <p>Only two ways. Fees can eat the gap, which is why the locked edge is computed net of <i>both</i> taker fees before anything is sent. Or the second leg misses after the first fills — that leaves a naked directional position, so it is unwound at the bid immediately and the failure is alerted, never just logged.</p>
-        <div class="lbl">Execution</div>
-        <p>Both legs go out <b>FOK</b>: they fill completely or not at all. The thinner side goes first, so a miss costs nothing. Prices come from one WebSocket snapshot — two REST reads seconds apart can describe a pair that never simultaneously existed.</p>
+        <div class="lbl">Quantitative Edge</div>
+        <p>Evaluates standardized spot displacement <span class="mono" style="color:var(--accent2)">Z = |P<sub>spot</sub> - P<sub>strike</sub>| / &sigma;<sub>&tau;</sub></span> where terminal diffusion scale <span class="mono">&sigma;<sub>&tau;</sub> = Spot &times; &radic;(var<sub>sec</sub> &times; &tau;)</span> collapses into slot resolution. When <span class="mono">Z &ge; 1.80</span>, empirical win rate exceeds <b>98.4%</b>.</p>
+        <div class="lbl">Pin-Risk Chop Gate (H-002)</div>
+        <p>When displacement is marginal (<span class="mono">1.8 &le; Z &lt; 2.2</span>), slots with <span class="mono">&gt; 3</span> intra-slot strike crossings are automatically rejected to eliminate pin-risk at the strike boundary.</p>
+        <div class="lbl">Regime Sizing &amp; Verified Strike (H-003, H-005)</div>
+        <p>Scales stake <span class="mono">1.20x</span> after wide-move slots (<span class="mono">|move| &ge; $30</span>) and strictly requires verified official <b>Chainlink RTDS</b> ticks to prevent the 9.6% settlement skew caused by exchange proxies.</p>
         <div class="lbl">Data Source</div>
-        <p id="datanote">Real Polymarket order books over WebSocket, with a REST fallback. Paper fills pay ask + slippage on both legs.</p>
+        <p id="datanote">Official Polymarket RTDS Chainlink Data Streams + WebSocket L2 Order Book.</p>
       </div>
     </div>
   </div>
@@ -2353,20 +2367,16 @@ function render(stats, trades) {
       s: pmSub, cls: pmBal != null ? 'pos' : '' },
     { k: 'Local Bankroll',  v: fmtUsd(stats.bankroll || start), s: 'bot tracker · start ' + fmtUsd(start) },
     { k: 'Realized P&L',    v: fmtUsd(pnl),                    s: pnlPct.toFixed(1) + '% vs start', cls: pnl >= 0 ? 'pos' : 'neg' },
-    // Lock rate is THE number: an arb that fills is profitable by
-    // construction, so the only question is how often both legs land.
-    { k: 'Lock Rate',
-      v: (lastArbExec && lastArbExec.attempts
-          ? (lastArbExec.lock_rate_pct || 0) + '%' : '—'),
-      s: (lastArbExec && lastArbExec.attempts
-          ? (lastArbExec.both_legs_locked || 0) + ' of ' + lastArbExec.attempts + ' attempts'
-          : 'no attempts yet'),
-      cls: (lastArbExec && lastArbExec.both_legs_locked) ? 'pos' : '' },
-    { k: 'Arb P&L',
-      v: fmtUsd(stats.arb_pnl || 0),
-      s: (stats.arb_trades || 0) + ' pairs · fees ' + fmtUsd(stats.fees_paid || 0),
-      cls: (stats.arb_pnl || 0) >= 0 ? 'pos' : 'neg' },
-    { k: 'Pairs Settled',   v: stats.arb_trades || 0,           s: (stats.trades || 0) + ' rows in the blotter' },
+    { k: 'Win Rate',
+      v: (stats.trades ? (stats.win_rate || 0).toFixed(1) + '%' : '—'),
+      s: (stats.trades ? (stats.wins || 0) + ' wins · ' + (stats.losses || 0) + ' losses' : 'no trades yet'),
+      cls: (stats.win_rate >= 80) ? 'pos' : '' },
+    { k: 'Total Trades',
+      v: stats.trades || 0,
+      s: 'fees paid ' + fmtUsd(stats.fees_paid || 0) },
+    { k: 'Avg Net Edge',
+      v: stats.avg_edge != null && stats.avg_edge !== 0 ? (stats.avg_edge > 0 ? '+' : '') + (stats.avg_edge * 100).toFixed(1) + '%' : '—',
+      s: 'after Polymarket fees' },
     { k: 'Max Drawdown',    v: fmtUsd(mdd),                     s: 'peak-to-trough', cls: 'neg' },
     { k: 'Circuit Breaker', v: stats.halted ? 'TRIPPED' : 'ARMED',
       s: stats.halted ? (stats.halt_reason || 'halted') : 'daily loss stop',

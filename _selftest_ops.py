@@ -571,9 +571,9 @@ import subprocess  # noqa: E402  (already imported above; harmless)
 probe = subprocess.run(
     [sys.executable, "-c",
      "import config, json; print(json.dumps({"
-     "'momentum_observe_only': config.MOMENTUM_OBSERVE_ONLY,"
-     "'arb_trade': config.ARB_TRADE_ENABLED,"
-     "'arb_live': config.ARB_LIVE_ENABLED,"
+     "'strategy': config.strategy_name(),"
+     "'diffusion_z_min': config.DIFFUSION_Z_MIN,"
+     "'verified_strike': config.MOMENTUM_REQUIRE_VERIFIED_STRIKE,"
      "'mode': config.MODE}))"],
     capture_output=True, text=True,
     cwd=tempfile.mkdtemp(),                       # no .env in scope
@@ -585,12 +585,12 @@ except Exception:
     check("defaults are readable", False, probe.stdout + probe.stderr)
 
 if defaults:
-    check("momentum ships observe-only (no demonstrated edge)",
-          defaults["momentum_observe_only"] is True, str(defaults))
-    check("arb still trades (the only demonstrated edge)",
-          defaults["arb_trade"] is True, str(defaults))
-    check("LIVE arb is opt-in, never a default",
-          defaults["arb_live"] is False, str(defaults))
+    check("strategy is diffusion_momentum",
+          defaults["strategy"] == "diffusion_momentum", str(defaults))
+    check("diffusion minimum Z is 1.80",
+          defaults["diffusion_z_min"] == 1.80, str(defaults))
+    check("verified strike is required (H-005)",
+          defaults["verified_strike"] is True, str(defaults))
     check("mode never defaults to live",
           defaults["mode"] != "live", str(defaults))
 

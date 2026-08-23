@@ -172,13 +172,24 @@ class ChainlinkDataStream:
         with self._lock:
             return [(ts, px) for ts, px in self._ticks if ts >= unix_ts]
 
-    def realized_vol_daily_since(self, unix_ts: float) -> float | None:
-        """Realized daily vol from real tick spacing since unix_ts.
+    def strike_crossings_since(self, unix_ts: float, strike: float) -> int:
+        """Count the number of times spot crossed strike since unix_ts."""
+        ticks = self.ticks_since(unix_ts)
+        if len(ticks) < 2 or strike <= 0:
+            return 0
+        crossings = 0
+        prev_diff = ticks[0][1] - strike
+        for _, px in ticks[1:]:
+            diff = px - strike
+            if (prev_diff > 0 and diff < 0) or (prev_diff < 0 and diff > 0):
+                crossings += 1
+                prev_diff = diff
+            elif diff != 0:
+                prev_diff = diff
+        return crossings
 
-        Uses each tick's own dt instead of assuming a fixed sample interval
-        (the polled history assumed 5s while really being 15s+ apart, which
-        overstated vol ~1.7x and pulled model probabilities toward 0.5).
-        """
+    def var_per_sec_since(self, unix_ts: float) -> float | None:
+        """Realized log-return variance per second from tick history since unix_ts."""
         ticks = self.ticks_since(unix_ts)
         if len(ticks) < 4:
             return None
@@ -189,12 +200,23 @@ class ChainlinkDataStream:
             if dt <= 0 or p0 <= 0 or p1 <= 0:
                 continue
             r = math.log(p1 / p0)
-            var_sum += (r * r) / dt      # per-second variance contribution
+            var_sum += (r * r) / dt
             n += 1
         if n < 3:
             return None
-        var_per_sec = var_sum / n
-        daily = math.sqrt(max(var_per_sec, 0.0) * 86400.0)
+        return var_sum / n
+
+    def realized_vol_daily_since(self, unix_ts: float) -> float | None:
+        """Realized daily vol from real tick spacing since unix_ts.
+
+        Uses each tick's own dt instead of assuming a fixed sample interval
+        (the polled history assumed 5s while really being 15s+ apart, which
+        overstated vol ~1.7x and pulled model probabilities toward 0.5).
+        """
+        v_sec = self.var_per_sec_since(unix_ts)
+        if v_sec is None:
+            return None
+        daily = math.sqrt(max(v_sec, 0.0) * 86400.0)
         return max(0.01, min(0.15, daily))
 
     def _record(self, ts_s: float, value: float) -> None:
@@ -476,6 +498,24 @@ class LivePriceFeed:
 
     def recent(self, n: int) -> list[float]:
         return list(self.history)[-n:]
+
+    def strike_crossings_since(self, unix_ts: float, strike: float) -> int:
+        """Count the number of times spot crossed strike since unix_ts."""
+        if self.stream is not None:
+            return self.stream.strike_crossings_since(unix_ts, strike)
+        return 0
+
+    def var_per_sec_since(self, unix_ts: float) -> float | None:
+        """Return realized variance per second since unix_ts."""
+        if self.stream is not None:
+            return self.stream.var_per_sec_since(unix_ts)
+        return None
+
+    def realized_vol_daily_since(self, unix_ts: float) -> float | None:
+        """Return realized daily volatility since unix_ts."""
+        if self.stream is not None:
+            return self.stream.realized_vol_daily_since(unix_ts)
+        return None
 
     def get_slot_start_price(self, slot_start_ts: int) -> float | None:
         """Price at the beginning of the slot window (Polymarket strike).
