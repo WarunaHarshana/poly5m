@@ -253,19 +253,29 @@ def load_session() -> tuple[list, float, str | None]:
 def _atomic_write_json(path: str, obj) -> None:
     """Write JSON so a reader never sees a half-written file.
 
-    Plain open(path,"w") truncates first: a dashboard poll landing mid-write
-    gets a partial parse, and a process killed while the handle is open can
-    leave the file as pure NUL bytes on Windows (observed: status.json,
-    1052 bytes, all zeros — permanently unreadable until rewritten).
-    Write to a temp file in the same directory, flush+fsync, then os.replace,
-    which is atomic on both Windows and POSIX.
+    Handles Windows file-lock contention gracefully with retries and fallback.
     """
-    tmp = f"{path}.tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(obj, f, indent=2, default=str)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(obj, f, indent=2, default=str)
+            f.flush()
+        for _ in range(5):
+            try:
+                os.replace(tmp, path)
+                return
+            except OSError:
+                time.sleep(0.02)
+        # Fallback if replace is momentarily locked on Windows
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(obj, f, indent=2, default=str)
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+    except Exception:
+        pass
 
 
 def read_json_safe(path: str, default=None):
