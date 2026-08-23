@@ -1233,7 +1233,7 @@ async def run_realtime(rounds: int = 100, paper: bool = True,
     early_seen_end_ts = None
     time_guard_seen_end_ts = None
 
-    async def _try_momentum(market, question, end_ts, remaining):
+    async def _try_momentum(market, question, end_ts, remaining, verbose: bool = True):
         """Evaluate and execute regime-conditioned terminal diffusion momentum (H-001 - H-005)."""
         nonlocal momentum_done_end_ts, placed
         if end_ts is None:
@@ -1248,17 +1248,20 @@ async def run_realtime(rounds: int = 100, paper: bool = True,
                 if strike is not None:
                     strike_src = "chainlink-data-stream" if cl_stream.ready else "proxy"
             except Exception as e:
-                print(f"  [diffusion] strike fetch failed: {e}")
+                if verbose:
+                    print(f"  [diffusion] strike fetch failed: {e}")
 
         if strike is None or strike <= 0:
-            print("  [diffusion] no verified slot strike available; skipping")
+            if verbose:
+                print("  [diffusion] no verified slot strike available; skipping")
             return False
 
         spot = None
         try:
             spot = await asyncio.to_thread(feed.price)
         except Exception as e:
-            print(f"  [diffusion] spot fetch failed: {e}")
+            if verbose:
+                print(f"  [diffusion] spot fetch failed: {e}")
             return False
 
         chop_crosses = feed.strike_crossings_since(slot_start_time, strike) if slot_start_time else 0
@@ -1375,14 +1378,16 @@ async def run_realtime(rounds: int = 100, paper: bool = True,
             except Exception as e:
                 print(f"  [obs] record failed: {e}")
 
-        print(f"  [diffusion] Z={signal.z_score:.2f} (|move|=${abs(move_usd):.2f}, "
-              f"sigma_tau=${signal.sigma_tau:.2f}, chop={chop_crosses}) "
-              f"{signal.side} @ ask={ask if ask is not None else 0.0:.3f} "
-              f"(prob={signal.model_prob:.3f}, edge={signal.edge_net:+.3f}, "
-              f"session='{signal.session_name}', regime={signal.regime_mult:.2f}x)")
+        if verbose or signal.passed_gates:
+            print(f"  [diffusion] Z={signal.z_score:.2f} (|move|=${abs(move_usd):.2f}, "
+                  f"sigma_tau=${signal.sigma_tau:.2f}, chop={chop_crosses}) "
+                  f"{signal.side} @ ask={ask if ask is not None else 0.0:.3f} "
+                  f"(prob={signal.model_prob:.3f}, edge={signal.edge_net:+.3f}, "
+                  f"session='{signal.session_name}', regime={signal.regime_mult:.2f}x)")
 
         if not signal.passed_gates:
-            print(f"  [diffusion] skipped: {signal.skip_reason}")
+            if verbose:
+                print(f"  [diffusion] skipped: {signal.skip_reason}")
             skips["diffusion_gates"] = skips.get("diffusion_gates", 0) + 1
             return False
 
@@ -1597,7 +1602,7 @@ async def run_realtime(rounds: int = 100, paper: bool = True,
                      message=f"monitoring {session_tag} ({rem_txt})")
 
         # ---- Dedicated Terminal Diffusion Execution ----
-        term_max_s = int(getattr(config, "TERMINAL_WINDOW_MAX_S", 20) or 20)
+        term_max_s = int(getattr(config, "TERMINAL_WINDOW_MAX_S", 60) or 60)
         term_min_s = int(getattr(config, "TERMINAL_WINDOW_MIN_S", 5) or 5)
 
         # Wait until terminal window opens
@@ -1609,13 +1614,25 @@ async def run_realtime(rounds: int = 100, paper: bool = True,
             if config.ROUND_SECONDS <= 0:
                 break
 
-        # In the terminal window: evaluate and execute
-        remaining = (end_ts - _now(cl_stream)) if end_ts else None
-        if remaining is not None and remaining >= term_min_s:
+        # In the execution window: continuously scan until trade is placed or window expires
+        scan_gap = max(0.5, float(getattr(config, "DIFFUSION_SCAN_INTERVAL_S", 1.0) or 1.0))
+        scan_count = 0
+        while True:
+            remaining = (end_ts - _now(cl_stream)) if end_ts else None
+            if remaining is None or remaining < term_min_s:
+                break
+            scan_count += 1
+            # Verbose on first scan of slot or at final seconds
+            is_verbose = (scan_count == 1) or (remaining <= term_min_s + 1)
             try:
-                await _try_momentum(market, question, end_ts, remaining)
+                placed_ok = await _try_momentum(market, question, end_ts, remaining, verbose=is_verbose)
+                if placed_ok:
+                    break
             except Exception as e:
                 print(f"  [diffusion] evaluation error: {e}")
+            if config.ROUND_SECONDS <= 0:
+                break
+            await _heartbeat_sleep(scan_gap)
 
         # Sleep out remainder of slot
         if placed < rounds:

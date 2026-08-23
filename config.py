@@ -243,7 +243,7 @@ DIFFUSION_ALPHA = float(os.getenv("DIFFUSION_ALPHA", "1.75"))
 # Floor on terminal standard deviation in USD over tau to prevent division by zero
 DIFFUSION_MIN_SIGMA_USD = float(os.getenv("DIFFUSION_MIN_SIGMA_USD", "2.50"))
 # Terminal execution window (remaining seconds before slot resolution)
-TERMINAL_WINDOW_MAX_S = int(os.getenv("TERMINAL_WINDOW_MAX_S", "20"))
+TERMINAL_WINDOW_MAX_S = int(os.getenv("TERMINAL_WINDOW_MAX_S", "60"))
 TERMINAL_WINDOW_MIN_S = int(os.getenv("TERMINAL_WINDOW_MIN_S", "5"))
 # H-003: Dynamic stake multiplier based on previous slot (T-1) displacement
 MOMENTUM_USE_REGIME_SIZING = _env_bool("MOMENTUM_USE_REGIME_SIZING", True)
@@ -253,9 +253,9 @@ MOMENTUM_REQUIRE_VERIFIED_STRIKE = _env_bool("MOMENTUM_REQUIRE_VERIFIED_STRIKE",
 MOMENTUM_TRADE_ENABLED = _env_bool("MOMENTUM_TRADE_ENABLED", True)
 MOMENTUM_OBSERVE_ONLY = _env_bool("MOMENTUM_OBSERVE_ONLY", False)
 
-# Entry price band: [0.50, 0.99]
+# Entry price band: [0.50, 0.94]
 LATE_MOMENTUM_MIN_ENTRY = float(os.getenv("LATE_MOMENTUM_MIN_ENTRY", "0.50"))
-LATE_MOMENTUM_MAX_ENTRY = float(os.getenv("LATE_MOMENTUM_MAX_ENTRY", "0.99"))
+LATE_MOMENTUM_MAX_ENTRY = float(os.getenv("LATE_MOMENTUM_MAX_ENTRY", "0.94"))
 LATE_MOMENTUM_MIN_EDGE = float(os.getenv("LATE_MOMENTUM_MIN_EDGE", "0.00"))
 LATE_MOMENTUM_MAX_EDGE = None  # No ceiling: aggressively capture large mispricings on volatile moves
 # Evaluate and record momentum slots, but place no momentum trades.
