@@ -126,6 +126,12 @@ class TWAPBot:
 
                 strike = slot_strike
                 spot = self.cl_stream.price()
+
+                if self.cl_stream.is_stale(max_age_s=6.0):
+                    logger.warning(f"[FEED] Chainlink tick stream waiting for live tick... (last: ${spot:,.2f})")
+                    await asyncio.sleep(1.0)
+                    continue
+
                 realized_twap, _ = self.cl_stream.compute_realized_twap(start_ts=slot_start_ts, end_ts=now)
                 chop = self.cl_stream.strike_crossings_since(slot_start_ts, strike)
 

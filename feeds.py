@@ -139,10 +139,16 @@ class ChainlinkRTDSStream:
                 prev_side = side
         return crossings
 
+    def is_stale(self, max_age_s: float = 6.0) -> bool:
+        with self._lock:
+            if not self._history:
+                return True
+            return (time.time() - self._last_tick_time) > max_age_s
+
     def _record(self, ts: float, price: float) -> None:
         with self._lock:
             self._history.append((ts, price))
-            self._last_tick_time = ts
+            self._last_tick_time = time.time()
             self._ready_event.set()
 
     def _run_loop(self) -> None:
@@ -169,8 +175,12 @@ class ChainlinkRTDSStream:
                         }],
                     }
                     await ws.send(json.dumps(sub))
-                    async for raw in ws:
-                        if self._stop:
+                    logger.info("[ChainlinkRTDS] Connected and subscribed to tick feed")
+                    while not self._stop:
+                        try:
+                            raw = await asyncio.wait_for(ws.recv(), timeout=6.0)
+                        except asyncio.TimeoutError:
+                            logger.warning("[ChainlinkRTDS] Heartbeat timeout (>6s no message), reconnecting stream...")
                             break
                         if not raw or not raw.strip() or raw in ("PONG", "pong"):
                             continue
@@ -305,10 +315,13 @@ class PolymarketBookStream:
 
                     pinger = asyncio.create_task(self._pinger(ws))
                     try:
-                        async for raw in ws:
-                            if self._stop:
+                        while not self._stop:
+                            try:
+                                raw = await asyncio.wait_for(ws.recv(), timeout=15.0)
+                            except asyncio.TimeoutError:
+                                logger.warning("[CLOB WS] Heartbeat timeout (>15s no message), reconnecting...")
                                 break
-                            if raw == "PONG":
+                            if not raw or raw == "PONG":
                                 continue
                             try:
                                 msg = json.loads(raw)
