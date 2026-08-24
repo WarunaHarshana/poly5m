@@ -1,5 +1,0 @@
-# The live-trading client now ships in requirements.txt, because the
-# deployed image is the one that goes live and must be able to build a
-# wallet client to verify itself before any money moves.
-# Kept as an alias so existing instructions keep working.
--r requirements.txt

@@ -1,14 +1,6 @@
-# Runtime deps for paper / paper_live — real BTC prices and real Polymarket
-# order books, simulated fills. This is what the Dockerfile installs, and it is
-# everything the 24/7 Railway deployment needs.
-requests>=2.31
-python-dotenv>=1.0
-websockets>=12.0          # Polymarket RTDS Chainlink Data Stream (btc/usd)
-
-# Real-money trading and the wallet/balance checks. Previously split out to
-# keep the paper image lean, which was right while the deployment was paper
-# only — but the image is now the one that goes live, and without this
-# MODE=live dies at startup on ModuleNotFoundError while /api/balance can
-# never confirm a wallet. A slower build is a fair price for a deployment that
-# can actually be verified before money goes in.
-py-clob-client-v2>=0.1.0
+websockets>=12.0
+requests>=2.31.0
+python-dotenv>=1.0.0
+py-clob-client>=0.18.0
+web3>=6.0.0
+eth-account>=0.8.0

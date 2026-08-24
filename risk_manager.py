@@ -1,0 +1,102 @@
+"""Risk and Portfolio Management for H-001 TWAP Bot."""
+from __future__ import annotations
+
+import json
+import logging
+import time
+from pathlib import Path
+
+import config
+
+logger = logging.getLogger("risk")
+
+
+class RiskManager:
+    """Enforces bankroll preservation, daily loss limits, and consecutive loss cooldowns."""
+
+    def __init__(self, state_dir: Path = config.STATE_DIR):
+        self.state_dir = state_dir
+        self.bankroll = config.STARTING_BANKROLL
+        self.daily_pnl = 0.0
+        self.consecutive_losses = 0
+        self.trades_today = 0
+        self.day_timestamp = int(time.time() // 86400)
+        self.load_state()
+
+    def _check_day_rollover(self) -> None:
+        current_day = int(time.time() // 86400)
+        if current_day != self.day_timestamp:
+            self.day_timestamp = current_day
+            self.daily_pnl = 0.0
+            self.trades_today = 0
+
+    def can_trade(self) -> tuple[bool, str]:
+        """Check if trading is allowed under current risk limits."""
+        self._check_day_rollover()
+
+        # Daily loss limit check
+        if self.daily_pnl <= -config.DAILY_LOSS_LIMIT_USD:
+            return False, f"daily loss limit hit (-${abs(self.daily_pnl):.2f} <= -${config.DAILY_LOSS_LIMIT_USD:.2f})"
+
+        # Consecutive loss check
+        if self.consecutive_losses >= config.MAX_CONSECUTIVE_LOSSES:
+            return False, f"hit {self.consecutive_losses} consecutive losses (max {config.MAX_CONSECUTIVE_LOSSES})"
+
+        # Minimum bankroll check
+        if self.bankroll < config.BASE_STAKE_USD:
+            return False, f"insufficient bankroll (${self.bankroll:.2f} < ${config.BASE_STAKE_USD:.2f})"
+
+        return True, ""
+
+    def calculate_stake(self, edge: float, price: float) -> float:
+        """Calculate dollar stake for trade."""
+        stake = config.BASE_STAKE_USD
+        # Modest scale-up with edge
+        if edge > 0.08:
+            stake = min(config.MAX_STAKE_USD, stake * 1.5)
+        # Ensure bankroll constraint
+        stake = min(stake, self.bankroll * 0.20)
+        return max(config.BASE_STAKE_USD, round(stake, 2))
+
+    def record_trade_result(self, pnl: float) -> None:
+        """Update risk metrics upon trade settlement."""
+        self._check_day_rollover()
+        self.bankroll += pnl
+        self.daily_pnl += pnl
+        self.trades_today += 1
+
+        if pnl < 0:
+            self.consecutive_losses += 1
+        else:
+            self.consecutive_losses = 0
+
+        self.save_state()
+
+    def save_state(self) -> None:
+        state = {
+            "bankroll": round(self.bankroll, 2),
+            "daily_pnl": round(self.daily_pnl, 2),
+            "consecutive_losses": self.consecutive_losses,
+            "trades_today": self.trades_today,
+            "day_timestamp": self.day_timestamp,
+            "updated_at": time.time(),
+        }
+        try:
+            with open(self.state_dir / "risk_state.json", "w") as f:
+                json.dump(state, f, indent=2)
+        except Exception as e:
+            logger.error(f"Failed to save risk state: {e}")
+
+    def load_state(self) -> None:
+        path = self.state_dir / "risk_state.json"
+        if path.exists():
+            try:
+                with open(path, "r") as f:
+                    state = json.load(f)
+                    self.bankroll = float(state.get("bankroll", self.bankroll))
+                    self.consecutive_losses = int(state.get("consecutive_losses", 0))
+                    if state.get("day_timestamp") == self.day_timestamp:
+                        self.daily_pnl = float(state.get("daily_pnl", 0.0))
+                        self.trades_today = int(state.get("trades_today", 0))
+            except Exception as e:
+                logger.error(f"Failed to load risk state: {e}")

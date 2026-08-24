@@ -1,0 +1,207 @@
+"""TWAP Path-Accumulation Pricing Engine (H-001).
+
+Implements analytical TWAP settlement probability for Polymarket 5-Minute BTC Up/Down markets:
+1. Realized TWAP path accumulation: I_realized(t) = integral_0^t S(u) du
+2. Required remaining average spot price: S_req(tau) = (300 * S_0 - I_realized(t)) / tau
+3. Cubic variance decay of remaining TWAP: sigma_twap(tau) = S(t) * sqrt(sigma^2 * tau / 3)
+4. Standardized TWAP Z-Score: Z_twap = (S(t) - S_req(tau)) / sigma_twap(tau)
+5. Calibrated win probability: P(Z) = 1 / (1 + exp(-alpha * |Z|))
+6. Polymarket dynamic crypto taker fee: fee = rate * p * (1 - p)
+7. Net edge calculation and decision gating.
+"""
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+
+
+@dataclass(slots=True)
+class TWAPSignal:
+    """Evaluation result from the TWAP Pricing Model."""
+    side: str                        # 'UP', 'DOWN', or 'FLAT'
+    z_score: float                   # Standardized TWAP Z-score magnitude
+    signed_z: float                  # Signed Z (+ for UP, - for DOWN)
+    model_prob: float                # Calibrated win probability P in [0.5, 1.0)
+    ask: float | None                # Order book best ask price
+    edge_gross: float                # model_prob - ask
+    fee_taker: float                 # Dynamic taker fee
+    edge_net: float                  # edge_gross - fee_taker
+    s_req: float                     # Required remaining average spot price
+    s_0: float                       # Slot strike (price at t=0)
+    spot: float                      # Current BTC spot price
+    realized_twap: float             # Realized TWAP over elapsed time
+    elapsed_s: float                 # Elapsed seconds in slot
+    remaining_s: float               # Remaining seconds in slot (tau)
+    sigma_twap_usd: float            # Dispersion of remaining TWAP in USD
+    passed_gates: bool               # True if all entry conditions satisfied
+    skip_reason: str = ""            # Explanation if passed_gates is False
+
+
+class TWAPEngine:
+    """Pure analytical engine for the H-001 TWAP Mispricing Strategy."""
+
+    def __init__(
+        self,
+        alpha: float = 1.75,
+        min_sigma_usd: float = 2.0,
+        min_z: float = 1.8,
+        min_edge: float = 0.03,
+        min_entry: float = 0.50,
+        max_entry: float = 0.95,
+        max_chop_crosses: int = 3,
+        default_daily_vol: float = 0.0106,
+    ):
+        self.alpha = float(alpha)
+        self.min_sigma_usd = float(min_sigma_usd)
+        self.min_z = float(min_z)
+        self.min_edge = float(min_edge)
+        self.min_entry = float(min_entry)
+        self.max_entry = float(max_entry)
+        self.max_chop_crosses = int(max_chop_crosses)
+        self.default_daily_vol = float(default_daily_vol)
+
+    def estimate_sigma_twap_usd(
+        self,
+        spot: float,
+        remaining_s: float,
+        realized_vol_daily: float | None = None,
+        var_per_sec: float | None = None,
+    ) -> float:
+        """Calculate analytical std dev of remaining TWAP: sigma_twap = spot * sqrt(var_sec * tau / 3)."""
+        tau = max(1.0, min(300.0, float(remaining_s)))
+        if var_per_sec is not None and var_per_sec > 0:
+            v_sec = float(var_per_sec)
+        elif realized_vol_daily is not None and realized_vol_daily > 0:
+            v_sec = (float(realized_vol_daily) ** 2) / 86400.0
+        else:
+            v_sec = (self.default_daily_vol ** 2) / 86400.0
+
+        # Remaining TWAP integral variance is Var(1/tau * int_0^tau B_t dt) = sigma^2 * tau / 3
+        sigma_twap = spot * math.sqrt(v_sec * tau / 3.0)
+        return max(self.min_sigma_usd, float(sigma_twap))
+
+    def compute_s_req_and_z(
+        self,
+        spot: float,
+        strike: float,
+        realized_twap: float,
+        elapsed_s: float,
+        remaining_s: float,
+        sigma_twap_usd: float,
+    ) -> tuple[float, float, float]:
+        """Return (abs_z, signed_z, s_req)."""
+        elapsed = max(0.0, min(300.0, float(elapsed_s)))
+        remaining = max(1.0, min(300.0, float(remaining_s)))
+        total_window = max(1.0, elapsed + remaining)
+
+        # Realized path integral: I_realized = elapsed * realized_twap
+        # Target path integral: I_target = total_window * strike
+        target_integral = total_window * strike
+        realized_integral = elapsed * realized_twap
+        remaining_integral = target_integral - realized_integral
+        s_req = remaining_integral / remaining
+
+        dispersion = max(self.min_sigma_usd, float(sigma_twap_usd))
+        signed_z = (spot - s_req) / dispersion
+        abs_z = abs(signed_z)
+        return abs_z, signed_z, s_req
+
+    def calibrated_probability(self, z: float) -> float:
+        """Map Z-score to calibrated win probability via logistic S-curve."""
+        mag = abs(float(z))
+        prob = 1.0 / (1.0 + math.exp(-self.alpha * mag))
+        return max(0.50, min(0.999, prob))
+
+    @staticmethod
+    def calculate_taker_fee(price: float, fee_rate: float = 0.07) -> float:
+        """Polymarket crypto taker fee formula: fee = rate * p * (1 - p)."""
+        p = max(0.0, min(1.0, float(price)))
+        return float(fee_rate) * p * (1.0 - p)
+
+    def evaluate(
+        self,
+        spot: float,
+        strike: float,
+        remaining_s: float,
+        elapsed_s: float,
+        realized_twap: float,
+        ask: float | None = None,
+        chop_crosses: int = 0,
+        realized_vol_daily: float | None = None,
+        var_per_sec: float | None = None,
+        fee_rate: float = 0.07,
+    ) -> TWAPSignal:
+        """Evaluate TWAP mispricing and determine trade eligibility."""
+        sigma_twap = self.estimate_sigma_twap_usd(
+            spot=spot,
+            remaining_s=remaining_s,
+            realized_vol_daily=realized_vol_daily,
+            var_per_sec=var_per_sec,
+        )
+
+        abs_z, signed_z, s_req = self.compute_s_req_and_z(
+            spot=spot,
+            strike=strike,
+            realized_twap=realized_twap,
+            elapsed_s=elapsed_s,
+            remaining_s=remaining_s,
+            sigma_twap_usd=sigma_twap,
+        )
+
+        model_prob = self.calibrated_probability(abs_z)
+        side = "UP" if signed_z >= 0 else "DOWN"
+
+        # Taker fee and edge
+        if ask is not None and 0.0 < ask < 1.0:
+            fee_taker = self.calculate_taker_fee(ask, fee_rate)
+            edge_gross = model_prob - ask
+            edge_net = edge_gross - fee_taker
+        else:
+            fee_taker = 0.0
+            edge_gross = 0.0
+            edge_net = 0.0
+
+        # --- Decision Gatekeeper ---
+        passed = True
+        skip_reasons = []
+
+        if abs_z < self.min_z:
+            passed = False
+            skip_reasons.append(f"Z-score {abs_z:.2f} < threshold {self.min_z:.2f}")
+
+        if chop_crosses > self.max_chop_crosses:
+            passed = False
+            skip_reasons.append(f"chop crosses {chop_crosses} > max {self.max_chop_crosses}")
+
+        if ask is None:
+            passed = False
+            skip_reasons.append("no ask price available")
+        elif ask < self.min_entry:
+            passed = False
+            skip_reasons.append(f"ask {ask:.3f} < min entry {self.min_entry:.2f}")
+        elif ask > self.max_entry:
+            passed = False
+            skip_reasons.append(f"ask {ask:.3f} > max entry {self.max_entry:.2f}")
+        elif edge_net < self.min_edge:
+            passed = False
+            skip_reasons.append(f"net edge {edge_net:+.3f} < required {self.min_edge:+.3f}")
+
+        return TWAPSignal(
+            side=side,
+            z_score=abs_z,
+            signed_z=signed_z,
+            model_prob=model_prob,
+            ask=ask,
+            edge_gross=edge_gross,
+            fee_taker=fee_taker,
+            edge_net=edge_net,
+            s_req=s_req,
+            s_0=strike,
+            spot=spot,
+            realized_twap=realized_twap,
+            elapsed_s=elapsed_s,
+            remaining_s=remaining_s,
+            sigma_twap_usd=sigma_twap,
+            passed_gates=passed,
+            skip_reason="; ".join(skip_reasons),
+        )
