@@ -21,11 +21,13 @@ class ChainlinkRTDSStream:
 
     def __init__(self, url: str = config.CHAINLINK_RTDS_URL, asset: str = "btc"):
         self.url = url
-        self.symbol = f"{asset}/usd"
+        self.asset = str(asset).lower()
+        self.symbol = f"{self.asset}/usd"
         self._history: collections.deque[tuple[float, float]] = collections.deque(maxlen=10000)
         self._lock = threading.Lock()
         self._stop = False
         self._thread: threading.Thread | None = None
+        self._task: asyncio.Task | None = None
         self._ready_event = threading.Event()
         self._last_tick_time: float = 0.0
         self._stream_clock_offset: float = 0.0  # (stream_ts - local_ts)
@@ -33,12 +35,19 @@ class ChainlinkRTDSStream:
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
             return
+        if self._task and not self._task.done():
+            return
         self._stop = False
-        self._thread = threading.Thread(target=self._run_loop, daemon=True, name="chainlink-rtds")
-        self._thread.start()
+        try:
+            self._task = asyncio.create_task(self._run())
+        except RuntimeError:
+            self._thread = threading.Thread(target=self._run_loop, daemon=True, name="chainlink-rtds")
+            self._thread.start()
 
     def stop(self) -> None:
         self._stop = True
+        if self._task:
+            self._task.cancel()
 
     def wait_ready(self, timeout: float = 15.0) -> bool:
         return self._ready_event.wait(timeout)
@@ -193,7 +202,8 @@ class ChainlinkRTDSStream:
                         self._stream_clock_offset = ts_s - time.time()
                         if value > 0:
                             self._record(ts_s, value)
-            except Exception:
+            except Exception as e:
+                logger.warning(f"[ChainlinkRTDS] connection error: {e}")
                 await asyncio.sleep(2.0)
 
 
@@ -206,20 +216,27 @@ class PolymarketBookStream:
         self._books: dict[str, dict] = {}  # token_id -> {bid, ask, bid_size, ask_size, updated_at}
         self._lock = threading.Lock()
         self._assets: set[str] = set()
-        self._stop = False
         self._thread: threading.Thread | None = None
+        self._task: asyncio.Task | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._ws = None
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
             return
+        if self._task and not self._task.done():
+            return
         self._stop = False
-        self._thread = threading.Thread(target=self._run_loop, daemon=True, name="clob-ws")
-        self._thread.start()
+        try:
+            self._task = asyncio.create_task(self._run())
+        except RuntimeError:
+            self._thread = threading.Thread(target=self._run_loop, daemon=True, name="clob-ws")
+            self._thread.start()
 
     def stop(self) -> None:
         self._stop = True
+        if self._task:
+            self._task.cancel()
 
     def watch(self, *token_ids: str) -> None:
         """Subscribe to token IDs."""
@@ -228,9 +245,12 @@ class PolymarketBookStream:
             diff = new_ids - self._assets
             self._assets.update(new_ids)
             full_list = sorted(self._assets)
-        if diff and self._loop and self._ws:
+        if diff and self._ws:
             try:
-                asyncio.run_coroutine_threadsafe(self._send_subscribe(self._ws, full_list), self._loop)
+                if self._loop and self._loop != asyncio.get_event_loop():
+                    asyncio.run_coroutine_threadsafe(self._send_subscribe(self._ws, full_list), self._loop)
+                else:
+                    asyncio.create_task(self._send_subscribe(self._ws, full_list))
             except Exception:
                 pass
 

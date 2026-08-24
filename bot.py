@@ -78,8 +78,11 @@ class TWAPBot:
         self.cl_stream.start()
         self.book_stream.start()
 
-        if not self.cl_stream.wait_ready(timeout=15.0):
-            logger.warning("Chainlink RTDS stream warming up slowly...")
+        # Non-blocking async wait for stream ready
+        for _ in range(30):
+            if self.cl_stream.ready:
+                break
+            await asyncio.sleep(0.5)
 
         spot = self.cl_stream.price()
         logger.info(f"Chainlink BTC Spot: ${spot:,.2f} | Clock Offset: {self.cl_stream.clock_offset_s():+.2f}s")
