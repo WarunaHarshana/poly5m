@@ -393,6 +393,27 @@ class BookFeed:
             return BookSide(b.best_bid, b.best_ask, b.bid_size, b.ask_size,
                             b.updated_at) if b else None
 
+    def get_top(self, token_id: str, max_age_s: float | None = None) -> dict | None:
+        """Return top of book dict {bid, ask, spread, bid_size, ask_size, age_s} or None."""
+        limit = self.max_age_s if max_age_s is None else max_age_s
+        now = time.time()
+        with self._lock:
+            b = self._books.get(token_id)
+            if not b:
+                return None
+            age = now - b.updated_at
+            if limit > 0 and age > limit:
+                return None
+            spread = round(b.best_ask - b.best_bid, 4) if (b.best_ask is not None and b.best_bid is not None) else None
+            return {
+                "bid": b.best_bid,
+                "ask": b.best_ask,
+                "spread": spread,
+                "bid_size": b.bid_size,
+                "ask_size": b.ask_size,
+                "age_s": age,
+            }
+
     def pair(self, up_token: str, down_token: str,
              max_age_s: float | None = None) -> PairQuote | None:
         """Both sides from ONE instant, or None if either is missing/stale.

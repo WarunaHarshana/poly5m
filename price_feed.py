@@ -45,6 +45,10 @@ class SimulatedPriceFeed:
     def recent(self, n: int) -> list[float]:
         return list(self.history)[-n:]
 
+    def compute_realized_twap(self, start_ts: float, end_ts: float | None = None) -> tuple[float | None, float]:
+        elapsed = (float(end_ts) if end_ts is not None else time.time()) - float(start_ts)
+        return self.p, max(0.0, elapsed)
+
 
 class ChainlinkDataStream:
     """Live Chainlink BTC/USD via Polymarket Real-Time Data Socket (RTDS).
@@ -218,6 +222,59 @@ class ChainlinkDataStream:
             return None
         daily = math.sqrt(max(v_sec, 0.0) * 86400.0)
         return max(0.01, min(0.15, daily))
+
+    def compute_realized_twap(self, start_ts: float, end_ts: float | None = None) -> tuple[float | None, float]:
+        """Compute the time-weighted average price (TWAP) between start_ts and end_ts.
+        
+        Returns (twap_price, elapsed_seconds).
+        Uses trapezoidal time integration across timestamped ticks.
+        """
+        now = self.market_now() if self.ready else time.time()
+        t_end = float(end_ts) if end_ts is not None else now
+        t_start = float(start_ts)
+        elapsed = max(0.0, t_end - t_start)
+        if elapsed <= 0.0:
+            with self._lock:
+                return self._latest, 0.0
+
+        ticks = self.ticks_since(t_start - 5.0)
+        pts: list[tuple[float, float]] = []
+        with self._lock:
+            for ts, px in ticks:
+                if ts <= t_end:
+                    pts.append((ts, px))
+        
+        if not pts:
+            with self._lock:
+                return self._latest, elapsed
+
+        # If first point is after start_ts, anchor with first point's price at start_ts
+        first_ts, first_px = pts[0]
+        integrated_pts: list[tuple[float, float]] = []
+        if first_ts > t_start:
+            integrated_pts.append((t_start, first_px))
+        
+        for ts, px in pts:
+            if ts >= t_start:
+                integrated_pts.append((ts, px))
+
+        # If last point is before t_end, extend with last point's price to t_end
+        last_ts, last_px = integrated_pts[-1]
+        if last_ts < t_end:
+            integrated_pts.append((t_end, last_px))
+
+        if len(integrated_pts) < 2:
+            return integrated_pts[0][1], elapsed
+
+        # Trapezoidal area summation
+        area = 0.0
+        for (t0, p0), (t1, p1) in zip(integrated_pts, integrated_pts[1:]):
+            dt = t1 - t0
+            if dt > 0:
+                area += 0.5 * (p0 + p1) * dt
+
+        twap = area / elapsed
+        return float(twap), elapsed
 
     def _record(self, ts_s: float, value: float) -> None:
         local = time.time()
@@ -516,6 +573,14 @@ class LivePriceFeed:
         if self.stream is not None:
             return self.stream.realized_vol_daily_since(unix_ts)
         return None
+
+    def compute_realized_twap(self, start_ts: float, end_ts: float | None = None) -> tuple[float | None, float]:
+        """Return realized TWAP and elapsed seconds since start_ts."""
+        if self.stream is not None:
+            return self.stream.compute_realized_twap(start_ts, end_ts)
+        p = self.price()
+        elapsed = (float(end_ts) if end_ts is not None else time.time()) - float(start_ts)
+        return p, max(0.0, elapsed)
 
     def get_slot_start_price(self, slot_start_ts: int) -> float | None:
         """Price at the beginning of the slot window (Polymarket strike).

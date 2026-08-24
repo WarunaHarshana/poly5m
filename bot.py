@@ -32,7 +32,7 @@ from price_feed import LivePriceFeed, ChainlinkDataStream
 from risk import RiskManager
 from executor import PaperExecutor, Trade, stamp_trade_times
 from decision_journal import log_decision
-from pricing_model import DiffusionPricingModel, classify_session, calculate_regime_multiplier
+from pricing_model import DiffusionPricingModel, TWAPPricingModel, classify_session, calculate_regime_multiplier
 
 # Parallel timeframe instances MUST NOT share state files or they overwrite
 # each other's trades/stats. STATE_SUBDIR (or --timeframe on a non-5m run)
@@ -781,7 +781,59 @@ def _quote_side(pub, market, side: str) -> dict | None:
         return None
 
 
+def _scan_sum_to_one_arb(pub, market, book_feed_client=None):
+    """Scan market for sum-to-one arbitrage (ask_up + ask_down < 1.0 - min_edge)."""
+    tokens = market.get("tokens", {})
+    up_id = tokens.get("UP")
+    dn_id = tokens.get("DOWN")
+    if not up_id or not dn_id:
+        return None
 
+    pair = None
+    if book_feed_client is not None:
+        try:
+            pair = book_feed_client.pair(up_id, dn_id)
+        except Exception:
+            pair = None
+
+    if pair is not None:
+        ask_up = pair.ask_up
+        ask_down = pair.ask_down
+        bid_up = pair.bid_up
+        bid_down = pair.bid_down
+        up_size = pair.size_up
+        down_size = pair.size_down
+        src = f"ws ({pair.age_s:.2f}s)"
+    else:
+        q_up = _quote_side(pub, market, "UP")
+        q_down = _quote_side(pub, market, "DOWN")
+        if not q_up or not q_down:
+            return None
+        ask_up = float(q_up["price"])
+        ask_down = float(q_down["price"])
+        bid_up = q_up.get("best_bid")
+        bid_down = q_up.get("best_bid")
+        up_size = float(q_up.get("ask_size", 0) or 0)
+        down_size = float(q_up.get("ask_size", 0) or 0)
+        src = "rest"
+
+    cost = ask_up + ask_down
+    raw_edge = 1.0 - cost
+    min_edge = float(getattr(config, "ARB_MIN_EDGE", 0.02))
+    if raw_edge < min_edge:
+        return None
+
+    return {
+        "src": src,
+        "sum": cost,
+        "raw_edge": raw_edge,
+        "ask_up": ask_up,
+        "ask_down": ask_down,
+        "bid_up": bid_up,
+        "bid_down": bid_down,
+        "up_size": up_size,
+        "down_size": down_size,
+    }
 
 
 def _journal(session_id: str, mode: str, strategy: str, **kw):
@@ -1328,11 +1380,21 @@ async def run_realtime(rounds: int = 100, paper: bool = True,
 
         utc_hour = int(time.strftime("%H", time.gmtime(_now(cl_stream))))
 
+        realized_twap = None
+        elapsed_s = None
+        if slot_start_time and hasattr(feed, "compute_realized_twap"):
+            try:
+                realized_twap, elapsed_s = feed.compute_realized_twap(slot_start_time)
+            except Exception:
+                realized_twap = spot
+
         signal = diffusion_model.evaluate(
             spot=spot,
             strike=strike,
             remaining_s=remaining or 10.0,
             ask=ask,
+            realized_twap=realized_twap,
+            elapsed_s=elapsed_s,
             chop_crosses=chop_crosses,
             realized_vol_daily=realized_vol,
             var_per_sec=var_sec,
