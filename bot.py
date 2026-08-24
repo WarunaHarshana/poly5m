@@ -1242,8 +1242,11 @@ async def run_realtime(rounds: int = 100, paper: bool = True,
     async def _try_momentum(market, question, end_ts, remaining, verbose: bool = True):
         """Evaluate and execute regime-conditioned terminal diffusion momentum (H-001 - H-005)."""
         nonlocal momentum_done_end_ts, placed
+        nonlocal momentum_done_end_ts
         if end_ts is None:
             return False
+        if end_ts and momentum_done_end_ts == end_ts:
+            return True
 
         slot_start_time = (end_ts - config.SLOT_SECONDS) if end_ts else None
         strike = None
@@ -1480,7 +1483,12 @@ async def run_realtime(rounds: int = 100, paper: bool = True,
                     shares,
                     cond_id,
                 )
-                if not order_res or not order_res.get("order_id"):
+                order_id = ""
+                if isinstance(order_res, dict):
+                    order_id = (order_res.get("orderID") or order_res.get("order_id") or
+                                (order_res.get("order") or {}).get("id") or "")
+                success = bool(order_res.get("success") or order_id) if isinstance(order_res, dict) else False
+                if not success:
                     print(f"  [diffusion/live] order placement failed: {order_res}")
                     return False
             except Exception as e:
