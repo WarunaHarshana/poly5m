@@ -187,7 +187,8 @@ class DiffusionPricingModel:
                 strike_verified=strike_verified,
             )
 
-        fee = ask * fee_rate if fee_rate > 0 else 0.0
+        # Polymarket crypto feeSchedule: fee = rate * price * (1 - price)
+        fee = (fee_rate * ask * (1.0 - ask)) if fee_rate > 0 else 0.0
         edge = model_prob - ask
         edge_net = edge - fee
 
