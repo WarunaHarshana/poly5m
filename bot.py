@@ -98,6 +98,7 @@ class TWAPBot:
                 # Discover new slot if needed
                 if active_slot_ts != current_window:
                     active_slot_ts = current_window
+                    slot_strike = None
                     current_market = self.pub_client.find_active_5m_slot(now_ts=now)
                     if current_market:
                         logger.info(f"\n[SLOT {active_slot_ts}] Discovered market: {current_market['slug']}")
@@ -117,11 +118,13 @@ class TWAPBot:
                 remaining_s = max(0.0, end_ts - now)
                 elapsed_s = max(0.0, now - slot_start_ts)
 
-                # Latch slot strike S_0
-                strike = self.cl_stream.get_slot_strike(slot_start_ts)
-                if strike is None:
-                    strike = self.cl_stream.price()
+                # Latch slot strike S_0 once at or near slot open
+                if slot_strike is None or slot_strike <= 0:
+                    slot_strike = self.cl_stream.get_slot_strike(slot_start_ts)
+                    if slot_strike is None or slot_strike <= 0:
+                        slot_strike = self.cl_stream.price()
 
+                strike = slot_strike
                 spot = self.cl_stream.price()
                 realized_twap, _ = self.cl_stream.compute_realized_twap(start_ts=slot_start_ts, end_ts=now)
                 chop = self.cl_stream.strike_crossings_since(slot_start_ts, strike)

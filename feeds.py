@@ -169,16 +169,10 @@ class ChainlinkRTDSStream:
                         }],
                     }
                     await ws.send(json.dumps(sub))
-                    while not self._stop:
-                        try:
-                            raw = await asyncio.wait_for(ws.recv(), timeout=3.0)
-                        except asyncio.TimeoutError:
-                            try:
-                                await ws.send("PING")
-                            except Exception:
-                                break
-                            continue
-                        if not raw or raw in ("PONG", "pong"):
+                    async for raw in ws:
+                        if self._stop:
+                            break
+                        if not raw or not raw.strip() or raw in ("PONG", "pong"):
                             continue
                         try:
                             msg = json.loads(raw)
