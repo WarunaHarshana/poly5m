@@ -124,19 +124,24 @@ class ChainlinkRTDSStream:
             realized_twap = integral / elapsed if elapsed > 0 else pts[-1][1]
             return realized_twap, elapsed
 
-    def strike_crossings_since(self, start_ts: float, strike: float) -> int:
-        """Count the number of times spot crossed strike since start_ts."""
+    def strike_crossings_since(self, start_ts: float, strike: float, noise_buffer_usd: float = 3.0) -> int:
+        """Count the number of times spot significantly crossed strike since start_ts, filtering noise."""
         with self._lock:
             ticks = [p for ts, p in self._history if ts >= start_ts]
         if len(ticks) < 2 or strike <= 0:
             return 0
         crossings = 0
-        prev_side = ticks[0] >= strike
-        for p in ticks[1:]:
-            side = p >= strike
-            if side != prev_side:
+        current_regime = None
+        for p in ticks:
+            if p >= strike + noise_buffer_usd:
+                new_regime = 1
+            elif p <= strike - noise_buffer_usd:
+                new_regime = -1
+            else:
+                new_regime = current_regime
+            if current_regime is not None and new_regime != current_regime:
                 crossings += 1
-                prev_side = side
+            current_regime = new_regime
         return crossings
 
     def is_stale(self, max_age_s: float = 6.0) -> bool:

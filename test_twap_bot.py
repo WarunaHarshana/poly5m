@@ -79,8 +79,8 @@ def test_gatekeeper_conditions():
 
     # High chop market (rejected by chop filter)
     sig_chop = engine.evaluate(
-        spot=65040.0, strike=65000.0, remaining_s=90.0, elapsed_s=210.0,
-        realized_twap=65030.0, ask=0.75, chop_crosses=5
+        spot=65008.0, strike=65000.0, remaining_s=90.0, elapsed_s=210.0,
+        realized_twap=65008.0, ask=0.75, chop_crosses=5
     )
     assert sig_chop.passed_gates is False
     assert "chop" in sig_chop.skip_reason

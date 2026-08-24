@@ -169,7 +169,7 @@ class TWAPEngine:
             passed = False
             skip_reasons.append(f"Z-score {abs_z:.2f} < threshold {self.min_z:.2f}")
 
-        if chop_crosses > self.max_chop_crosses:
+        if chop_crosses > self.max_chop_crosses and abs_z < 2.5:
             passed = False
             skip_reasons.append(f"chop crosses {chop_crosses} > max {self.max_chop_crosses}")
 
