@@ -177,9 +177,7 @@ class ChainlinkRTDSStream:
                             continue
                         if not isinstance(msg, dict):
                             continue
-                        if msg.get("topic") != "crypto_prices_chainlink":
-                            continue
-                        payload = msg.get("payload") or msg.get("data") or {}
+                        payload = msg.get("payload") or msg.get("data") or (msg if "symbol" in msg else {})
                         sym = str(payload.get("symbol") or "").lower()
                         if sym not in (self.symbol, f"{self.asset}-usd", f"{self.asset}usd"):
                             continue
