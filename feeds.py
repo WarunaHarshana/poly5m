@@ -143,27 +143,58 @@ class ChainlinkRTDSStream:
         import websockets
         while not self._stop:
             try:
-                async with websockets.connect(self.url, ping_interval=10, ping_timeout=5) as ws:
-                    sub_msg = {"action": "subscribe", "topics": ["crypto_prices_chainlink"]}
-                    await ws.send(json.dumps(sub_msg))
-                    async for raw in ws:
-                        if self._stop:
-                            break
+                async with websockets.connect(
+                    self.url,
+                    ping_interval=20,
+                    ping_timeout=10,
+                    open_timeout=12,
+                    close_timeout=2,
+                    max_size=2**20,
+                ) as ws:
+                    sub = {
+                        "action": "subscribe",
+                        "subscriptions": [{
+                            "topic": "crypto_prices_chainlink",
+                            "type": "*",
+                            "filters": "",
+                        }],
+                    }
+                    await ws.send(json.dumps(sub))
+                    while not self._stop:
+                        try:
+                            raw = await asyncio.wait_for(ws.recv(), timeout=3.0)
+                        except asyncio.TimeoutError:
+                            try:
+                                await ws.send("PING")
+                            except Exception:
+                                break
+                            continue
+                        if not raw or raw in ("PONG", "pong"):
+                            continue
                         try:
                             msg = json.loads(raw)
-                            topic = msg.get("topic")
-                            if topic == "crypto_prices_chainlink":
-                                data = msg.get("data") or {}
-                                sym = str(data.get("symbol", "")).lower()
-                                if sym == self.symbol:
-                                    p = float(data.get("price", 0))
-                                    t_ms = float(data.get("timestamp", time.time() * 1000))
-                                    t_s = t_ms / 1000.0 if t_ms > 1e11 else t_ms
-                                    self._stream_clock_offset = t_s - time.time()
-                                    if p > 0:
-                                        self._record(t_s, p)
                         except Exception:
                             continue
+                        if not isinstance(msg, dict):
+                            continue
+                        if msg.get("topic") != "crypto_prices_chainlink":
+                            continue
+                        payload = msg.get("payload") or msg.get("data") or {}
+                        sym = str(payload.get("symbol") or "").lower()
+                        if sym not in (self.symbol, f"{self.asset}-usd", f"{self.asset}usd"):
+                            continue
+                        try:
+                            value = float(payload.get("value") if payload.get("value") is not None else payload.get("price"))
+                        except (TypeError, ValueError):
+                            continue
+                        ts_ms = payload.get("timestamp") or msg.get("timestamp")
+                        try:
+                            ts_s = float(ts_ms) / 1000.0 if float(ts_ms) > 1e11 else float(ts_ms)
+                        except (TypeError, ValueError):
+                            ts_s = time.time()
+                        self._stream_clock_offset = ts_s - time.time()
+                        if value > 0:
+                            self._record(ts_s, value)
             except Exception:
                 await asyncio.sleep(2.0)
 
