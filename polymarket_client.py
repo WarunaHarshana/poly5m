@@ -658,19 +658,10 @@ class PolymarketClient:
                 config.SIGNATURE_TYPE = 0
             return 0, eoa
 
-        # funder != EOA → deposit / site proxy
-        if sig == 2:
-            return 2, eoa  # explicit Gnosis Safe
-        if sig != 3:
-            if not getattr(cls, "_sig_warn_printed", False):
-                print(f"  [auth] funder != key address - using SIGNATURE_TYPE=3 "
-                      f"(POLY_1271 deposit wallet); was {sig}")
-                print(f"         EOA={eoa}  funder={funder}")
-                print("         (type 1 returns $0 collateral for most site proxies)")
-                cls._sig_warn_printed = True
-            sig = 3
-            config.SIGNATURE_TYPE = 3
-        return 3, eoa
+        # funder != EOA → deposit / site proxy (POLY_PROXY=1, GNOSIS_SAFE=2, POLY_1271=3)
+        if sig in (1, 2, 3):
+            return int(sig), eoa
+        return 1, eoa
 
     def _client(self):
         if self._use_shared:
