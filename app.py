@@ -1741,11 +1741,25 @@ function render(stats, trades, status) {
   }
 }
 
+/* ===== TOKEN PERSISTENCE & FETCHER ===== */
+const urlParams = new URLSearchParams(window.location.search);
+let dashToken = urlParams.get('token') || localStorage.getItem('pm_dash_token') || '';
+if (urlParams.get('token')) {
+  localStorage.setItem('pm_dash_token', urlParams.get('token'));
+}
+
+function authFetch(url, opts = {}) {
+  const sep = url.includes('?') ? '&' : '?';
+  const finalUrl = dashToken ? `${url}${sep}token=${encodeURIComponent(dashToken)}` : url;
+  const headers = { ...(opts.headers || {}), ...(dashToken ? { 'X-Dash-Token': dashToken } : {}) };
+  return fetch(finalUrl, { ...opts, headers });
+}
+
 /* ===== LOG STREAM POLLER ===== */
 let prevLogLength = 0;
 async function fetchLogs() {
   try {
-    const res = await fetch('/api/logs?tf=' + document.getElementById('ctl-tf').value, { cache: 'no-store' });
+    const res = await authFetch('/api/logs?tf=' + document.getElementById('ctl-tf').value, { cache: 'no-store' });
     if (res.ok) {
       const text = await res.text();
       const el = document.getElementById('console-logs');
@@ -1763,10 +1777,10 @@ async function pollState() {
   const tf = document.getElementById('ctl-tf').value;
   try {
     const [stRes, trRes, staRes, ctlRes] = await Promise.all([
-      fetch(`/state/status.json?tf=${tf}&_=${Date.now()}`).then(r => r.ok ? r.json() : {}),
-      fetch(`/state/trades.json?tf=${tf}&_=${Date.now()}`).then(r => r.ok ? r.json() : []),
-      fetch(`/state/stats.json?tf=${tf}&_=${Date.now()}`).then(r => r.ok ? r.json() : {}),
-      fetch(`/api/control?tf=${tf}&_=${Date.now()}`).then(r => r.ok ? r.json() : {}),
+      authFetch(`/state/status.json?tf=${tf}&_=${Date.now()}`).then(r => r.ok ? r.json() : {}),
+      authFetch(`/state/trades.json?tf=${tf}&_=${Date.now()}`).then(r => r.ok ? r.json() : []),
+      authFetch(`/state/stats.json?tf=${tf}&_=${Date.now()}`).then(r => r.ok ? r.json() : {}),
+      authFetch(`/api/control?tf=${tf}&_=${Date.now()}`).then(r => r.ok ? r.json() : {}),
     ]);
 
     render(staRes, trRes, stRes);
@@ -1796,7 +1810,7 @@ document.getElementById('btn-start').onclick = async () => {
   document.getElementById('bot-state-txt').textContent = 'STARTING…';
 
   try {
-    const res = await fetch('/api/start', {
+    const res = await authFetch('/api/start', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ mode, timeframe: tf, bet: stake, bankroll, reset, asset: 'btc' })
@@ -1814,7 +1828,7 @@ document.getElementById('btn-stop').onclick = async () => {
   document.getElementById('btn-stop').disabled = true;
   document.getElementById('bot-state-txt').textContent = 'STOPPING…';
   try {
-    await fetch('/api/stop', {
+    await authFetch('/api/stop', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ timeframe: tf })
@@ -1937,7 +1951,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if (q.get("token") or [None])[0]:
             self.send_header(
                 "Set-Cookie",
-                f"dash_token={DASH_TOKEN}; Path=/; HttpOnly; SameSite=Strict")
+                f"dash_token={DASH_TOKEN}; Path=/; HttpOnly; SameSite=Lax")
 
     def _json(self, obj, code=200):
         body = json.dumps(obj).encode()
