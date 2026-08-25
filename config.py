@@ -26,15 +26,15 @@ PRIVATE_KEY = os.getenv("PRIVATE_KEY", "").strip()
 FUNDER_ADDRESS = os.getenv("FUNDER_ADDRESS", "").strip()
 SIGNATURE_TYPE = int(os.getenv("SIGNATURE_TYPE", "3"))  # 3 = Polymarket Proxy Wallet
 
-# --- H-001 TWAP Pricing Model Parameters ---
-MIN_Z_SCORE = float(os.getenv("MIN_Z_SCORE", "1.8"))
+# --- H-001 TWAP Pricing Model Parameters (Active Quant Profile) ---
+MIN_Z_SCORE = float(os.getenv("MIN_Z_SCORE", "1.35"))
 ALPHA = float(os.getenv("ALPHA", "1.75"))
 MIN_SIGMA_USD = float(os.getenv("MIN_SIGMA_USD", "2.0"))
 MAX_CHOP_CROSSES = int(os.getenv("MAX_CHOP_CROSSES", "3"))
-MIN_EDGE = float(os.getenv("MIN_EDGE", "0.03"))
+MIN_EDGE = float(os.getenv("MIN_EDGE", "0.015"))
 MIN_ENTRY_PRICE = float(os.getenv("MIN_ENTRY_PRICE", "0.50"))
-MAX_ENTRY_PRICE = float(os.getenv("MAX_ENTRY_PRICE", "0.95"))
-EVAL_WINDOW_START_S = float(os.getenv("EVAL_WINDOW_START_S", "180.0"))  # start evaluating at tau <= 180s
+MAX_ENTRY_PRICE = float(os.getenv("MAX_ENTRY_PRICE", "0.96"))
+EVAL_WINDOW_START_S = float(os.getenv("EVAL_WINDOW_START_S", "220.0"))  # start evaluating at tau <= 220s
 EVAL_WINDOW_END_S = float(os.getenv("EVAL_WINDOW_END_S", "10.0"))      # stop evaluating at tau < 10s
 TAKER_FEE_RATE = float(os.getenv("TAKER_FEE_RATE", "0.07"))
 
@@ -42,8 +42,8 @@ TAKER_FEE_RATE = float(os.getenv("TAKER_FEE_RATE", "0.07"))
 STARTING_BANKROLL = float(os.getenv("STARTING_BANKROLL", "50.0"))
 BASE_STAKE_USD = float(os.getenv("BASE_STAKE_USD", "5.0"))
 MAX_STAKE_USD = float(os.getenv("MAX_STAKE_USD", "10.0"))
-DAILY_LOSS_LIMIT_USD = float(os.getenv("DAILY_LOSS_LIMIT_USD", "10.0"))
-MAX_CONSECUTIVE_LOSSES = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "3"))
+DAILY_LOSS_LIMIT_USD = float(os.getenv("DAILY_LOSS_LIMIT_USD", "15.0"))
+MAX_CONSECUTIVE_LOSSES = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "4"))
 MIN_ORDER_SHARES = float(os.getenv("MIN_ORDER_SHARES", "5.0"))
 
 # --- State Directory ---
