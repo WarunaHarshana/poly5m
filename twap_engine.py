@@ -17,7 +17,7 @@ from dataclasses import dataclass
 
 @dataclass(slots=True)
 class TWAPSignal:
-    """Evaluation result from the TWAP Pricing Model."""
+    """Evaluation result from the TWAP Pricing Model (Taker)."""
     side: str                        # 'UP', 'DOWN', or 'FLAT'
     z_score: float                   # Standardized TWAP Z-score magnitude
     signed_z: float                  # Signed Z (+ for UP, - for DOWN)
@@ -37,18 +37,44 @@ class TWAPSignal:
     skip_reason: str = ""            # Explanation if passed_gates is False
 
 
+@dataclass(slots=True)
+class MakerSignal:
+    """Evaluation result from the H-004 Passive Maker Limit Engine."""
+    side: str                        # 'UP' or 'DOWN'
+    z_score: float                   # Standardized TWAP Z-score magnitude
+    signed_z: float                  # Signed Z (+ for UP, - for DOWN)
+    model_prob: float                # Theoretical Fair Value P in [0.5, 1.0)
+    target_bid: float                # Optimal resting limit bid price
+    best_bid: float | None           # Current CLOB top bid
+    best_ask: float | None           # Current CLOB top ask
+    maker_rebate: float              # 20% fee rebate on taker volume
+    edge_net: float                  # Net maker edge: model_prob - target_bid + rebate
+    s_req: float                     # Required remaining average spot price
+    s_0: float                       # Slot strike (price at t=0)
+    spot: float                      # Current BTC spot price
+    realized_twap: float             # Realized TWAP over elapsed time
+    elapsed_s: float                 # Elapsed seconds in slot
+    remaining_s: float               # Remaining seconds in slot (tau)
+    sigma_twap_usd: float            # Dispersion of remaining TWAP in USD
+    passed_gates: bool               # True if all maker entry conditions satisfied
+    skip_reason: str = ""            # Explanation if passed_gates is False
+
+
 class TWAPEngine:
-    """Pure analytical engine for the H-001 TWAP Mispricing Strategy."""
+    """Analytical engine for TWAP Mispricing and Passive Maker Limit Trading."""
 
     def __init__(
         self,
         alpha: float = 1.75,
         min_sigma_usd: float = 2.0,
-        min_z: float = 1.8,
-        min_edge: float = 0.03,
+        min_z: float = 1.15,
+        min_edge: float = 0.05,
         min_entry: float = 0.50,
         max_entry: float = 0.95,
-        max_chop_crosses: int = 3,
+        min_maker_bid: float = 0.55,
+        max_maker_bid: float = 0.90,
+        min_maker_edge: float = 0.05,
+        max_chop_crosses: int = 2,
         default_daily_vol: float = 0.0106,
     ):
         self.alpha = float(alpha)
@@ -57,6 +83,9 @@ class TWAPEngine:
         self.min_edge = float(min_edge)
         self.min_entry = float(min_entry)
         self.max_entry = float(max_entry)
+        self.min_maker_bid = float(min_maker_bid)
+        self.max_maker_bid = float(max_maker_bid)
+        self.min_maker_edge = float(min_maker_edge)
         self.max_chop_crosses = int(max_chop_crosses)
         self.default_daily_vol = float(default_daily_vol)
 
@@ -194,6 +223,111 @@ class TWAPEngine:
             ask=ask,
             edge_gross=edge_gross,
             fee_taker=fee_taker,
+            edge_net=edge_net,
+            s_req=s_req,
+            s_0=strike,
+            spot=spot,
+            realized_twap=realized_twap,
+            elapsed_s=elapsed_s,
+            remaining_s=remaining_s,
+            sigma_twap_usd=sigma_twap,
+            passed_gates=passed,
+            skip_reason="; ".join(skip_reasons),
+        )
+
+    @staticmethod
+    def calculate_maker_rebate(price: float, fee_rate: float = 0.07, rebate_share: float = 0.20) -> float:
+        """Polymarket crypto maker rebate: rebate = rebate_share * (fee_rate * p * (1 - p))."""
+        p = max(0.0, min(1.0, float(price)))
+        return float(rebate_share) * float(fee_rate) * p * (1.0 - p)
+
+    def evaluate_maker(
+        self,
+        spot: float,
+        strike: float,
+        remaining_s: float,
+        elapsed_s: float,
+        realized_twap: float,
+        best_bid: float | None = None,
+        best_ask: float | None = None,
+        chop_crosses: int = 0,
+        realized_vol_daily: float | None = None,
+        var_per_sec: float | None = None,
+        fee_rate: float = 0.07,
+    ) -> MakerSignal:
+        """Evaluate and price optimal resting limit bid for H-004 Passive Maker Strategy."""
+        sigma_twap = self.estimate_sigma_twap_usd(
+            spot=spot,
+            remaining_s=remaining_s,
+            realized_vol_daily=realized_vol_daily,
+            var_per_sec=var_per_sec,
+        )
+
+        abs_z, signed_z, s_req = self.compute_s_req_and_z(
+            spot=spot,
+            strike=strike,
+            realized_twap=realized_twap,
+            elapsed_s=elapsed_s,
+            remaining_s=remaining_s,
+            sigma_twap_usd=sigma_twap,
+        )
+
+        model_prob = self.calibrated_probability(abs_z)
+        side = "UP" if signed_z >= 0 else "DOWN"
+
+        # --- Calculate Optimal Limit Bid Price ---
+        # 1. Target maximum price is Fair Value minus minimum required maker margin
+        max_allowed_bid = min(self.max_maker_bid, model_prob - self.min_maker_edge)
+
+        # 2. To get queue priority, step 1 tick above current top bid if profitable
+        if best_bid is not None and 0.0 < best_bid < 1.0:
+            target_bid = round(best_bid + 0.01, 2)
+        else:
+            # If no bids on book, quote at attractive discount to fair value
+            target_bid = round(max(self.min_maker_bid, model_prob - 0.08), 2)
+
+        # 3. Apply bounds: must not cross ask, must not exceed max_allowed_bid, must be >= min_maker_bid
+        if best_ask is not None and best_ask > 0:
+            target_bid = min(target_bid, round(best_ask - 0.01, 2))
+        
+        target_bid = min(target_bid, round(max_allowed_bid, 2))
+        target_bid = max(target_bid, self.min_maker_bid)
+
+        # Maker rebate and net edge
+        maker_rebate = self.calculate_maker_rebate(target_bid, fee_rate=fee_rate)
+        edge_net = (model_prob - target_bid) + maker_rebate
+
+        # --- Decision Gatekeeper for Maker ---
+        passed = True
+        skip_reasons = []
+
+        if abs_z < self.min_z:
+            passed = False
+            skip_reasons.append(f"Z-score {abs_z:.2f} < threshold {self.min_z:.2f}")
+
+        if chop_crosses > self.max_chop_crosses and abs_z < 2.5:
+            passed = False
+            skip_reasons.append(f"chop crosses {chop_crosses} > max {self.max_chop_crosses}")
+
+        if target_bid < self.min_maker_bid:
+            passed = False
+            skip_reasons.append(f"bid {target_bid:.2f} < min maker bid {self.min_maker_bid:.2f}")
+        elif target_bid > self.max_maker_bid:
+            passed = False
+            skip_reasons.append(f"bid {target_bid:.2f} > max maker bid {self.max_maker_bid:.2f}")
+        elif edge_net < self.min_maker_edge:
+            passed = False
+            skip_reasons.append(f"maker edge {edge_net:+.3f} < required {self.min_maker_edge:+.3f}")
+
+        return MakerSignal(
+            side=side,
+            z_score=abs_z,
+            signed_z=signed_z,
+            model_prob=model_prob,
+            target_bid=target_bid,
+            best_bid=best_bid,
+            best_ask=best_ask,
+            maker_rebate=maker_rebate,
             edge_net=edge_net,
             s_req=s_req,
             s_0=strike,

@@ -26,17 +26,21 @@ PRIVATE_KEY = os.getenv("PRIVATE_KEY", "").strip()
 FUNDER_ADDRESS = os.getenv("FUNDER_ADDRESS", "").strip()
 SIGNATURE_TYPE = int(os.getenv("SIGNATURE_TYPE", "3"))  # 3 = Polymarket Proxy Wallet
 
-# --- H-003 Early-Round Mispricing Parameters (t in [30s, 120s]) ---
-MIN_Z_SCORE = float(os.getenv("MIN_Z_SCORE", "1.10"))
+# --- Strategy Selection ---
+STRATEGY = os.getenv("STRATEGY", "H-004_MAKER").strip().upper()
+
+# --- H-004 Passive Maker Limit Model Parameters ---
+MIN_Z_SCORE = float(os.getenv("MIN_Z_SCORE", "1.15"))
 ALPHA = float(os.getenv("ALPHA", "1.75"))
 MIN_SIGMA_USD = float(os.getenv("MIN_SIGMA_USD", "2.0"))
 MAX_CHOP_CROSSES = int(os.getenv("MAX_CHOP_CROSSES", "2"))
-MIN_EDGE = float(os.getenv("MIN_EDGE", "0.05"))          # Minimum +5.0% net expected edge
-MIN_ENTRY_PRICE = float(os.getenv("MIN_ENTRY_PRICE", "0.50"))
-MAX_ENTRY_PRICE = float(os.getenv("MAX_ENTRY_PRICE", "0.78")) # Cap at $0.78 for +28% to +100% payout ROI
-EVAL_WINDOW_START_S = float(os.getenv("EVAL_WINDOW_START_S", "270.0"))  # Start at t=30s (270s left)
-EVAL_WINDOW_END_S = float(os.getenv("EVAL_WINDOW_END_S", "180.0"))      # Stop at t=120s (180s left) before $0.99 MM repricing
+MIN_MAKER_EDGE = float(os.getenv("MIN_MAKER_EDGE", "0.05"))      # Minimum +5.0% expected net edge
+MIN_MAKER_BID = float(os.getenv("MIN_MAKER_BID", "0.55"))        # Floor resting bid price at $0.55
+MAX_MAKER_BID = float(os.getenv("MAX_MAKER_BID", "0.90"))        # Cap resting bid price at $0.90 (+11% to +81% ROI)
+EVAL_WINDOW_START_S = float(os.getenv("EVAL_WINDOW_START_S", "270.0"))  # Start quoting at t=30s (270s left)
+EVAL_WINDOW_END_S = float(os.getenv("EVAL_WINDOW_END_S", "15.0"))      # Stop quoting at t=285s (15s left)
 TAKER_FEE_RATE = float(os.getenv("TAKER_FEE_RATE", "0.07"))
+MAKER_REBATE_SHARE = float(os.getenv("MAKER_REBATE_SHARE", "0.20"))
 
 # --- Risk & Sizing Parameters ---
 STARTING_BANKROLL = float(os.getenv("STARTING_BANKROLL", "50.0"))

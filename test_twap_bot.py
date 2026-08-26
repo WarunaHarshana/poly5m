@@ -117,11 +117,42 @@ def test_risk_manager():
     print("[PASS] test_risk_manager")
 
 
+def test_maker_gatekeeper_and_pricing():
+    engine = TWAPEngine(
+        min_z=1.15,
+        min_maker_edge=0.05,
+        min_maker_bid=0.55,
+        max_maker_bid=0.90,
+    )
+
+    # Valid Maker UP Signal
+    sig_maker = engine.evaluate_maker(
+        spot=65035.0, strike=65000.0, remaining_s=150.0, elapsed_s=150.0,
+        realized_twap=65020.0, best_bid=0.78, best_ask=0.95, chop_crosses=0
+    )
+    assert sig_maker.passed_gates is True
+    assert sig_maker.side == "UP"
+    assert sig_maker.z_score >= 1.15
+    assert sig_maker.target_bid == 0.79  # 1 tick above best_bid (0.78 + 0.01)
+    assert sig_maker.edge_net > 0.05
+    assert sig_maker.maker_rebate > 0.0
+
+    # Flat market rejected by Z-score
+    sig_flat = engine.evaluate_maker(
+        spot=65002.0, strike=65000.0, remaining_s=200.0, elapsed_s=100.0,
+        realized_twap=65001.0, best_bid=0.50, best_ask=0.52, chop_crosses=0
+    )
+    assert sig_flat.passed_gates is False
+    assert "Z-score" in sig_flat.skip_reason
+    print("[PASS] test_maker_gatekeeper_and_pricing")
+
+
 def main():
     print("=== RUNNING TWAP BOT TEST SUITE ===")
     test_twap_cubic_variance()
     test_s_req_and_z_acceleration()
     test_gatekeeper_conditions()
+    test_maker_gatekeeper_and_pricing()
     test_trapezoidal_integration()
     test_risk_manager()
     print("=== ALL TESTS PASSED SUCCESSFULLY ===")
