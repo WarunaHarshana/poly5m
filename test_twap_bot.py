@@ -133,7 +133,7 @@ def test_maker_gatekeeper_and_pricing():
     assert sig_maker.passed_gates is True
     assert sig_maker.side == "UP"
     assert sig_maker.z_score >= 1.15
-    assert sig_maker.target_bid == 0.79  # 1 tick above best_bid (0.78 + 0.01)
+    assert sig_maker.target_bid == 0.90  # Fair value (0.96) - 0.05 capped at max_maker_bid 0.90
     assert sig_maker.edge_net > 0.05
     assert sig_maker.maker_rebate > 0.0
 

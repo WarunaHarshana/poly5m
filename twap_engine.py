@@ -275,16 +275,14 @@ class TWAPEngine:
         model_prob = self.calibrated_probability(abs_z)
         side = "UP" if signed_z >= 0 else "DOWN"
 
-        # --- Calculate Optimal Limit Bid Price ---
-        # 1. Target maximum price is Fair Value minus minimum required maker margin
+        # --- Calculate Dynamic Fair-Value Limit Bid Price ---
+        # 1. Target bid is pegged to Fair Value minus required maker margin (e.g. 0.92 - 0.06 = 0.86)
         max_allowed_bid = min(self.max_maker_bid, model_prob - self.min_maker_edge)
+        target_bid = round(model_prob - self.min_maker_edge, 2)
 
-        # 2. To get queue priority, step 1 tick above current top bid if profitable
-        if best_bid is not None and 0.0 < best_bid < 1.0:
-            target_bid = round(best_bid + 0.01, 2)
-        else:
-            # If no bids on book, quote at attractive discount to fair value
-            target_bid = round(max(self.min_maker_bid, model_prob - 0.08), 2)
+        # 2. If a competitive top bid exists, step 1 tick above it to gain priority
+        if best_bid is not None and 0.50 <= best_bid < max_allowed_bid:
+            target_bid = max(target_bid, round(best_bid + 0.01, 2))
 
         # 3. Apply bounds: must not cross ask, must not exceed max_allowed_bid, must be >= min_maker_bid
         if best_ask is not None and best_ask > 0:
