@@ -22,9 +22,9 @@ CLOB_HOST = os.getenv("CLOB_HOST", "https://clob.polymarket.com").strip()
 CHAIN_ID = int(os.getenv("CHAIN_ID", "137"))  # Polygon PoS
 
 # --- Polymarket Authentication (for MODE=live) ---
-PRIVATE_KEY = os.getenv("PRIVATE_KEY", "").strip()
-FUNDER_ADDRESS = os.getenv("FUNDER_ADDRESS", "").strip()
-SIGNATURE_TYPE = int(os.getenv("SIGNATURE_TYPE", "3"))  # 3 = Polymarket Proxy Wallet
+PRIVATE_KEY = os.getenv("PRIVATE_KEY", os.getenv("POLYMARKET_PRIVATE_KEY", "")).strip()
+FUNDER_ADDRESS = os.getenv("FUNDER_ADDRESS", os.getenv("POLYMARKET_FUNDER_ADDRESS", "")).strip()
+SIGNATURE_TYPE = int(os.getenv("SIGNATURE_TYPE", os.getenv("POLYMARKET_SIGNATURE_TYPE", "3")))  # 3 = Polymarket Proxy Wallet
 
 # --- Strategy Selection ---
 STRATEGY = os.getenv("STRATEGY", "H-004_MAKER").strip().upper()

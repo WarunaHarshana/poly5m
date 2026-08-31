@@ -104,8 +104,8 @@ class PolymarketLiveClient:
         except Exception as e:
             raise RuntimeError(f"Failed to initialize py_clob_client: {e}")
 
-    def place_order(self, token_id: str, side: str, price: float, size: float) -> dict:
-        """Place an order via CLOB API."""
+    def place_order(self, token_id: str, side: str, price: float, size: float, order_type: str = "GTC") -> dict:
+        """Place an order via CLOB API (GTC for resting maker, FOK for taker)."""
         from py_clob_client.clob_types import OrderArgs, OrderType
         order_args = OrderArgs(
             token_id=token_id,
@@ -114,5 +114,14 @@ class PolymarketLiveClient:
             side=side.upper(),
         )
         signed_order = self.client.create_order(order_args)
-        resp = self.client.post_order(signed_order, OrderType.FOK)
+        ot = OrderType.GTC if order_type.upper() == "GTC" else OrderType.FOK
+        resp = self.client.post_order(signed_order, ot)
         return resp
+
+    def cancel_order(self, order_id: str) -> dict:
+        """Cancel an open resting limit order."""
+        try:
+            return self.client.cancel(order_id)
+        except Exception as e:
+            logger.error(f"Error cancelling order {order_id}: {e}")
+            return {}
