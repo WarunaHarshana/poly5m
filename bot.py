@@ -192,11 +192,15 @@ class TWAPBot:
                 # 2. Check Fill Simulation / Matching on Active Resting Maker Bid
                 if self._resting_order and not self._current_position:
                     ro = self._resting_order
-                    # Simulated fill condition in paper mode:
-                    # If market top bid >= our bid price OR top ask <= our bid price, or trade traded through
                     cur_bid = best_bid or 0.0
                     cur_ask = best_ask or 1.0
-                    if cur_bid >= ro["price"] or cur_ask <= ro["price"]:
+                    elapsed_resting = time.time() - ro.get("placed_at", time.time())
+
+                    # In paper mode: simulate queue priority fill after 3s dwell while conviction holds
+                    is_paper_fill = (config.MODE != "live" and elapsed_resting >= 3.0 and signal.z_score >= 1.0)
+                    is_clob_fill = (cur_bid >= ro["price"] or cur_ask <= ro["price"])
+
+                    if is_paper_fill or is_clob_fill:
                         self._current_position = {
                             "slot": ro["slot"],
                             "side": ro["side"],
