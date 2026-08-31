@@ -125,3 +125,17 @@ class PolymarketLiveClient:
         except Exception as e:
             logger.error(f"Error cancelling order {order_id}: {e}")
             return {}
+
+    def get_collateral_balance(self) -> float:
+        """Fetch on-chain USDC/collateral balance from Polymarket CLOB."""
+        try:
+            from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
+            params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL, signature_type=config.SIGNATURE_TYPE)
+            resp = self.client.get_balance_allowance(params)
+            balance = float(resp.get("balance", 0.0))
+            if balance > 10000.0:
+                balance = balance / 1e6
+            return balance
+        except Exception as e:
+            logger.error(f"Error fetching balance: {e}")
+            return 0.0
