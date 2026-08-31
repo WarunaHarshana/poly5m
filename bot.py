@@ -73,6 +73,16 @@ class TWAPBot:
         logger.info(f"Parameters: min_z={config.MIN_Z_SCORE} | min_maker_edge={config.MIN_MAKER_EDGE:.1%} | bid_range=[${config.MIN_MAKER_BID:.2f} .. ${config.MAX_MAKER_BID:.2f}]")
         logger.info(f"Quoting Window: [{config.EVAL_WINDOW_END_S:.0f}s .. {config.EVAL_WINDOW_START_S:.0f}s remaining]")
         logger.info(f"Bankroll: ${self.risk.bankroll:.2f} | Base Stake: ${config.BASE_STAKE_USD:.2f}")
+        if self._trades_log_path.exists():
+            try:
+                with open(self._trades_log_path, "r") as f:
+                    all_trades = json.load(f)
+                    total_wins = sum(1 for t in all_trades if t.get("won"))
+                    total_losses = len(all_trades) - total_wins
+                    total_pnl = sum(float(t.get("pnl", 0.0)) for t in all_trades)
+                    logger.info(f"Historical Blotter: {len(all_trades)} trades ({total_wins}W / {total_losses}L) | Net PnL: ${total_pnl:+.2f}")
+            except Exception:
+                pass
         logger.info("=" * 70)
 
         # Start feeds
