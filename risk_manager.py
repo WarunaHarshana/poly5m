@@ -28,7 +28,9 @@ class RiskManager:
         if current_day != self.day_timestamp:
             self.day_timestamp = current_day
             self.daily_pnl = 0.0
+            self.consecutive_losses = 0
             self.trades_today = 0
+            self.save_state()
 
     def can_trade(self) -> tuple[bool, str]:
         """Check if trading is allowed under current risk limits."""
@@ -89,14 +91,19 @@ class RiskManager:
 
     def load_state(self) -> None:
         path = self.state_dir / "risk_state.json"
+        current_day = int(time.time() // 86400)
         if path.exists():
             try:
                 with open(path, "r") as f:
                     state = json.load(f)
                     self.bankroll = float(state.get("bankroll", self.bankroll))
-                    self.consecutive_losses = int(state.get("consecutive_losses", 0))
-                    if state.get("day_timestamp") == self.day_timestamp:
+                    if state.get("day_timestamp") == current_day:
                         self.daily_pnl = float(state.get("daily_pnl", 0.0))
+                        self.consecutive_losses = int(state.get("consecutive_losses", 0))
                         self.trades_today = int(state.get("trades_today", 0))
+                    else:
+                        self.daily_pnl = 0.0
+                        self.consecutive_losses = 0
+                        self.trades_today = 0
             except Exception as e:
                 logger.error(f"Failed to load risk state: {e}")
