@@ -206,8 +206,8 @@ class TWAPBot:
                     cur_ask = best_ask or 1.0
                     elapsed_resting = time.time() - ro.get("placed_at", time.time())
 
-                    # In paper mode: simulate queue priority fill after 3s dwell while conviction holds
-                    is_paper_fill = (config.MODE != "live" and elapsed_resting >= 3.0 and signal.z_score >= 1.0)
+                    # In paper mode: simulate queue priority fill after sustained dwell while conviction holds
+                    is_paper_fill = (config.MODE != "live" and elapsed_resting >= config.MAKER_DWELL_SECONDS and signal.z_score >= config.MIN_Z_SCORE)
                     is_clob_fill = (cur_bid >= ro["price"] or cur_ask <= ro["price"])
 
                     if is_paper_fill or is_clob_fill:

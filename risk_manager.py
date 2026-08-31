@@ -1,6 +1,4 @@
-"""Risk and Portfolio Management for H-001 TWAP Bot."""
-from __future__ import annotations
-
+import os
 import json
 import logging
 import time
@@ -90,6 +88,16 @@ class RiskManager:
             logger.error(f"Failed to save risk state: {e}")
 
     def load_state(self) -> None:
+        reset_flag = os.getenv("RESET_RISK_STATE", "false").strip().lower() in ("true", "1", "yes")
+        if reset_flag:
+            self.bankroll = config.STARTING_BANKROLL
+            self.daily_pnl = 0.0
+            self.consecutive_losses = 0
+            self.trades_today = 0
+            self.save_state()
+            logger.info(f"Risk state cleanly reset via RESET_RISK_STATE (Bankroll: ${self.bankroll:.2f}).")
+            return
+
         path = self.state_dir / "risk_state.json"
         current_day = int(time.time() // 86400)
         if path.exists():

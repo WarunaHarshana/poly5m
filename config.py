@@ -30,15 +30,16 @@ SIGNATURE_TYPE = int(os.getenv("SIGNATURE_TYPE", os.getenv("POLYMARKET_SIGNATURE
 STRATEGY = os.getenv("STRATEGY", "H-004_MAKER").strip().upper()
 
 # --- H-004 Passive Maker Limit Model Parameters ---
-MIN_Z_SCORE = float(os.getenv("MIN_Z_SCORE", "1.15"))
+MIN_Z_SCORE = float(os.getenv("MIN_Z_SCORE", "1.45"))                # Require >=93.0% conviction (Z >= 1.45)
 ALPHA = float(os.getenv("ALPHA", "1.75"))
 MIN_SIGMA_USD = float(os.getenv("MIN_SIGMA_USD", "2.0"))
 MAX_CHOP_CROSSES = int(os.getenv("MAX_CHOP_CROSSES", "2"))
-MIN_MAKER_EDGE = float(os.getenv("MIN_MAKER_EDGE", "0.05"))      # Minimum +5.0% expected net edge
-MIN_MAKER_BID = float(os.getenv("MIN_MAKER_BID", "0.55"))        # Floor resting bid price at $0.55
-MAX_MAKER_BID = float(os.getenv("MAX_MAKER_BID", "0.90"))        # Cap resting bid price at $0.90 (+11% to +81% ROI)
+MIN_MAKER_EDGE = float(os.getenv("MIN_MAKER_EDGE", "0.05"))          # Minimum +5.0% expected net edge
+MIN_MAKER_BID = float(os.getenv("MIN_MAKER_BID", "0.55"))            # Floor resting bid price at $0.55
+MAX_MAKER_BID = float(os.getenv("MAX_MAKER_BID", "0.90"))            # Cap resting bid price at $0.90 (+11% to +81% ROI)
 EVAL_WINDOW_START_S = float(os.getenv("EVAL_WINDOW_START_S", "270.0"))  # Start quoting at t=30s (270s left)
-EVAL_WINDOW_END_S = float(os.getenv("EVAL_WINDOW_END_S", "15.0"))      # Stop quoting at t=285s (15s left)
+EVAL_WINDOW_END_S = float(os.getenv("EVAL_WINDOW_END_S", "20.0"))        # Stop quoting at t=280s (20s left)
+MAKER_DWELL_SECONDS = float(os.getenv("MAKER_DWELL_SECONDS", "8.0"))    # Require 8s sustained queue dwell
 TAKER_FEE_RATE = float(os.getenv("TAKER_FEE_RATE", "0.07"))
 MAKER_REBATE_SHARE = float(os.getenv("MAKER_REBATE_SHARE", "0.20"))
 

@@ -67,7 +67,7 @@ class TWAPEngine:
         self,
         alpha: float = 1.75,
         min_sigma_usd: float = 2.0,
-        min_z: float = 1.15,
+        min_z: float = 1.45,
         min_edge: float = 0.05,
         min_entry: float = 0.50,
         max_entry: float = 0.95,
