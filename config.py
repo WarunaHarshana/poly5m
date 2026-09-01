@@ -35,8 +35,8 @@ ALPHA = float(os.getenv("ALPHA", "1.75"))
 MIN_SIGMA_USD = float(os.getenv("MIN_SIGMA_USD", "2.0"))
 MAX_CHOP_CROSSES = int(os.getenv("MAX_CHOP_CROSSES", "2"))
 MIN_EDGE = float(os.getenv("MIN_EDGE", "0.035"))                     # Minimum +3.5% net profit edge
-MIN_BUY_PRICE = float(os.getenv("MIN_BUY_PRICE", "0.60"))            # Minimum entry ask price
-MAX_BUY_PRICE = float(os.getenv("MAX_BUY_PRICE", "0.92"))            # Strict ceiling: NEVER pay > $0.92 (guarantees >= +8.7% ROI)
+MIN_BUY_PRICE = float(os.getenv("MIN_BUY_PRICE", "0.20"))            # Capture discount mispricings down to $0.20
+MAX_BUY_PRICE = float(os.getenv("MAX_BUY_PRICE", "0.92"))            # Strict ceiling: NEVER pay > $0.92
 EVAL_WINDOW_START_S = float(os.getenv("EVAL_WINDOW_START_S", "270.0"))  # Start evaluating at t=30s (270s left)
 EVAL_WINDOW_END_S = float(os.getenv("EVAL_WINDOW_END_S", "40.0"))        # Stop evaluating at t=260s (40s left)
 TAKER_FEE_RATE = float(os.getenv("TAKER_FEE_RATE", "0.07"))
