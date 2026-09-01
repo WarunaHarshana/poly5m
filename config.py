@@ -27,20 +27,25 @@ FUNDER_ADDRESS = os.getenv("FUNDER_ADDRESS", os.getenv("POLYMARKET_FUNDER_ADDRES
 SIGNATURE_TYPE = int(os.getenv("SIGNATURE_TYPE", os.getenv("POLYMARKET_SIGNATURE_TYPE", "3")))  # 3 = Polymarket Proxy Wallet
 
 # --- Strategy Selection ---
-STRATEGY = os.getenv("STRATEGY", "H-004_MAKER").strip().upper()
+STRATEGY = os.getenv("STRATEGY", "H-001_SNIPER").strip().upper()
 
-# --- H-004 Passive Maker Limit Model Parameters ---
-MIN_Z_SCORE = float(os.getenv("MIN_Z_SCORE", "1.45"))                # Require >=93.0% conviction (Z >= 1.45)
+# --- H-001 Conservative Taker Sniper Parameters ---
+MIN_Z_SCORE = float(os.getenv("MIN_Z_SCORE", "1.65"))                # Require >=95.0% mathematical certainty (Z >= 1.65)
 ALPHA = float(os.getenv("ALPHA", "1.75"))
 MIN_SIGMA_USD = float(os.getenv("MIN_SIGMA_USD", "2.0"))
 MAX_CHOP_CROSSES = int(os.getenv("MAX_CHOP_CROSSES", "2"))
-MIN_MAKER_EDGE = float(os.getenv("MIN_MAKER_EDGE", "0.05"))          # Minimum +5.0% expected net edge
-MIN_MAKER_BID = float(os.getenv("MIN_MAKER_BID", "0.55"))            # Floor resting bid price at $0.55
-MAX_MAKER_BID = float(os.getenv("MAX_MAKER_BID", "0.90"))            # Cap resting bid price at $0.90 (+11% to +81% ROI)
-EVAL_WINDOW_START_S = float(os.getenv("EVAL_WINDOW_START_S", "270.0"))  # Start quoting at t=30s (270s left)
-EVAL_WINDOW_END_S = float(os.getenv("EVAL_WINDOW_END_S", "20.0"))        # Stop quoting at t=280s (20s left)
-MAKER_DWELL_SECONDS = float(os.getenv("MAKER_DWELL_SECONDS", "8.0"))    # Require 8s sustained queue dwell
+MIN_EDGE = float(os.getenv("MIN_EDGE", "0.035"))                     # Minimum +3.5% net profit edge
+MIN_BUY_PRICE = float(os.getenv("MIN_BUY_PRICE", "0.60"))            # Minimum entry ask price
+MAX_BUY_PRICE = float(os.getenv("MAX_BUY_PRICE", "0.92"))            # Strict ceiling: NEVER pay > $0.92 (guarantees >= +8.7% ROI)
+EVAL_WINDOW_START_S = float(os.getenv("EVAL_WINDOW_START_S", "270.0"))  # Start evaluating at t=30s (270s left)
+EVAL_WINDOW_END_S = float(os.getenv("EVAL_WINDOW_END_S", "40.0"))        # Stop evaluating at t=260s (40s left)
 TAKER_FEE_RATE = float(os.getenv("TAKER_FEE_RATE", "0.07"))
+
+# --- H-004 Passive Maker Limit Model Parameters (Optional) ---
+MIN_MAKER_EDGE = float(os.getenv("MIN_MAKER_EDGE", "0.05"))
+MIN_MAKER_BID = float(os.getenv("MIN_MAKER_BID", "0.55"))
+MAX_MAKER_BID = float(os.getenv("MAX_MAKER_BID", "0.90"))
+MAKER_DWELL_SECONDS = float(os.getenv("MAKER_DWELL_SECONDS", "8.0"))
 MAKER_REBATE_SHARE = float(os.getenv("MAKER_REBATE_SHARE", "0.20"))
 
 # --- Risk & Sizing Parameters ---

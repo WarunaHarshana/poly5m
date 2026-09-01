@@ -170,78 +170,108 @@ class TWAPBot:
                         if bk.get("asks"):
                             best_ask = float(bk["asks"][0]["price"])
 
-                signal = self.engine.evaluate_maker(
-                    spot=spot,
-                    strike=strike,
-                    remaining_s=remaining_s,
-                    elapsed_s=elapsed_s,
-                    realized_twap=realized_twap,
-                    best_bid=best_bid,
-                    best_ask=best_ask,
-                    chop_crosses=chop,
-                    fee_rate=current_market.get("fee_rate", config.TAKER_FEE_RATE),
-                )
+                is_sniper = (config.STRATEGY in ("H-001_SNIPER", "SNIPER", "H-001"))
 
-                if in_eval_window:
-                    # Diagnostic tick log
-                    logger.info(
-                        f"[{remaining_s:3.0f}s left] BTC: ${spot:,.1f} | S0: ${strike:,.1f} | "
-                        f"Z: {signal.z_score:4.2f} | P: {signal.model_prob:.1%} | "
-                        f"TopBid: {best_bid or 0:.2f} | TargetBid({signal.side}): {signal.target_bid:.2f} | "
-                        f"Edge: {signal.edge_net:+.1%} | Pass: {signal.passed_gates}"
+                if is_sniper:
+                    signal = self.engine.evaluate(
+                        spot=spot,
+                        strike=strike,
+                        remaining_s=remaining_s,
+                        elapsed_s=elapsed_s,
+                        realized_twap=realized_twap,
+                        ask=best_ask,
+                        chop_crosses=chop,
+                        fee_rate=current_market.get("fee_rate", config.TAKER_FEE_RATE),
                     )
 
-                    # 1. Place Resting Maker Bid if not already active or positioned
-                    if signal.passed_gates and not self._resting_order and not self._current_position:
-                        can_trade, risk_reason = self.risk.can_trade()
-                        if can_trade:
-                            await self._place_maker_bid(current_market, signal)
-                        else:
-                            logger.warning(f"Maker trade blocked by risk manager: {risk_reason}")
+                    if in_eval_window:
+                        logger.info(
+                            f"[{remaining_s:3.0f}s left] BTC: ${spot:,.1f} | S0: ${strike:,.1f} | "
+                            f"Z: {signal.z_score:4.2f} | P: {signal.model_prob:.1%} | "
+                            f"Ask({signal.side}): {best_ask or 0:.2f} | "
+                            f"Edge: {signal.edge_net:+.1%} | Pass: {signal.passed_gates}"
+                        )
 
-                # 2. Check Fill Simulation / Matching on Active Resting Maker Bid
-                if self._resting_order and not self._current_position:
-                    ro = self._resting_order
-                    cur_bid = best_bid or 0.0
-                    cur_ask = best_ask or 1.0
-                    elapsed_resting = time.time() - ro.get("placed_at", time.time())
+                        if signal.passed_gates and not self._current_position:
+                            can_trade, risk_reason = self.risk.can_trade()
+                            if can_trade:
+                                await self._place_taker_order(current_market, signal, best_ask)
+                            else:
+                                logger.warning(f"Sniper trade blocked by risk manager: {risk_reason}")
+                else:
+                    signal = self.engine.evaluate_maker(
+                        spot=spot,
+                        strike=strike,
+                        remaining_s=remaining_s,
+                        elapsed_s=elapsed_s,
+                        realized_twap=realized_twap,
+                        best_bid=best_bid,
+                        best_ask=best_ask,
+                        chop_crosses=chop,
+                        fee_rate=current_market.get("fee_rate", config.TAKER_FEE_RATE),
+                    )
 
-                    # In paper mode: simulate queue priority fill after sustained dwell while conviction holds
-                    is_paper_fill = (config.MODE != "live" and elapsed_resting >= config.MAKER_DWELL_SECONDS and signal.z_score >= config.MIN_Z_SCORE)
-                    is_clob_fill = (cur_bid >= ro["price"] or cur_ask <= ro["price"])
+                    if in_eval_window:
+                        logger.info(
+                            f"[{remaining_s:3.0f}s left] BTC: ${spot:,.1f} | S0: ${strike:,.1f} | "
+                            f"Z: {signal.z_score:4.2f} | P: {signal.model_prob:.1%} | "
+                            f"TopBid: {best_bid or 0:.2f} | TargetBid({signal.side}): {signal.target_bid:.2f} | "
+                            f"Edge: {signal.edge_net:+.1%} | Pass: {signal.passed_gates}"
+                        )
 
-                    if is_paper_fill or is_clob_fill:
-                        self._current_position = {
-                            "slot": ro["slot"],
-                            "side": ro["side"],
-                            "token_id": ro["token_id"],
-                            "price": ro["price"],
-                            "shares": ro["shares"],
-                            "cost_usd": ro["cost_usd"],
-                            "z_score": ro["z_score"],
-                            "prob": ro["prob"],
-                            "rebate": ro["rebate"],
-                            "entry_time": time.time(),
-                            "order_id": ro["order_id"],
-                        }
-                        logger.info("=" * 60)
-                        logger.info(f"✅ [H-004 MAKER BID FILLED] BUY {ro['side']} @ {ro['price']:.2f}")
-                        logger.info(f"   Filled: {ro['shares']:.1f} shares (${ro['cost_usd']:.2f}) | Rebate: ${ro['rebate']:.3f}")
-                        logger.info("=" * 60)
-                        self._resting_order = None
+                        # Place Resting Maker Bid if not already active or positioned
+                        if signal.passed_gates and not self._resting_order and not self._current_position:
+                            can_trade, risk_reason = self.risk.can_trade()
+                            if can_trade:
+                                await self._place_maker_bid(current_market, signal)
+                            else:
+                                logger.warning(f"Maker trade blocked by risk manager: {risk_reason}")
 
-                    # 3. Adverse Selection / Reversal Protection Cancellation
-                    elif signal.z_score < 0.80 or remaining_s < config.EVAL_WINDOW_END_S:
-                        reason = "spot reversal (Z < 0.80)" if signal.z_score < 0.80 else "end of quoting window"
-                        logger.info(f"🚫 [H-004 MAKER BID CANCELLED] Cancelled resting bid @ {ro['price']:.2f} ({reason})")
-                        if config.MODE == "live" and self.live_client:
-                            try:
-                                self.live_client.cancel_order(ro["order_id"])
-                            except Exception as e:
-                                logger.error(f"Error cancelling live order: {e}")
-                        self._resting_order = None
+                    # Check Fill Simulation / Matching on Active Resting Maker Bid
+                    if self._resting_order and not self._current_position:
+                        ro = self._resting_order
+                        cur_bid = best_bid or 0.0
+                        cur_ask = best_ask or 1.0
+                        elapsed_resting = time.time() - ro.get("placed_at", time.time())
 
-                # 4. Handle settlement at slot end
+                        # In paper mode: simulate queue priority fill after sustained dwell while conviction holds
+                        is_paper_fill = (config.MODE != "live" and elapsed_resting >= config.MAKER_DWELL_SECONDS and signal.z_score >= config.MIN_Z_SCORE)
+                        is_clob_fill = (cur_bid >= ro["price"] or cur_ask <= ro["price"])
+
+                        if is_paper_fill or is_clob_fill:
+                            self._current_position = {
+                                "slot": ro["slot"],
+                                "strategy": "H-004_MAKER",
+                                "side": ro["side"],
+                                "token_id": ro["token_id"],
+                                "price": ro["price"],
+                                "shares": ro["shares"],
+                                "cost_usd": ro["cost_usd"],
+                                "z_score": ro["z_score"],
+                                "prob": ro["prob"],
+                                "fee": 0.0,
+                                "rebate": ro["rebate"],
+                                "entry_time": time.time(),
+                                "order_id": ro["order_id"],
+                            }
+                            logger.info("=" * 60)
+                            logger.info(f"✅ [H-004 MAKER BID FILLED] BUY {ro['side']} @ {ro['price']:.2f}")
+                            logger.info(f"   Filled: {ro['shares']:.1f} shares (${ro['cost_usd']:.2f}) | Rebate: ${ro['rebate']:.3f}")
+                            logger.info("=" * 60)
+                            self._resting_order = None
+
+                        # Adverse Selection / Reversal Protection Cancellation
+                        elif signal.z_score < 0.80 or remaining_s < config.EVAL_WINDOW_END_S:
+                            reason = "spot reversal (Z < 0.80)" if signal.z_score < 0.80 else "end of quoting window"
+                            logger.info(f"🚫 [H-004 MAKER BID CANCELLED] Cancelled resting bid @ {ro['price']:.2f} ({reason})")
+                            if config.MODE == "live" and self.live_client:
+                                try:
+                                    self.live_client.cancel_order(ro["order_id"])
+                                except Exception as e:
+                                    logger.error(f"Error cancelling live order: {e}")
+                            self._resting_order = None
+
+                # Handle settlement at slot end
                 if remaining_s <= 0.5:
                     if self._resting_order:
                         self._resting_order = None
@@ -253,6 +283,49 @@ class TWAPBot:
             except Exception as e:
                 logger.error(f"Error in main loop: {e}", exc_info=True)
                 await asyncio.sleep(2.0)
+
+    async def _place_taker_order(self, market: dict, signal: TWAPSignal, ask: float) -> None:
+        """Execute immediate taker sniper order against available ask."""
+        token_id = market["tokens"].get(signal.side)
+        if not token_id or not ask:
+            return
+
+        stake_usd = self.risk.calculate_stake(signal.edge_net, ask)
+        shares = max(config.MIN_ORDER_SHARES, round(stake_usd / ask, 2))
+        cost_usd = round(shares * ask, 2)
+        fee_usd = round(signal.fee_taker * shares, 4)
+
+        logger.info("=" * 60)
+        logger.info(f"🎯 [H-001 SNIPER ORDER EXECUTED] BUY {signal.side} @ {ask:.3f}")
+        logger.info(f"   Z-Score: {signal.z_score:.2f} | Win Prob: {signal.model_prob:.1%} | Net Edge: {signal.edge_net:+.1%}")
+        logger.info(f"   Size: {shares:.1f} shares (${cost_usd:.2f}) | Fee: ${fee_usd:.3f}")
+        logger.info("=" * 60)
+
+        order_id = f"sniper_paper_{int(time.time()*1000)}"
+        if config.MODE == "live" and self.live_client:
+            try:
+                resp = self.live_client.place_order(token_id, "BUY", ask, shares, order_type="FOK")
+                order_id = resp.get("orderID", order_id)
+                logger.info(f"Live taker order placed: {resp}")
+            except Exception as e:
+                logger.error(f"Live taker order placement failed: {e}")
+                return
+
+        self._current_position = {
+            "slot": market["slug"],
+            "strategy": "H-001_SNIPER",
+            "side": signal.side,
+            "token_id": token_id,
+            "price": ask,
+            "shares": shares,
+            "cost_usd": cost_usd,
+            "z_score": signal.z_score,
+            "prob": signal.model_prob,
+            "fee": fee_usd,
+            "rebate": 0.0,
+            "entry_time": time.time(),
+            "order_id": order_id,
+        }
 
     async def _place_maker_bid(self, market: dict, signal: MakerSignal) -> None:
         """Post resting limit bid inside spread as Maker."""
@@ -274,7 +347,7 @@ class TWAPBot:
         order_id = f"maker_paper_{int(time.time()*1000)}"
         if config.MODE == "live" and self.live_client:
             try:
-                resp = self.live_client.place_order(token_id, "BUY", signal.target_bid, shares)
+                resp = self.live_client.place_order(token_id, "BUY", signal.target_bid, shares, order_type="GTC")
                 order_id = resp.get("orderID", order_id)
                 logger.info(f"Live limit order placed: {resp}")
             except Exception as e:
@@ -296,7 +369,7 @@ class TWAPBot:
         }
 
     async def _settle_position(self, market: dict, strike: float) -> None:
-        """Settle filled maker position against final Chainlink TWAP."""
+        """Settle filled position against final Chainlink TWAP."""
         pos = self._current_position
         self._current_position = None
         if not pos:
@@ -310,31 +383,36 @@ class TWAPBot:
         resolved_side = "UP" if final_twap >= strike else "DOWN"
         won = (pos["side"] == resolved_side)
 
+        strategy_name = pos.get("strategy", "H-001_SNIPER")
+        fee = pos.get("fee", 0.0)
+        rebate = pos.get("rebate", 0.0)
+
         if won:
             revenue = pos["shares"] * 1.0
-            pnl = (revenue - pos["cost_usd"]) + pos.get("rebate", 0.0)
+            pnl = (revenue - pos["cost_usd"]) - fee + rebate
         else:
-            pnl = -pos["cost_usd"] + pos.get("rebate", 0.0)
+            pnl = -pos["cost_usd"] - fee + rebate
 
         self.risk.record_trade_result(pnl)
 
         logger.info("=" * 60)
-        logger.info(f"🏁 [SLOT SETTLEMENT] {market['slug']}")
+        logger.info(f"🏁 [SLOT SETTLEMENT] {market['slug']} ({strategy_name})")
         logger.info(f"   Strike (S0): ${strike:,.2f} | Final TWAP: ${final_twap:,.2f}")
-        logger.info(f"   Outcome: {resolved_side} | Maker Trade: {pos['side']} -> {'WON' if won else 'LOST'}")
-        logger.info(f"   Trade PnL: ${pnl:+.2f} (incl. rebate) | New Bankroll: ${self.risk.bankroll:.2f}")
+        logger.info(f"   Outcome: {resolved_side} | Trade: {pos['side']} -> {'WON' if won else 'LOST'}")
+        logger.info(f"   Trade PnL: ${pnl:+.2f} | New Bankroll: ${self.risk.bankroll:.2f}")
         logger.info("=" * 60)
 
         # Record to trades.json
         record = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "slot": market["slug"],
-            "strategy": "H-004_MAKER",
+            "strategy": strategy_name,
             "side": pos["side"],
             "price": pos["price"],
             "shares": pos["shares"],
             "cost_usd": pos["cost_usd"],
-            "rebate": pos.get("rebate", 0.0),
+            "fee": fee,
+            "rebate": rebate,
             "z_score": pos["z_score"],
             "strike": strike,
             "final_twap": final_twap,
