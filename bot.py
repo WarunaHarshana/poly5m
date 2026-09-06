@@ -94,7 +94,13 @@ class TWAPBot:
                 f"bid_range=[${config.MIN_MAKER_BID:.2f} .. ${config.MAX_MAKER_BID:.2f}]"
             )
             logger.info(f"Quoting Window: [{config.EVAL_WINDOW_END_S:.0f}s .. {config.EVAL_WINDOW_START_S:.0f}s remaining]")
+        journal_configure(config.JOURNAL_PATH)
+        logger.info(f"Journal: {config.JOURNAL_PATH}")
         logger.info(f"Bankroll: ${self.risk.bankroll:.2f} | Base Stake: ${config.BASE_STAKE_USD:.2f}")
+        if config.MODE != "live":
+            logger.info("Daily-loss / consecutive-loss kill switches: DISABLED (paper mode keeps filling)")
+        else:
+            logger.info(f"Daily loss limit: ${config.DAILY_LOSS_LIMIT_USD:.2f} | Max consecutive losses: {config.MAX_CONSECUTIVE_LOSSES}")
         if self._trades_log_path.exists():
             try:
                 with open(self._trades_log_path, "r") as f:
