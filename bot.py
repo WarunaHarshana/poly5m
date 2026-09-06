@@ -357,6 +357,14 @@ class TWAPBot:
                                     logger.error(f"Error cancelling live order: {e}")
                             self._resting_order = None
 
+                # Momentum overlays: stop-loss / early exit / micro-hedge
+                if self._current_position and self._current_position.get("strategy") in (
+                    "H-005_MOMENTUM", "LATE_MOMENTUM", "MOMENTUM", "H-005"
+                ):
+                    await self._manage_open_momentum_position(
+                        current_market, remaining_s, tokens
+                    )
+
                 # Handle settlement at slot end
                 if remaining_s <= 0.5:
                     if self._resting_order:
@@ -454,6 +462,191 @@ class TWAPBot:
             "order_id": order_id,
         }
 
+
+    async def _manage_open_momentum_position(self, market: dict, remaining_s: float, tokens: dict) -> None:
+        """Stop-loss, exit-before-close, and optional micro-hedge for H-005 positions."""
+        pos = self._current_position
+        if not pos:
+            return
+
+        side = pos["side"]
+        token_id = pos.get("token_id") or tokens.get(side)
+        best_bid = None
+        best_ask = None
+        if token_id:
+            top = self.book_stream.get_top(token_id)
+            best_bid = top.get("bid") if top else None
+            best_ask = top.get("ask") if top else None
+            if best_bid is None:
+                bk = self.pub_client.get_order_book(token_id)
+                if bk:
+                    if bk.get("bids"):
+                        best_bid = float(bk["bids"][0]["price"])
+                    if bk.get("asks"):
+                        best_ask = float(bk["asks"][0]["price"])
+
+        entry = float(pos["price"])
+        mark = float(best_bid) if best_bid is not None else None
+
+        # 1) Stop-loss vs entry (mark = best bid)
+        if (
+            config.MOMENTUM_STOP_LOSS_ENABLED
+            and mark is not None
+            and entry > 0
+            and mark <= entry * (1.0 - float(config.MOMENTUM_STOP_LOSS_PCT))
+        ):
+            logger.warning(
+                f"[H-005 STOP-LOSS] mark {mark:.3f} <= entry {entry:.3f} * "
+                f"(1-{config.MOMENTUM_STOP_LOSS_PCT:.0%})"
+            )
+            await self._exit_position_early(market, mark, reason="stop_loss")
+            return
+
+        # 2) Exit before final seconds (avoid last-second oracle chop)
+        if remaining_s <= float(config.MOMENTUM_EXIT_BEFORE_S) and remaining_s > 0.5:
+            exit_px = mark if mark is not None else entry
+            logger.info(
+                f"[H-005 EXIT-BEFORE] {remaining_s:.1f}s left <= {config.MOMENTUM_EXIT_BEFORE_S:.0f}s; "
+                f"flatten @ {exit_px:.3f}"
+            )
+            await self._exit_position_early(market, exit_px, reason="exit_before")
+            return
+
+        # 3) Micro-hedge when main side ask is extremely rich / skew extreme
+        if (
+            config.MOMENTUM_HEDGE_ENABLED
+            and not pos.get("hedge_placed")
+            and remaining_s <= float(config.MOMENTUM_HEDGE_TRIGGER_SECONDS_LEFT)
+        ):
+            main_ask = float(best_ask) if best_ask is not None else None
+            # Extreme conviction on our side (crowd piled in) -> tiny opposite hedge
+            if main_ask is not None and main_ask >= float(config.MOMENTUM_HEDGE_TRIGGER_ASK):
+                await self._place_micro_hedge(market, tokens, pos, main_ask)
+
+    async def _place_micro_hedge(self, market: dict, tokens: dict, pos: dict, main_ask: float) -> None:
+        """Buy a small opposite-side ticket when skew is extreme (Novals-style)."""
+        hedge_side = "DOWN" if pos["side"] == "UP" else "UP"
+        hedge_token = tokens.get(hedge_side)
+        if not hedge_token:
+            return
+
+        top = self.book_stream.get_top(hedge_token)
+        hedge_ask = top.get("ask") if top else None
+        if hedge_ask is None:
+            bk = self.pub_client.get_order_book(hedge_token)
+            if bk and bk.get("asks"):
+                hedge_ask = float(bk["asks"][0]["price"])
+        if hedge_ask is None or hedge_ask <= 0:
+            return
+
+        main_cost = float(pos.get("cost_usd", 0.0))
+        notional = main_cost * (float(config.MOMENTUM_HEDGE_SHARE_PCT) / 100.0)
+        notional = max(float(config.MOMENTUM_HEDGE_NOTIONAL_MIN), notional)
+        notional = min(float(config.MOMENTUM_HEDGE_NOTIONAL_MAX), notional)
+        shares = max(1.0, round(notional / hedge_ask, 2))
+        cost = round(shares * hedge_ask, 2)
+
+        logger.info("=" * 60)
+        logger.info(
+            f"[H-005 MICRO-HEDGE] BUY {hedge_side} @ {hedge_ask:.3f} | "
+            f"{shares:.1f} sh (${cost:.2f}) | trigger main_ask={main_ask:.3f}"
+        )
+        logger.info("=" * 60)
+
+        order_id = f"h005_hedge_paper_{int(time.time()*1000)}"
+        if config.MODE == "live" and self.live_client:
+            try:
+                resp = self.live_client.place_order(hedge_token, "BUY", hedge_ask, shares, order_type="FOK")
+                order_id = resp.get("orderID", order_id)
+            except Exception as e:
+                logger.error(f"Live micro-hedge failed: {e}")
+                return
+
+        pos["hedge_placed"] = True
+        pos["hedge_side"] = hedge_side
+        pos["hedge_token_id"] = hedge_token
+        pos["hedge_price"] = hedge_ask
+        pos["hedge_shares"] = shares
+        pos["hedge_cost_usd"] = cost
+        pos["hedge_order_id"] = order_id
+
+    async def _exit_position_early(self, market: dict, exit_price: float, reason: str) -> None:
+        """Flatten main (+ optional hedge) before TWAP settlement; paper marks at exit_price."""
+        pos = self._current_position
+        if not pos:
+            return
+        self._current_position = None
+
+        shares = float(pos["shares"])
+        cost = float(pos["cost_usd"])
+        fee = float(pos.get("fee", 0.0))
+        rebate = float(pos.get("rebate", 0.0))
+        exit_price = float(exit_price)
+
+        # Paper / live flatten of main
+        if config.MODE == "live" and self.live_client:
+            try:
+                self.live_client.place_order(
+                    pos["token_id"], "SELL", max(0.01, exit_price), shares, order_type="FOK"
+                )
+            except Exception as e:
+                logger.error(f"Live early exit sell failed ({reason}): {e}")
+
+        main_pnl = (shares * exit_price) - cost - fee + rebate
+
+        hedge_pnl = 0.0
+        if pos.get("hedge_placed"):
+            h_shares = float(pos.get("hedge_shares", 0.0))
+            h_cost = float(pos.get("hedge_cost_usd", 0.0))
+            h_token = pos.get("hedge_token_id")
+            # Mark hedge at its best bid if available, else assume worthless residual
+            h_exit = 0.0
+            if h_token:
+                top = self.book_stream.get_top(h_token)
+                if top and top.get("bid") is not None:
+                    h_exit = float(top["bid"])
+            if config.MODE == "live" and self.live_client and h_token and h_shares > 0:
+                try:
+                    self.live_client.place_order(h_token, "SELL", max(0.01, h_exit or 0.01), h_shares, order_type="FOK")
+                except Exception as e:
+                    logger.error(f"Live hedge exit failed: {e}")
+            hedge_pnl = (h_shares * h_exit) - h_cost
+
+        pnl = main_pnl + hedge_pnl
+        self.risk.record_trade_result(pnl)
+
+        logger.info("=" * 60)
+        logger.info(f"[H-005 EARLY EXIT:{reason}] {market['slug']}")
+        logger.info(
+            f"   Main {pos['side']} entry={pos['price']:.3f} exit={exit_price:.3f} | "
+            f"PnL ${pnl:+.2f} | Bankroll ${self.risk.bankroll:.2f}"
+        )
+        logger.info("=" * 60)
+
+        record = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "slot": market["slug"],
+            "strategy": pos.get("strategy", "H-005_MOMENTUM"),
+            "side": pos["side"],
+            "price": pos["price"],
+            "exit_price": exit_price,
+            "exit_reason": reason,
+            "shares": shares,
+            "cost_usd": cost,
+            "fee": fee,
+            "rebate": rebate,
+            "hedge_placed": bool(pos.get("hedge_placed")),
+            "hedge_side": pos.get("hedge_side"),
+            "hedge_cost_usd": pos.get("hedge_cost_usd", 0.0),
+            "hedge_pnl": round(hedge_pnl, 2),
+            "z_score": pos.get("z_score"),
+            "won": pnl > 0,
+            "pnl": round(pnl, 2),
+            "bankroll": round(self.risk.bankroll, 2),
+            "early_exit": True,
+        }
+        self._save_trade_record(record)
+
     async def _settle_position(self, market: dict, strike: float) -> None:
         """Settle filled position against final Chainlink TWAP."""
         pos = self._current_position
@@ -478,6 +671,16 @@ class TWAPBot:
             pnl = (revenue - pos["cost_usd"]) - fee + rebate
         else:
             pnl = -pos["cost_usd"] - fee + rebate
+
+        # If a micro-hedge was on, it resolves opposite the main outcome
+        if pos.get("hedge_placed"):
+            h_shares = float(pos.get("hedge_shares", 0.0))
+            h_cost = float(pos.get("hedge_cost_usd", 0.0))
+            hedge_won = not won
+            if hedge_won:
+                pnl += (h_shares * 1.0) - h_cost
+            else:
+                pnl += -h_cost
 
         self.risk.record_trade_result(pnl)
 
