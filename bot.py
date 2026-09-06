@@ -61,6 +61,7 @@ class TWAPBot:
         self._stop = False
         self._resting_order: dict | None = None
         self._current_position: dict | None = None
+        self._slot_done: set[str] = set()  # slugs we already traded/exited this process
         self._trades_log_path = config.STATE_DIR / "trades.json"
 
     def stop(self) -> None:
@@ -250,13 +251,19 @@ class TWAPBot:
                         )
 
                         if signal.passed_gates and not self._current_position:
-                            can_trade, risk_reason = self.risk.can_trade()
-                            if can_trade:
-                                await self._place_taker_order(
-                                    current_market, signal, best_ask, strategy_tag="H-005_MOMENTUM"
-                                )
+                            slot_key = current_market.get("slug", "")
+                            if slot_key and slot_key in self._slot_done:
+                                pass  # already traded/exited this slot
                             else:
-                                logger.warning(f"Momentum trade blocked by risk manager: {risk_reason}")
+                                can_trade, risk_reason = self.risk.can_trade()
+                                if can_trade:
+                                    await self._place_taker_order(
+                                        current_market, signal, best_ask, strategy_tag="H-005_MOMENTUM"
+                                    )
+                                    if slot_key:
+                                        self._slot_done.add(slot_key)
+                                else:
+                                    logger.warning(f"Momentum trade blocked by risk manager: {risk_reason}")
 
                 elif is_sniper:
                     signal = self.engine.evaluate(
@@ -486,9 +493,19 @@ class TWAPBot:
                         best_ask = float(bk["asks"][0]["price"])
 
         entry = float(pos["price"])
-        mark = float(best_bid) if best_bid is not None else None
+        # Mark carefully: raw best bid on thin CLOB books is often garbage (e.g. 0.28 vs 0.87 ask).
+        mark = None
+        if best_bid is not None and best_ask is not None:
+            spread = float(best_ask) - float(best_bid)
+            if 0 <= spread <= 0.15:
+                mark = (float(best_bid) + float(best_ask)) / 2.0
+            else:
+                # Wide/absurd book — do not stop-loss on thin bid alone
+                mark = None
+        elif best_ask is not None:
+            mark = float(best_ask)
 
-        # 1) Stop-loss vs entry (mark = best bid)
+        # 1) Stop-loss vs entry (mid only when spread is sane)
         if (
             config.MOMENTUM_STOP_LOSS_ENABLED
             and mark is not None
@@ -576,6 +593,9 @@ class TWAPBot:
         if not pos:
             return
         self._current_position = None
+        slot_key = market.get("slug") or pos.get("slot")
+        if slot_key:
+            self._slot_done.add(slot_key)
 
         shares = float(pos["shares"])
         cost = float(pos["cost_usd"])
