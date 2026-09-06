@@ -16,6 +16,7 @@ import signal
 import sys
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 import config
 from twap_engine import TWAPEngine, MakerSignal, TWAPSignal
@@ -66,6 +67,53 @@ class TWAPBot:
         self._slot_done: set[str] = set()  # slugs we already traded/exited this process
         self._risk_block_logged = False
         self._trades_log_path = config.STATE_DIR / "trades.json"
+        for _slug in (self._load_slot_state().get("slot_done") or []):
+            if _slug:
+                self._slot_done.add(str(_slug))
+
+
+    def _slot_state_path(self) -> Path:
+        return config.STATE_DIR / "slot_state.json"
+
+    def _load_slot_state(self) -> dict:
+        p = self._slot_state_path()
+        if not p.exists():
+            return {}
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except Exception as e:
+            logger.warning(f"Failed to load slot state: {e}")
+            return {}
+
+    def _save_slot_state(
+        self,
+        *,
+        slot_ts: int | float | None,
+        slug: str | None,
+        strike: float | None,
+    ) -> None:
+        """Persist S0 + slot identity so redeploys keep impulse continuity."""
+        payload = {
+            "slot_ts": int(slot_ts) if slot_ts is not None else None,
+            "slug": slug,
+            "strike": float(strike) if strike is not None else None,
+            "slot_done": sorted(self._slot_done),
+            "updated_at": time.time(),
+        }
+        if payload["strike"] is None:
+            prev = self._load_slot_state()
+            if prev.get("slug") == slug or (
+                slot_ts is not None and int(prev.get("slot_ts") or 0) == int(slot_ts)
+            ):
+                if prev.get("strike") is not None:
+                    payload["strike"] = float(prev["strike"])
+        try:
+            with open(self._slot_state_path(), "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2)
+        except Exception as e:
+            logger.warning(f"Failed to save slot state: {e}")
 
     def stop(self) -> None:
         logger.info("Stopping bot...")
@@ -144,6 +192,22 @@ class TWAPBot:
                     current_market = self.pub_client.find_active_5m_slot(now_ts=now)
                     if current_market:
                         logger.info(f"\n[SLOT {active_slot_ts}] Discovered market: {current_market['slug']}")
+                        saved = self._load_slot_state()
+                        same_slot = (
+                            int(saved.get("slot_ts") or 0) == int(active_slot_ts)
+                            or saved.get("slug") == current_market.get("slug")
+                        )
+                        if same_slot and saved.get("strike") is not None:
+                            try:
+                                restored = float(saved["strike"])
+                                if restored > 0:
+                                    slot_strike = restored
+                                    logger.info(
+                                        f"[SLOT {active_slot_ts}] Restored S0 ${slot_strike:,.2f} from volume "
+                                        f"(survived redeploy)"
+                                    )
+                            except (TypeError, ValueError):
+                                slot_strike = None
                         tokens = current_market["tokens"]
                         self.book_stream.watch(tokens.get("UP", ""), tokens.get("DOWN", ""))
                     else:
@@ -160,11 +224,17 @@ class TWAPBot:
                 remaining_s = max(0.0, end_ts - now)
                 elapsed_s = max(0.0, now - slot_start_ts)
 
-                # Latch slot strike S_0 once at or near slot open
+                # Latch slot strike S_0 once at or near slot open (persist to volume)
                 if slot_strike is None or slot_strike <= 0:
                     slot_strike = self.cl_stream.get_slot_strike(slot_start_ts)
                     if slot_strike is None or slot_strike <= 0:
                         slot_strike = self.cl_stream.price()
+                    if slot_strike and slot_strike > 0:
+                        self._save_slot_state(
+                            slot_ts=active_slot_ts,
+                            slug=current_market.get("slug"),
+                            strike=slot_strike,
+                        )
 
                 strike = slot_strike
                 spot = self.cl_stream.price()
@@ -281,6 +351,11 @@ class TWAPBot:
                                     )
                                     if slot_key:
                                         self._slot_done.add(slot_key)
+                                        self._save_slot_state(
+                                            slot_ts=active_slot_ts,
+                                            slug=slot_key,
+                                            strike=strike,
+                                        )
                                 else:
                                     logger.warning(f"Momentum trade blocked by risk manager: {risk_reason}")
 
@@ -647,6 +722,11 @@ class TWAPBot:
         slot_key = market.get("slug") or pos.get("slot")
         if slot_key:
             self._slot_done.add(slot_key)
+            self._save_slot_state(
+                slot_ts=market.get("slot_start_ts"),
+                slug=slot_key,
+                strike=None,
+            )
 
         shares = float(pos["shares"])
         cost = float(pos["cost_usd"])
