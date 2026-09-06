@@ -62,6 +62,7 @@ class TWAPBot:
         self._resting_order: dict | None = None
         self._current_position: dict | None = None
         self._slot_done: set[str] = set()  # slugs we already traded/exited this process
+        self._risk_block_logged = False
         self._trades_log_path = config.STATE_DIR / "trades.json"
 
     def stop(self) -> None:
@@ -201,6 +202,15 @@ class TWAPBot:
                             best_ask = float(bk["asks"][0]["price"])
 
                 if is_momentum:
+                    can_trade_now, risk_reason_now = self.risk.can_trade()
+                    if not can_trade_now:
+                        # Avoid per-second spam once daily loss / consecutive-loss lock is hit
+                        if not getattr(self, "_risk_block_logged", False):
+                            logger.warning(f"Momentum paused by risk manager: {risk_reason_now}")
+                            self._risk_block_logged = True
+                        await asyncio.sleep(2.0)
+                        continue
+                    self._risk_block_logged = False
                     # Stronger-side check (Novals): also peek opposite ask when available
                     opp_side = "DOWN" if prelim_side == "UP" else "UP"
                     opp_token = tokens.get(opp_side)

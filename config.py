@@ -34,7 +34,7 @@ MOMENTUM_WINDOW_END_S = float(os.getenv('MOMENTUM_WINDOW_END_S', '60.0'))
 MOMENTUM_MIN_MOVE_USD = float(os.getenv('MOMENTUM_MIN_MOVE_USD', '70.0'))
 MOMENTUM_MAX_MOVE_USD = float(os.getenv('MOMENTUM_MAX_MOVE_USD', '300.0'))
 MOMENTUM_MIN_ASK = float(os.getenv('MOMENTUM_MIN_ASK', '0.70'))
-MOMENTUM_MAX_ASK = float(os.getenv('MOMENTUM_MAX_ASK', '0.99'))
+MOMENTUM_MAX_ASK = float(os.getenv('MOMENTUM_MAX_ASK', '0.92'))
 MOMENTUM_MIN_EDGE = float(os.getenv('MOMENTUM_MIN_EDGE', '0.00'))
 # Risk overlays for momentum (Novals conservative defaults)
 MOMENTUM_EXIT_BEFORE_S = float(os.getenv("MOMENTUM_EXIT_BEFORE_S", "20.0"))
@@ -76,7 +76,8 @@ MIN_ORDER_SHARES = float(os.getenv("MIN_ORDER_SHARES", "5.0"))
 
 # --- State Directory ---
 STATE_ROOT = os.getenv("STATE_ROOT", "").strip()
-if STATE_ROOT and os.path.exists(STATE_ROOT):
+# Prefer explicit STATE_ROOT (e.g. Railway volume at /data) even before first mkdir
+if STATE_ROOT:
     STATE_DIR = Path(STATE_ROOT)
 else:
     STATE_DIR = Path("state")
