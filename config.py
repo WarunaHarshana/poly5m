@@ -28,6 +28,14 @@ SIGNATURE_TYPE = int(os.getenv("SIGNATURE_TYPE", os.getenv("POLYMARKET_SIGNATURE
 
 # --- Strategy Selection ---
 STRATEGY = os.getenv("STRATEGY", "H-001_SNIPER").strip().upper()
+# --- H-005 Momentum-Into-Close (Novals/igus-style) ---
+MOMENTUM_WINDOW_START_S = float(os.getenv('MOMENTUM_WINDOW_START_S', '150.0'))
+MOMENTUM_WINDOW_END_S = float(os.getenv('MOMENTUM_WINDOW_END_S', '60.0'))
+MOMENTUM_MIN_MOVE_USD = float(os.getenv('MOMENTUM_MIN_MOVE_USD', '70.0'))
+MOMENTUM_MAX_MOVE_USD = float(os.getenv('MOMENTUM_MAX_MOVE_USD', '300.0'))
+MOMENTUM_MIN_ASK = float(os.getenv('MOMENTUM_MIN_ASK', '0.70'))
+MOMENTUM_MAX_ASK = float(os.getenv('MOMENTUM_MAX_ASK', '0.99'))
+MOMENTUM_MIN_EDGE = float(os.getenv('MOMENTUM_MIN_EDGE', '0.00'))
 
 # --- H-001 Conservative Taker Sniper Parameters ---
 MIN_Z_SCORE = float(os.getenv("MIN_Z_SCORE", "1.65"))                # Require >=95.0% mathematical certainty (Z >= 1.65)

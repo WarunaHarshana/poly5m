@@ -39,6 +39,9 @@ class TWAPBot:
             alpha=config.ALPHA,
             min_sigma_usd=config.MIN_SIGMA_USD,
             min_z=config.MIN_Z_SCORE,
+            min_edge=config.MIN_EDGE,
+            min_entry=config.MIN_BUY_PRICE,
+            max_entry=config.MAX_BUY_PRICE,
             min_maker_bid=config.MIN_MAKER_BID,
             max_maker_bid=config.MAX_MAKER_BID,
             min_maker_edge=config.MIN_MAKER_EDGE,
@@ -68,10 +71,25 @@ class TWAPBot:
 
     async def start(self) -> None:
         logger.info("=" * 70)
-        logger.info("STARTING H-004 PASSIVE MAKER LIMIT TRADING BOT")
+        logger.info(f"STARTING POLY 5M BOT | STRATEGY={config.STRATEGY}")
         logger.info(f"Mode: {config.MODE.upper()} | Asset: {config.ASSET.upper()} | Timeframe: {config.TIMEFRAME}")
-        logger.info(f"Parameters: min_z={config.MIN_Z_SCORE} | min_maker_edge={config.MIN_MAKER_EDGE:.1%} | bid_range=[${config.MIN_MAKER_BID:.2f} .. ${config.MAX_MAKER_BID:.2f}]")
-        logger.info(f"Quoting Window: [{config.EVAL_WINDOW_END_S:.0f}s .. {config.EVAL_WINDOW_START_S:.0f}s remaining]")
+        if config.STRATEGY in ("H-005_MOMENTUM", "MOMENTUM", "H-005", "LATE_MOMENTUM"):
+            logger.info(
+                f"Momentum: move>=${config.MOMENTUM_MIN_MOVE_USD:.0f} | ask=[{config.MOMENTUM_MIN_ASK:.2f}..{config.MOMENTUM_MAX_ASK:.2f}] | "
+                f"window=[{config.MOMENTUM_WINDOW_END_S:.0f}s..{config.MOMENTUM_WINDOW_START_S:.0f}s left]"
+            )
+        elif config.STRATEGY in ("H-001_SNIPER", "SNIPER", "H-001"):
+            logger.info(
+                f"Sniper: min_z={config.MIN_Z_SCORE} | edge>={config.MIN_EDGE:.1%} | "
+                f"ask=[{config.MIN_BUY_PRICE:.2f}..{config.MAX_BUY_PRICE:.2f}]"
+            )
+            logger.info(f"Eval Window: [{config.EVAL_WINDOW_END_S:.0f}s .. {config.EVAL_WINDOW_START_S:.0f}s remaining]")
+        else:
+            logger.info(
+                f"Maker: min_z={config.MIN_Z_SCORE} | min_maker_edge={config.MIN_MAKER_EDGE:.1%} | "
+                f"bid_range=[${config.MIN_MAKER_BID:.2f} .. ${config.MAX_MAKER_BID:.2f}]"
+            )
+            logger.info(f"Quoting Window: [{config.EVAL_WINDOW_END_S:.0f}s .. {config.EVAL_WINDOW_START_S:.0f}s remaining]")
         logger.info(f"Bankroll: ${self.risk.bankroll:.2f} | Base Stake: ${config.BASE_STAKE_USD:.2f}")
         if self._trades_log_path.exists():
             try:
@@ -149,8 +167,19 @@ class TWAPBot:
                 realized_twap, _ = self.cl_stream.compute_realized_twap(start_ts=slot_start_ts, end_ts=now)
                 chop = self.cl_stream.strike_crossings_since(slot_start_ts, strike)
 
+                # Strategy flags
+                is_momentum = (config.STRATEGY in ("H-005_MOMENTUM", "MOMENTUM", "H-005", "LATE_MOMENTUM"))
+                is_sniper = (config.STRATEGY in ("H-001_SNIPER", "SNIPER", "H-001"))
+
                 # Evaluate strategy within entry window
-                in_eval_window = (config.EVAL_WINDOW_END_S <= remaining_s <= config.EVAL_WINDOW_START_S)
+                if is_momentum:
+                    in_eval_window = (
+                        config.MOMENTUM_WINDOW_END_S <= remaining_s <= config.MOMENTUM_WINDOW_START_S
+                    )
+                else:
+                    in_eval_window = (
+                        config.EVAL_WINDOW_END_S <= remaining_s <= config.EVAL_WINDOW_START_S
+                    )
 
                 # Fetch top of book for UP and DOWN
                 tokens = current_market["tokens"]
@@ -170,9 +199,66 @@ class TWAPBot:
                         if bk.get("asks"):
                             best_ask = float(bk["asks"][0]["price"])
 
-                is_sniper = (config.STRATEGY in ("H-001_SNIPER", "SNIPER", "H-001"))
+                if is_momentum:
+                    # Stronger-side check (Novals): also peek opposite ask when available
+                    opp_side = "DOWN" if prelim_side == "UP" else "UP"
+                    opp_token = tokens.get(opp_side)
+                    opp_ask = None
+                    if opp_token:
+                        opp_top = self.book_stream.get_top(opp_token)
+                        opp_ask = opp_top.get("ask") if opp_top else None
+                        if opp_ask is None:
+                            bk = self.pub_client.get_order_book(opp_token)
+                            if bk and bk.get("asks"):
+                                opp_ask = float(bk["asks"][0]["price"])
+                    # Prefer stronger ask >= threshold; still require with-trend side
+                    trade_side = prelim_side
+                    trade_ask = best_ask
+                    if best_ask is not None and opp_ask is not None:
+                        if opp_ask > best_ask and ((spot >= strike and opp_side == "UP") or (spot < strike and opp_side == "DOWN")):
+                            trade_side = opp_side
+                            trade_ask = opp_ask
+                        elif best_ask >= config.MOMENTUM_MIN_ASK or opp_ask >= config.MOMENTUM_MIN_ASK:
+                            # pick stronger among same-direction-compatible; default keep trend side
+                            if trade_side == prelim_side and (best_ask or 0) < config.MOMENTUM_MIN_ASK and (opp_ask or 0) >= config.MOMENTUM_MIN_ASK:
+                                # opposite meets threshold but would be a fade — skip via gate later
+                                pass
 
-                if is_sniper:
+                    signal = self.engine.evaluate_momentum(
+                        spot=spot,
+                        strike=strike,
+                        remaining_s=remaining_s,
+                        elapsed_s=elapsed_s,
+                        ask=trade_ask if trade_side == prelim_side else best_ask,
+                        fee_rate=current_market.get("fee_rate", config.TAKER_FEE_RATE),
+                        min_move_usd=config.MOMENTUM_MIN_MOVE_USD,
+                        max_move_usd=config.MOMENTUM_MAX_MOVE_USD,
+                        min_ask=config.MOMENTUM_MIN_ASK,
+                        max_ask=config.MOMENTUM_MAX_ASK,
+                        min_edge=config.MOMENTUM_MIN_EDGE,
+                        window_start_s=config.MOMENTUM_WINDOW_START_S,
+                        window_end_s=config.MOMENTUM_WINDOW_END_S,
+                    )
+
+                    if in_eval_window:
+                        move = spot - strike
+                        logger.info(
+                            f"[{remaining_s:3.0f}s left] BTC: ${spot:,.1f} | S0: ${strike:,.1f} | "
+                            f"Move: ${move:+.1f} | Ask({signal.side}): {best_ask or 0:.2f} | "
+                            f"P: {signal.model_prob:.1%} | Edge: {signal.edge_net:+.1%} | Pass: {signal.passed_gates}"
+                            + (f" | Skip: {signal.skip_reason}" if (not signal.passed_gates and signal.skip_reason) else "")
+                        )
+
+                        if signal.passed_gates and not self._current_position:
+                            can_trade, risk_reason = self.risk.can_trade()
+                            if can_trade:
+                                await self._place_taker_order(
+                                    current_market, signal, best_ask, strategy_tag="H-005_MOMENTUM"
+                                )
+                            else:
+                                logger.warning(f"Momentum trade blocked by risk manager: {risk_reason}")
+
+                elif is_sniper:
                     signal = self.engine.evaluate(
                         spot=spot,
                         strike=strike,
@@ -284,7 +370,7 @@ class TWAPBot:
                 logger.error(f"Error in main loop: {e}", exc_info=True)
                 await asyncio.sleep(2.0)
 
-    async def _place_taker_order(self, market: dict, signal: TWAPSignal, ask: float) -> None:
+    async def _place_taker_order(self, market: dict, signal: TWAPSignal, ask: float, strategy_tag: str = "H-001_SNIPER") -> None:
         """Execute immediate taker sniper order against available ask."""
         token_id = market["tokens"].get(signal.side)
         if not token_id or not ask:
@@ -296,12 +382,12 @@ class TWAPBot:
         fee_usd = round(signal.fee_taker * shares, 4)
 
         logger.info("=" * 60)
-        logger.info(f"🎯 [H-001 SNIPER ORDER EXECUTED] BUY {signal.side} @ {ask:.3f}")
+        logger.info(f"[{strategy_tag} ORDER EXECUTED] BUY {signal.side} @ {ask:.3f}")
         logger.info(f"   Z-Score: {signal.z_score:.2f} | Win Prob: {signal.model_prob:.1%} | Net Edge: {signal.edge_net:+.1%}")
         logger.info(f"   Size: {shares:.1f} shares (${cost_usd:.2f}) | Fee: ${fee_usd:.3f}")
         logger.info("=" * 60)
 
-        order_id = f"sniper_paper_{int(time.time()*1000)}"
+        order_id = f"{strategy_tag.lower()}_paper_{int(time.time()*1000)}"
         if config.MODE == "live" and self.live_client:
             try:
                 resp = self.live_client.place_order(token_id, "BUY", ask, shares, order_type="FOK")
@@ -313,7 +399,7 @@ class TWAPBot:
 
         self._current_position = {
             "slot": market["slug"],
-            "strategy": "H-001_SNIPER",
+            "strategy": strategy_tag,
             "side": signal.side,
             "token_id": token_id,
             "price": ask,

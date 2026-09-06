@@ -337,3 +337,96 @@ class TWAPEngine:
             passed_gates=passed,
             skip_reason="; ".join(skip_reasons),
         )
+
+    def evaluate_momentum(
+        self,
+        spot: float,
+        strike: float,
+        remaining_s: float,
+        elapsed_s: float,
+        ask: float | None,
+        fee_rate: float = 0.07,
+        min_move_usd: float = 70.0,
+        max_move_usd: float = 300.0,
+        min_ask: float = 0.70,
+        max_ask: float = 0.99,
+        min_edge: float = 0.0,
+        window_start_s: float = 150.0,
+        window_end_s: float = 60.0,
+    ) -> TWAPSignal:
+        """Momentum-into-close gate (H-005): Novals/igus-style near-expiry follow-through.
+
+        - Late window (default ~150s..60s remaining; target ~120s)
+        - Require abs(spot - strike) >= min_move_usd (default 70 USD)
+        - Side follows the move (never fade)
+        - Buy only if ask in [min_ask, max_ask] (Novals threshold 0.70..0.99)
+        - Edge gate only applies when min_edge > 0
+        """
+        spot = float(spot)
+        strike = float(strike)
+        remaining_s = float(remaining_s)
+        elapsed_s = float(elapsed_s)
+        move = spot - strike
+        abs_move = abs(move)
+        side = "UP" if move >= 0 else "DOWN"
+
+        # Crude near-expiry confidence from move size (not TWAP math).
+        model_prob = 1.0 / (1.0 + math.exp(-0.04 * (abs_move - 50.0)))
+        model_prob = min(0.97, max(0.55, model_prob))
+
+        ask_v = float(ask) if ask is not None else None
+        fee_taker = 0.0
+        edge_gross = 0.0
+        edge_net = 0.0
+        if ask_v is not None and 0.0 < ask_v < 1.0:
+            fee_taker = float(fee_rate) * ask_v * (1.0 - ask_v)
+            edge_gross = model_prob - ask_v
+            edge_net = edge_gross - fee_taker
+
+        passed = True
+        reasons: list[str] = []
+
+        if not (window_end_s <= remaining_s <= window_start_s):
+            passed = False
+            reasons.append(
+                f"outside momentum window ({remaining_s:.0f}s left; want {window_end_s:.0f}..{window_start_s:.0f})"
+            )
+        if abs_move < float(min_move_usd):
+            passed = False
+            reasons.append(f"|move| ${abs_move:.1f} < min ${float(min_move_usd):.1f}")
+        if float(max_move_usd) > 0 and abs_move > float(max_move_usd):
+            passed = False
+            reasons.append(f"|move| ${abs_move:.1f} > max ${float(max_move_usd):.1f}")
+        if ask_v is None:
+            passed = False
+            reasons.append("no ask")
+        else:
+            if ask_v < float(min_ask):
+                passed = False
+                reasons.append(f"ask {ask_v:.3f} < min {float(min_ask):.2f}")
+            elif ask_v > float(max_ask):
+                passed = False
+                reasons.append(f"ask {ask_v:.3f} > max {float(max_ask):.2f}")
+            elif float(min_edge) > 0 and edge_net < float(min_edge):
+                passed = False
+                reasons.append(f"net edge {edge_net:+.3f} < required {float(min_edge):+.3f}")
+
+        return TWAPSignal(
+            side=side,
+            z_score=abs_move / 50.0,
+            signed_z=(abs_move / 50.0) if side == "UP" else -(abs_move / 50.0),
+            model_prob=model_prob,
+            ask=ask_v,
+            edge_gross=edge_gross,
+            fee_taker=fee_taker,
+            edge_net=edge_net,
+            s_req=strike,
+            s_0=strike,
+            spot=spot,
+            realized_twap=spot,
+            elapsed_s=elapsed_s,
+            remaining_s=remaining_s,
+            sigma_twap_usd=abs_move,
+            passed_gates=passed,
+            skip_reason="; ".join(reasons),
+        )
