@@ -30,19 +30,24 @@ class RiskManager:
             self.trades_today = 0
             self.save_state()
 
+    def _enforce_live_kill_switches(self) -> bool:
+        """Daily-loss / consecutive-loss caps are live-only; paper must keep filling."""
+        return str(config.MODE).strip().lower() == "live"
+
     def can_trade(self) -> tuple[bool, str]:
         """Check if trading is allowed under current risk limits."""
         self._check_day_rollover()
 
-        # Daily loss limit check
-        if self.daily_pnl <= -config.DAILY_LOSS_LIMIT_USD:
-            return False, f"daily loss limit hit (-${abs(self.daily_pnl):.2f} <= -${config.DAILY_LOSS_LIMIT_USD:.2f})"
+        if self._enforce_live_kill_switches():
+            # Daily loss limit check (live only)
+            if self.daily_pnl <= -config.DAILY_LOSS_LIMIT_USD:
+                return False, f"daily loss limit hit (-${abs(self.daily_pnl):.2f} <= -${config.DAILY_LOSS_LIMIT_USD:.2f})"
 
-        # Consecutive loss check
-        if self.consecutive_losses >= config.MAX_CONSECUTIVE_LOSSES:
-            return False, f"hit {self.consecutive_losses} consecutive losses (max {config.MAX_CONSECUTIVE_LOSSES})"
+            # Consecutive loss check (live only)
+            if self.consecutive_losses >= config.MAX_CONSECUTIVE_LOSSES:
+                return False, f"hit {self.consecutive_losses} consecutive losses (max {config.MAX_CONSECUTIVE_LOSSES})"
 
-        # Minimum bankroll check
+        # Minimum bankroll check (always)
         if self.bankroll < config.BASE_STAKE_USD:
             return False, f"insufficient bankroll (${self.bankroll:.2f} < ${config.BASE_STAKE_USD:.2f})"
 
@@ -115,3 +120,4 @@ class RiskManager:
                         self.trades_today = 0
             except Exception as e:
                 logger.error(f"Failed to load risk state: {e}")
+

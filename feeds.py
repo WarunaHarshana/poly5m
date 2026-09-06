@@ -144,6 +144,15 @@ class ChainlinkRTDSStream:
             current_regime = new_regime
         return crossings
 
+    def mark_stale(self, reason: str = "") -> None:
+        """Force is_stale() true until a fresh RTDS tick arrives (poly15m pattern)."""
+        with self._lock:
+            prev = self._last_tick_time
+            self._last_tick_time = 0.0
+        if prev > 0:
+            logger.warning(
+                f"[ChainlinkRTDS] Marked stale ({reason or 'unknown'}). Waiting for a fresh tick."
+            )
     def is_stale(self, max_age_s: float = 6.0) -> bool:
         with self._lock:
             if not self._history:
@@ -186,6 +195,7 @@ class ChainlinkRTDSStream:
                             raw = await asyncio.wait_for(ws.recv(), timeout=6.0)
                         except asyncio.TimeoutError:
                             logger.warning("[ChainlinkRTDS] Heartbeat timeout (>6s no message), reconnecting stream...")
+                            self.mark_stale("rtds_silence")
                             break
                         if not raw or not raw.strip() or raw in ("PONG", "pong"):
                             continue
@@ -210,8 +220,12 @@ class ChainlinkRTDSStream:
                             ts_s = time.time()
                         self._stream_clock_offset = ts_s - time.time()
                         if value > 0:
+                            was_stale = self.is_stale(max_age_s=6.0)
                             self._record(ts_s, value)
+                            if was_stale:
+                                logger.info(f"[ChainlinkRTDS] Stream resumed: ${value:,.2f}")
             except Exception as e:
+                self.mark_stale(f"rtds_error:{e}")
                 logger.warning(f"[ChainlinkRTDS] connection error: {e}")
                 await asyncio.sleep(2.0)
 
@@ -365,3 +379,4 @@ class PolymarketBookStream:
                 await ws.send("PING")
             except Exception:
                 break
+

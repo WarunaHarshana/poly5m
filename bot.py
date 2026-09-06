@@ -22,6 +22,8 @@ from twap_engine import TWAPEngine, MakerSignal, TWAPSignal
 from feeds import ChainlinkRTDSStream, PolymarketBookStream
 from polymarket_client import PolymarketPublicClient, PolymarketLiveClient
 from risk_manager import RiskManager
+from journal import configure as journal_configure
+from journal import write as journal_write
 
 logging.basicConfig(
     level=logging.INFO,
@@ -207,6 +209,7 @@ class TWAPBot:
                         # Avoid per-second spam once daily loss / consecutive-loss lock is hit
                         if not getattr(self, "_risk_block_logged", False):
                             logger.warning(f"Momentum paused by risk manager: {risk_reason_now}")
+                            journal_write("risk_block", reason=risk_reason_now, mode=config.MODE)
                             self._risk_block_logged = True
                         await asyncio.sleep(2.0)
                         continue
@@ -413,14 +416,43 @@ class TWAPBot:
         logger.info("=" * 60)
 
         order_id = f"{strategy_tag.lower()}_paper_{int(time.time()*1000)}"
+        is_paper = config.MODE != "live"
         if config.MODE == "live" and self.live_client:
             try:
                 resp = self.live_client.place_order(token_id, "BUY", ask, shares, order_type="FOK")
-                order_id = resp.get("orderID", order_id)
+                order_id = resp.get("order_id") or resp.get("orderID") or order_id
                 logger.info(f"Live taker order placed: {resp}")
+                if not resp.get("filled"):
+                    logger.warning(
+                        f"Live FOK not filled (post!=fill). status={resp.get('status')} — skipping position"
+                    )
+                    journal_write(
+                        "skip_round",
+                        reason="fok_unfilled",
+                        side=signal.side,
+                        ask=ask,
+                        response=str(resp)[:300],
+                    )
+                    return
+                if resp.get("shares"):
+                    shares = float(resp["shares"])
+                    cost_usd = round(shares * ask, 2)
             except Exception as e:
                 logger.error(f"Live taker order placement failed: {e}")
                 return
+
+        journal_write(
+            "paper_fill" if is_paper else "fill",
+            strategy=strategy_tag,
+            side=signal.side,
+            price=ask,
+            shares=shares,
+            cost_usd=cost_usd,
+            slot=market.get("slug"),
+            order_id=order_id,
+            z_score=signal.z_score,
+            edge=signal.edge_net,
+        )
 
         self._current_position = {
             "slot": market["slug"],
@@ -459,8 +491,11 @@ class TWAPBot:
         if config.MODE == "live" and self.live_client:
             try:
                 resp = self.live_client.place_order(token_id, "BUY", signal.target_bid, shares, order_type="GTC")
-                order_id = resp.get("orderID", order_id)
+                order_id = resp.get("order_id") or resp.get("orderID") or order_id
                 logger.info(f"Live limit order placed: {resp}")
+                if not resp.get("success"):
+                    logger.warning(f"Live GTC post failed: {resp}")
+                    return
             except Exception as e:
                 logger.error(f"Live limit order placement failed: {e}")
                 return
@@ -675,6 +710,16 @@ class TWAPBot:
             "bankroll": round(self.risk.bankroll, 2),
             "early_exit": True,
         }
+        journal_write(
+            "settlement",
+            slot=record.get("slot"),
+            strategy=record.get("strategy"),
+            side=record.get("side"),
+            won=record.get("won"),
+            pnl=record.get("pnl"),
+            bankroll=record.get("bankroll"),
+            early_exit=True,
+        )
         self._save_trade_record(record)
 
     async def _settle_position(self, market: dict, strike: float) -> None:
@@ -740,6 +785,17 @@ class TWAPBot:
             "pnl": round(pnl, 2),
             "bankroll": round(self.risk.bankroll, 2),
         }
+        journal_write(
+            "settlement",
+            slot=market["slug"],
+            strategy=strategy_name,
+            side=pos["side"],
+            outcome=resolved_side,
+            won=won,
+            pnl=round(pnl, 2),
+            bankroll=round(self.risk.bankroll, 2),
+            early_exit=False,
+        )
         self._save_trade_record(record)
 
     def _save_trade_record(self, record: dict) -> None:

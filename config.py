@@ -82,3 +82,7 @@ if STATE_ROOT:
 else:
     STATE_DIR = Path("state")
 STATE_DIR.mkdir(parents=True, exist_ok=True)
+# --- Event journal (JSONL) ---
+JOURNAL_PATH = os.getenv("JOURNAL_PATH", "").strip()
+if not JOURNAL_PATH:
+    JOURNAL_PATH = str(STATE_DIR / "journal.jsonl")

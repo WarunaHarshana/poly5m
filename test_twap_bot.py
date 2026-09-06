@@ -102,18 +102,23 @@ def test_trapezoidal_integration():
 
 
 def test_risk_manager():
-    risk = RiskManager()
-    risk.bankroll = 50.0
-    risk.daily_pnl = 0.0
-    risk.consecutive_losses = 0
+    import config
+    old_mode = config.MODE
+    try:
+        config.MODE = "live"
+        risk = RiskManager()
+        risk.bankroll = 50.0
+        risk.daily_pnl = 0.0
+        risk.consecutive_losses = 0
 
-    can_trade, _ = risk.can_trade()
-    assert can_trade is True
+        can_trade, _ = risk.can_trade()
+        assert can_trade is True
 
-    # Record 3 losses -> cooldown triggers
-    risk.record_trade_result(-5.0)
-    risk.record_trade_result(-5.0)
-    assert risk.can_trade()[0] is False  # Hit daily loss limit of -$10
+        # Breach daily loss limit (live-only kill switch)
+        risk.record_trade_result(-(config.DAILY_LOSS_LIMIT_USD + 1.0))
+        assert risk.can_trade()[0] is False
+    finally:
+        config.MODE = old_mode
     print("[PASS] test_risk_manager")
 
 
