@@ -130,6 +130,11 @@ class TWAPBot:
                 f"Momentum: move>=${config.MOMENTUM_MIN_MOVE_USD:.0f} | ask=[{config.MOMENTUM_MIN_ASK:.2f}..{config.MOMENTUM_MAX_ASK:.2f}] | "
                 f"window=[{config.MOMENTUM_WINDOW_END_S:.0f}s..{config.MOMENTUM_WINDOW_START_S:.0f}s left]"
             )
+            logger.info(
+                f"Overlays: SL={'on' if config.MOMENTUM_STOP_LOSS_ENABLED else 'off'} "
+                f"exit_before={config.MOMENTUM_EXIT_BEFORE_S:g}s "
+                f"hedge={'on' if config.MOMENTUM_HEDGE_ENABLED else 'off'}"
+            )
         elif config.STRATEGY in ("H-001_SNIPER", "SNIPER", "H-001"):
             logger.info(
                 f"Sniper: min_z={config.MIN_Z_SCORE} | edge>={config.MIN_EDGE:.1%} | "
