@@ -190,6 +190,14 @@ class TWAPBot:
             total += float(pos.get("cost_usd") or 0.0)
         return total
 
+    def _slot_entries_count(self) -> int:
+        """Count how many coins already have open positions in this window."""
+        count = 0
+        for slot in self.slots.values():
+            if slot.position:
+                count += 1
+        return count
+
     def _restored_strike(self, saved: dict, asset: str, slug: str | None, slot_ts: int) -> float | None:
         assets_map = saved.get("assets") or {}
         entry = assets_map.get(asset) or {}
@@ -521,6 +529,10 @@ class TWAPBot:
                     slot_key = market.get("slug", "")
                     if slot_key and slot_key in self._slot_done:
                         pass
+                    elif self._slot_entries_count() >= config.MAX_CONCURRENT_ENTRIES:
+                        logger.warning(
+                            f"[{tag}] Momentum trade skipped: slot entry cap ({config.MAX_CONCURRENT_ENTRIES}) reached"
+                        )
                     else:
                         can_trade, risk_reason = self.risk.can_trade(open_notional=open_notional)
                         if can_trade:
@@ -562,11 +574,16 @@ class TWAPBot:
                 )
 
                 if signal.passed_gates and not slot.position:
-                    can_trade, risk_reason = self.risk.can_trade(open_notional=open_notional)
-                    if can_trade:
-                        await self._place_taker_order(slot, market, signal, best_ask)
+                    if self._slot_entries_count() >= config.MAX_CONCURRENT_ENTRIES:
+                        logger.warning(
+                            f"[{tag}] Sniper trade skipped: slot entry cap ({config.MAX_CONCURRENT_ENTRIES}) reached"
+                        )
                     else:
-                        logger.warning(f"[{tag}] Sniper trade blocked by risk manager: {risk_reason}")
+                        can_trade, risk_reason = self.risk.can_trade(open_notional=open_notional)
+                        if can_trade:
+                            await self._place_taker_order(slot, market, signal, best_ask)
+                        else:
+                            logger.warning(f"[{tag}] Sniper trade blocked by risk manager: {risk_reason}")
         else:
             signal = slot.engine.evaluate_maker(
                 spot=spot,
@@ -591,11 +608,16 @@ class TWAPBot:
                 )
 
                 if signal.passed_gates and not slot.resting_order and not slot.position:
-                    can_trade, risk_reason = self.risk.can_trade(open_notional=open_notional)
-                    if can_trade:
-                        await self._place_maker_bid(slot, market, signal)
+                    if self._slot_entries_count() >= config.MAX_CONCURRENT_ENTRIES:
+                        logger.warning(
+                            f"[{tag}] Maker trade skipped: slot entry cap ({config.MAX_CONCURRENT_ENTRIES}) reached"
+                        )
                     else:
-                        logger.warning(f"[{tag}] Maker trade blocked by risk manager: {risk_reason}")
+                        can_trade, risk_reason = self.risk.can_trade(open_notional=open_notional)
+                        if can_trade:
+                            await self._place_maker_bid(slot, market, signal)
+                        else:
+                            logger.warning(f"[{tag}] Maker trade blocked by risk manager: {risk_reason}")
 
             if slot.resting_order and not slot.position:
                 ro = slot.resting_order

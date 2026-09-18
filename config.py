@@ -17,6 +17,8 @@ MAX_ORACLE_STALE_S = float(os.getenv("MAX_ORACLE_STALE_S", os.getenv("ORACLE_STA
 
 # Polymarket 5-minute Up/Down coins (Chainlink TWAP settlement).
 KNOWN_5M_ASSETS = ("btc", "eth", "sol", "bnb", "xrp", "doge", "hype")
+# Default assets list excludes HYPE (3.5% daily vol, 33% win rate, high noise)
+DEFAULT_5M_ASSETS = ("btc", "eth", "sol", "bnb", "xrp", "doge")
 
 
 def _parse_asset_list(raw: str) -> list[str]:
@@ -32,7 +34,7 @@ _assets_env = os.getenv("ASSETS", "").strip()
 if _assets_env:
     ASSETS = _parse_asset_list(_assets_env)
 else:
-    ASSETS = list(KNOWN_5M_ASSETS)
+    ASSETS = list(DEFAULT_5M_ASSETS)
 
 _asset_env = os.getenv("ASSET", "").strip().lower()
 if _asset_env in KNOWN_5M_ASSETS and not _assets_env:
@@ -109,6 +111,9 @@ PAPER_FOK_REQUIRE_SIZE = os.getenv("PAPER_FOK_REQUIRE_SIZE", "yes").strip().lowe
 # Settle from Polymarket Gamma, not our local TWAP. Wait this long after the window.
 RESOLUTION_TIMEOUT_S = float(os.getenv("RESOLUTION_TIMEOUT_S", "180.0"))
 RESOLUTION_PRICE_MIN = float(os.getenv("RESOLUTION_PRICE_MIN", "0.99"))
+# Cap how many coins can open new positions in a single 5-minute slot.
+# Prevents correlated multi-asset blowups when all crypto trends together.
+MAX_CONCURRENT_ENTRIES = int(os.getenv("MAX_CONCURRENT_ENTRIES", "3"))
 
 
 def _fenv(name: str, default: float) -> float:
@@ -147,21 +152,21 @@ _DAILY_VOL = {
 _MAX_BUY = {
     "btc": 0.92,
     "eth": 0.92,
-    "sol": 0.92,
+    "sol": 0.88,   # was 0.92 — force cheaper entries (SOL lost at 0.91)
     "bnb": 0.92,
-    "xrp": 0.90,
-    "doge": 0.88,
-    "hype": 0.90,
+    "xrp": 0.88,   # was 0.90
+    "doge": 0.85,   # was 0.88
+    "hype": 0.85,   # was 0.90
 }
-# Slightly higher Z on noisier coins.
+# Higher Z on noisier coins to prevent coin-flip entries.
 _MIN_Z = {
     "btc": 1.65,
     "eth": 1.65,
-    "sol": 1.70,
+    "sol": 2.00,    # was 1.70 — lost at Z=1.94
     "bnb": 1.70,
-    "xrp": 1.75,
-    "doge": 1.80,
-    "hype": 1.80,
+    "xrp": 2.20,    # was 1.75 — lost at Z=7.5 but asset is too noisy
+    "doge": 2.50,   # was 1.80 — lost at Z=4.1
+    "hype": 2.50,   # was 1.80 — 33% WR, toxic
 }
 
 

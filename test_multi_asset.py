@@ -98,6 +98,23 @@ def test_risk_accounts_for_open_notional():
         config.MODE = old_mode
 
 
+def test_max_concurrent_entries_count():
+    class DummyBot:
+        _slot_entries_count = TWAPBot._slot_entries_count
+
+    b = DummyBot()
+    b.slots = {
+        "btc": CoinSlot(asset="btc", params=config._load_asset_params("btc"), engine=None, position={"shares": 5.0}),
+        "eth": CoinSlot(asset="eth", params=config._load_asset_params("eth"), engine=None, position={"shares": 5.0}),
+        "sol": CoinSlot(asset="sol", params=config._load_asset_params("sol"), engine=None, position={"shares": 5.0}),
+        "bnb": CoinSlot(asset="bnb", params=config._load_asset_params("bnb"), engine=None, position=None),
+    }
+    assert b._slot_entries_count() == 3
+    assert b._slot_entries_count() >= config.MAX_CONCURRENT_ENTRIES
+
+
+
+
 if __name__ == "__main__":
     test_known_5m_assets()
     test_per_coin_sigma_and_chop_scale_with_spot()
