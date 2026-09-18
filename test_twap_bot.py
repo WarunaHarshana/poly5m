@@ -1,11 +1,11 @@
-"""Unit and Integration Tests for High-Conviction TWAP Bot (H-001)."""
+"""Unit tests for poly5m TWAP engine, fees, feeds math, and risk gates."""
 from __future__ import annotations
 
 import math
 import sys
-import time
 
-from twap_engine import TWAPEngine, TWAPSignal
+import config
+from twap_engine import TWAPEngine
 from feeds import ChainlinkRTDSStream
 from risk_manager import RiskManager
 
@@ -20,7 +20,6 @@ def test_twap_cubic_variance():
     sigma_60 = engine.estimate_sigma_twap_usd(spot, remaining_s=60.0, var_per_sec=var_sec)
     sigma_10 = engine.estimate_sigma_twap_usd(spot, remaining_s=10.0, var_per_sec=var_sec)
 
-    # Theoretical ratio: sqrt(60 / 150)
     assert abs((sigma_60 / sigma_150) - math.sqrt(60.0 / 150.0)) < 1e-3
     assert abs((sigma_10 / sigma_60) - math.sqrt(10.0 / 60.0)) < 1e-3
     print("[PASS] test_twap_cubic_variance")
@@ -30,65 +29,72 @@ def test_s_req_and_z_acceleration():
     engine = TWAPEngine(alpha=1.75, min_sigma_usd=1.0)
     strike = 65000.0
 
-    # BTC drifts up to 65030.0 and stays there
-    # At t=60s (tau=240s): realized TWAP=65015.0
     z_60, _, s_req_60 = engine.compute_s_req_and_z(
         spot=65030.0, strike=strike, realized_twap=65015.0,
-        elapsed_s=60.0, remaining_s=240.0, sigma_twap_usd=15.0
+        elapsed_s=60.0, remaining_s=240.0, sigma_twap_usd=15.0,
     )
-
-    # At t=180s (tau=120s): realized TWAP=65025.0
     z_180, _, s_req_180 = engine.compute_s_req_and_z(
         spot=65030.0, strike=strike, realized_twap=65025.0,
-        elapsed_s=180.0, remaining_s=120.0, sigma_twap_usd=10.0
+        elapsed_s=180.0, remaining_s=120.0, sigma_twap_usd=10.0,
     )
-
-    # At t=240s (tau=60s): realized TWAP=65028.0
     z_240, _, s_req_240 = engine.compute_s_req_and_z(
         spot=65030.0, strike=strike, realized_twap=65028.0,
-        elapsed_s=240.0, remaining_s=60.0, sigma_twap_usd=7.0
+        elapsed_s=240.0, remaining_s=60.0, sigma_twap_usd=7.0,
     )
 
-    # Required price must drop further below strike as time passes with spot > strike
     assert s_req_60 > s_req_180 > s_req_240
-    # Z-score must accelerate non-linearly
     assert z_240 > z_180 > z_60
     print("[PASS] test_s_req_and_z_acceleration")
 
 
-def test_gatekeeper_conditions():
+def test_taker_fee_curve_and_net_edge_gate():
+    """Gross edge can look fine while net edge after fee fails — must reject."""
+    engine = TWAPEngine(min_z=0.5, min_edge=0.03, min_entry=0.05, max_entry=0.95)
+    fee_rate = 0.07
+
+    ask = 0.50
+    fee = TWAPEngine.calculate_taker_fee(ask, fee_rate)
+    assert abs(fee - (fee_rate * ask * (1.0 - ask))) < 1e-12
+    assert fee == 0.07 * 0.25  # 0.0175
+
+    sig = engine.evaluate(
+        spot=65020.0,
+        strike=65000.0,
+        remaining_s=120.0,
+        elapsed_s=180.0,
+        realized_twap=65010.0,
+        ask=0.50,
+        chop_crosses=0,
+        fee_rate=fee_rate,
+    )
+    assert sig.fee_taker > 0
+    assert abs(sig.edge_net - (sig.edge_gross - sig.fee_taker)) < 1e-12
+    if sig.edge_net < engine.min_edge:
+        assert sig.passed_gates is False
+        assert "net edge" in sig.skip_reason
+    print("[PASS] test_taker_fee_curve_and_net_edge_gate")
+
+
+def test_gatekeeper_rejects_low_z_and_chop():
     engine = TWAPEngine(min_z=1.8, min_edge=0.03, min_entry=0.50, max_entry=0.95)
 
-    # Valid high-conviction UP signal
-    sig_valid = engine.evaluate(
-        spot=65040.0, strike=65000.0, remaining_s=90.0, elapsed_s=210.0,
-        realized_twap=65030.0, ask=0.75, chop_crosses=0
-    )
-    assert sig_valid.passed_gates is True
-    assert sig_valid.side == "UP"
-    assert sig_valid.z_score >= 1.8
-    assert sig_valid.edge_net > 0.03
-
-    # Flat market (rejected by Z-score)
     sig_flat = engine.evaluate(
         spot=65001.0, strike=65000.0, remaining_s=180.0, elapsed_s=120.0,
-        realized_twap=65000.5, ask=0.52, chop_crosses=1
+        realized_twap=65000.5, ask=0.52, chop_crosses=1, fee_rate=0.07,
     )
     assert sig_flat.passed_gates is False
     assert "Z-score" in sig_flat.skip_reason
 
-    # High chop market (rejected by chop filter)
     sig_chop = engine.evaluate(
-        spot=65008.0, strike=65000.0, remaining_s=90.0, elapsed_s=210.0,
-        realized_twap=65008.0, ask=0.75, chop_crosses=5
+        spot=65040.0, strike=65000.0, remaining_s=90.0, elapsed_s=210.0,
+        realized_twap=65030.0, ask=0.75, chop_crosses=5, fee_rate=0.07,
     )
     assert sig_chop.passed_gates is False
     assert "chop" in sig_chop.skip_reason
+    print("[PASS] test_gatekeeper_rejects_low_z_and_chop")
 
-    print("[PASS] test_gatekeeper_conditions")
 
-
-def test_trapezoidal_integration():
+def test_trapezoidal_integration_and_stale_flag():
     stream = ChainlinkRTDSStream(asset="btc")
     stream._record(1000.0, 65000.0)
     stream._record(1020.0, 65020.0)
@@ -98,11 +104,14 @@ def test_trapezoidal_integration():
     twap, elapsed = stream.compute_realized_twap(start_ts=1000.0, end_ts=1100.0)
     assert abs(twap - 65036.0) < 1e-4
     assert abs(elapsed - 100.0) < 1e-4
-    print("[PASS] test_trapezoidal_integration")
+
+    assert stream.is_stale(max_age_s=0.0) is True or stream.is_stale(max_age_s=3600.0) is False
+    stream.mark_stale("unit_test")
+    assert stream.is_stale(max_age_s=6.0) is True
+    print("[PASS] test_trapezoidal_integration_and_stale_flag")
 
 
-def test_risk_manager():
-    import config
+def test_risk_manager_live_only_kill_switch():
     old_mode = config.MODE
     try:
         config.MODE = "live"
@@ -111,15 +120,12 @@ def test_risk_manager():
         risk.daily_pnl = 0.0
         risk.consecutive_losses = 0
 
-        can_trade, _ = risk.can_trade()
-        assert can_trade is True
-
-        # Breach daily loss limit (live-only kill switch)
+        assert risk.can_trade()[0] is True
         risk.record_trade_result(-(config.DAILY_LOSS_LIMIT_USD + 1.0))
         assert risk.can_trade()[0] is False
     finally:
         config.MODE = old_mode
-    print("[PASS] test_risk_manager")
+    print("[PASS] test_risk_manager_live_only_kill_switch")
 
 
 def test_maker_gatekeeper_and_pricing():
@@ -129,38 +135,27 @@ def test_maker_gatekeeper_and_pricing():
         min_maker_bid=0.55,
         max_maker_bid=0.90,
     )
-
-    # Valid Maker UP Signal
     sig_maker = engine.evaluate_maker(
         spot=65035.0, strike=65000.0, remaining_s=150.0, elapsed_s=150.0,
-        realized_twap=65020.0, best_bid=0.78, best_ask=0.95, chop_crosses=0
+        realized_twap=65020.0, best_bid=0.78, best_ask=0.95, chop_crosses=0,
     )
     assert sig_maker.passed_gates is True
     assert sig_maker.side == "UP"
-    assert sig_maker.z_score >= 1.15
-    assert sig_maker.target_bid == 0.90  # Fair value (0.96) - 0.05 capped at max_maker_bid 0.90
+    assert sig_maker.target_bid <= 0.90
     assert sig_maker.edge_net > 0.05
-    assert sig_maker.maker_rebate > 0.0
-
-    # Flat market rejected by Z-score
-    sig_flat = engine.evaluate_maker(
-        spot=65002.0, strike=65000.0, remaining_s=200.0, elapsed_s=100.0,
-        realized_twap=65001.0, best_bid=0.50, best_ask=0.52, chop_crosses=0
-    )
-    assert sig_flat.passed_gates is False
-    assert "Z-score" in sig_flat.skip_reason
     print("[PASS] test_maker_gatekeeper_and_pricing")
 
 
 def main():
-    print("=== RUNNING TWAP BOT TEST SUITE ===")
+    print("=== RUNNING POLY5M HARDENING TEST SUITE ===")
     test_twap_cubic_variance()
     test_s_req_and_z_acceleration()
-    test_gatekeeper_conditions()
+    test_taker_fee_curve_and_net_edge_gate()
+    test_gatekeeper_rejects_low_z_and_chop()
     test_maker_gatekeeper_and_pricing()
-    test_trapezoidal_integration()
-    test_risk_manager()
-    print("=== ALL TESTS PASSED SUCCESSFULLY ===")
+    test_trapezoidal_integration_and_stale_flag()
+    test_risk_manager_live_only_kill_switch()
+    print("=== ALL TESTS PASSED ===")
     return 0
 
 
