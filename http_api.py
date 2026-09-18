@@ -18,6 +18,13 @@ logger = logging.getLogger("http-api")
 SnapshotFn = Callable[[], dict[str, Any]]
 
 
+def is_official_trade(row: dict) -> bool:
+    src = str(row.get("settlement_source") or "")
+    if src.startswith("polymarket"):
+        return True
+    return row.get("official") is True
+
+
 def load_trades(path: Path) -> list[dict]:
     if not path.exists():
         return []
@@ -53,7 +60,8 @@ def public_trade(row: dict) -> dict:
         "early_exit": bool(row.get("early_exit")),
         "entry_time_utc": row.get("timestamp"),
         "settlement_source": row.get("settlement_source"),
-        "official": row.get("official"),
+        "official": is_official_trade(row),
+        "unofficial": not is_official_trade(row),
         "polymarket_url": f"https://polymarket.com/event/{slug}" if slug else None,
     }
 
@@ -142,6 +150,11 @@ def _make_handler(bot_snapshot: SnapshotFn, trades_path: Path):
                     return
                 trades = load_trades(trades_path)
                 asset_filter = (qs.get("asset") or [""])[0].strip().lower()
+                include_unofficial = (qs.get("include_unofficial") or ["0"])[0].strip().lower() in (
+                    "1", "true", "yes"
+                )
+                if not include_unofficial:
+                    trades = [t for t in trades if is_official_trade(t)]
                 if path == "/trades":
                     rows = [public_trade(t) for t in reversed(trades)]
                     if asset_filter:

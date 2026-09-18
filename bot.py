@@ -29,7 +29,7 @@ from polymarket_client import (
 from risk_manager import RiskManager
 from journal import configure as journal_configure
 from journal import write as journal_write
-from http_api import StatusServer
+from http_api import StatusServer, is_official_trade, load_trades
 
 logging.basicConfig(
     level=logging.INFO,
@@ -157,6 +157,26 @@ class TWAPBot:
         except Exception as e:
             logger.warning(f"Failed to save slot state: {e}")
 
+    def _reconcile_paper_blotter(self) -> None:
+        """Paper bankroll follows official Polymarket settlements only."""
+        if config.MODE == "live":
+            return
+        trades = load_trades(self._trades_log_path)
+        official = [t for t in trades if is_official_trade(t)]
+        ghost = len(trades) - len(official)
+        pnl = sum(float(t.get("pnl") or 0.0) for t in official if t.get("won") is not None)
+        self.risk.bankroll = round(config.STARTING_BANKROLL + pnl, 2)
+        self.risk.daily_pnl = round(
+            sum(float(t.get("pnl") or 0.0) for t in official if t.get("won") is not None),
+            2,
+        )
+        self.risk.save_state()
+        if ghost:
+            logger.warning(
+                f"Paper blotter: {ghost} unofficial local-TWAP rows ignored. "
+                f"Bankroll reset to ${self.risk.bankroll:.2f} from official PnL only."
+            )
+
     def _open_notional(self) -> float:
         total = 0.0
         for slot in self.slots.values():
@@ -266,14 +286,21 @@ class TWAPBot:
             logger.info("Daily-loss / consecutive-loss kill switches: DISABLED (paper mode keeps filling)")
         else:
             logger.info(f"Daily loss limit: ${config.DAILY_LOSS_LIMIT_USD:.2f} | Max consecutive losses: {config.MAX_CONSECUTIVE_LOSSES}")
+        self._reconcile_paper_blotter()
         if self._trades_log_path.exists():
             try:
-                with open(self._trades_log_path, "r") as f:
-                    all_trades = json.load(f)
-                    total_wins = sum(1 for t in all_trades if t.get("won"))
-                    total_losses = len(all_trades) - total_wins
-                    total_pnl = sum(float(t.get("pnl", 0.0)) for t in all_trades)
-                    logger.info(f"Historical Blotter: {len(all_trades)} trades ({total_wins}W / {total_losses}L) | Net PnL: ${total_pnl:+.2f}")
+                all_trades = load_trades(self._trades_log_path)
+                official = [t for t in all_trades if is_official_trade(t)]
+                shown = official if config.MODE != "live" else all_trades
+                total_wins = sum(1 for t in shown if t.get("won"))
+                total_losses = sum(1 for t in shown if t.get("won") is False)
+                total_pnl = sum(float(t.get("pnl", 0.0)) for t in shown)
+                ghost = len(all_trades) - len(official)
+                logger.info(
+                    f"Historical Blotter: {len(shown)} official trades ({total_wins}W / {total_losses}L) "
+                    f"| Net PnL: ${total_pnl:+.2f}"
+                    + (f" | ignored {ghost} unofficial local-TWAP rows" if ghost else "")
+                )
             except Exception:
                 pass
         logger.info("=" * 70)

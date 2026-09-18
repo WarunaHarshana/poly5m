@@ -44,6 +44,10 @@ def test_public_trade_and_stats(tmp_path: Path):
     row = public_trade(loaded[0])
     assert row["slug"] == "btc-updown-5m-1"
     assert row["polymarket_url"].endswith("btc-updown-5m-1")
+    from http_api import is_official_trade
+    loaded[0]["settlement_source"] = "polymarket_outcome_prices"
+    loaded[1]["settlement_source"] = "polymarket_outcome_prices"
+    assert is_official_trade(loaded[0]) is True
     stats = build_stats(loaded, {"mode": "paper_live", "bankroll": 48.0})
     assert stats["trades"] == 2
     assert stats["wins"] == 1
