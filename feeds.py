@@ -146,7 +146,10 @@ class ChainlinkRTDSStream:
             # Pad start and end
             pts = []
             if window_ticks[0][0] > start:
-                pts.append((start, window_ticks[0][1]))
+                # Use last known tick BEFORE the window to avoid lookahead bias
+                prior = [p for ts, p in ticks if ts <= start]
+                start_price = prior[-1] if prior else window_ticks[0][1]
+                pts.append((start, start_price))
             pts.extend(window_ticks)
             if pts[-1][0] < end:
                 pts.append((end, pts[-1][1]))

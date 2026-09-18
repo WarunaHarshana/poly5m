@@ -23,8 +23,12 @@ def _json_list(val) -> list:
     return []
 
 
-def fillable_ask_shares(book: dict | None, limit_px: float) -> tuple[float, float]:
-    """Shares and VWAP available to a buy at or below limit_px (FOK simulation)."""
+def fillable_ask_shares(book: dict | None, limit_px: float, requested_shares: float = 0.0) -> tuple[float, float]:
+    """Shares and VWAP available to a buy at or below limit_px (FOK simulation).
+
+    If requested_shares > 0, stops accumulating once enough liquidity is found
+    and returns the VWAP for just that portion of the book.
+    """
     if not book or limit_px <= 0:
         return 0.0, 0.0
     asks = book.get("asks") or []
@@ -39,8 +43,13 @@ def fillable_ask_shares(book: dict | None, limit_px: float) -> tuple[float, floa
         if px <= 0 or sz <= 0:
             continue
         if px <= float(limit_px) + 1e-9:
-            shares += sz
-            notional += sz * px
+            if requested_shares > 0 and shares >= requested_shares:
+                break  # enough liquidity found for the requested order size
+            take = sz
+            if requested_shares > 0 and (shares + sz) > requested_shares:
+                take = requested_shares - shares  # partial fill of this level
+            shares += take
+            notional += take * px
     vwap = (notional / shares) if shares > 0 else 0.0
     return shares, vwap
 

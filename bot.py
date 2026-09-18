@@ -184,6 +184,10 @@ class TWAPBot:
                 total += float(slot.position.get("cost_usd") or 0.0)
             elif slot.resting_order:
                 total += float(slot.resting_order.get("cost_usd") or 0.0)
+        # Include capital tied up in positions awaiting Polymarket resolution
+        for item in self._pending_settles:
+            pos = item.get("position") or {}
+            total += float(pos.get("cost_usd") or 0.0)
         return total
 
     def _restored_strike(self, saved: dict, asset: str, slug: str | None, slot_ts: int) -> float | None:
@@ -523,7 +527,8 @@ class TWAPBot:
                             await self._place_taker_order(
                                 slot, market, signal, best_ask, strategy_tag="H-005_MOMENTUM"
                             )
-                            if slot_key:
+                            # Only mark done if order actually filled (position populated)
+                            if slot.position and slot_key:
                                 self._slot_done.add(slot_key)
                                 self._save_slot_state(
                                     slot_ts=slot_start_ts,
@@ -937,6 +942,27 @@ class TWAPBot:
         pos = slot.position
         if not pos:
             return
+
+        shares = float(pos["shares"])
+        cost = float(pos["cost_usd"])
+        fee = float(pos.get("fee", 0.0))
+        rebate = float(pos.get("rebate", 0.0))
+        exit_price = float(exit_price)
+
+        # Paper / live flatten of main
+        if config.MODE == "live" and self.live_client:
+            try:
+                resp = self.live_client.place_order(
+                    pos["token_id"], "SELL", max(0.01, exit_price), shares, order_type="FOK"
+                )
+                if not resp or not resp.get("filled"):
+                    logger.error(f"Live early exit SELL not filled ({reason}), retaining position for retry")
+                    return  # keep slot.position alive so bot retries next tick
+            except Exception as e:
+                logger.error(f"Live early exit sell failed ({reason}): {e} — retaining position for retry")
+                return  # keep slot.position alive so bot retries next tick
+
+        # Only clear position AFTER confirming exit (paper always succeeds, live confirmed above)
         slot.position = None
         slot_key = market.get("slug") or pos.get("slot")
         if slot_key:
@@ -948,20 +974,6 @@ class TWAPBot:
                 asset=slot.asset,
             )
 
-        shares = float(pos["shares"])
-        cost = float(pos["cost_usd"])
-        fee = float(pos.get("fee", 0.0))
-        rebate = float(pos.get("rebate", 0.0))
-        exit_price = float(exit_price)
-
-        # Paper / live flatten of main
-        if config.MODE == "live" and self.live_client:
-            try:
-                self.live_client.place_order(
-                    pos["token_id"], "SELL", max(0.01, exit_price), shares, order_type="FOK"
-                )
-            except Exception as e:
-                logger.error(f"Live early exit sell failed ({reason}): {e}")
 
         main_pnl = (shares * exit_price) - cost - fee + rebate
 
@@ -1016,6 +1028,8 @@ class TWAPBot:
             "pnl": round(pnl, 2),
             "bankroll": round(self.risk.bankroll, 2),
             "early_exit": True,
+            "official": True,
+            "settlement_source": f"early_exit_{reason}",
         }
         journal_write(
             "settlement",
