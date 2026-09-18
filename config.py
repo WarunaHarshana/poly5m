@@ -48,6 +48,8 @@ CHAINLINK_RTDS_URL = os.getenv("CHAINLINK_RTDS_URL", "wss://ws-live-data.polymar
 CLOB_WS_URL = os.getenv("CLOB_WS_URL", "wss://ws-subscriptions-clob.polymarket.com/ws/market").strip()
 GAMMA_HOST = os.getenv("GAMMA_HOST", "https://gamma-api.polymarket.com").strip()
 CLOB_HOST = os.getenv("CLOB_HOST", "https://clob.polymarket.com").strip()
+HTTP_HOST = os.getenv("HTTP_HOST", "0.0.0.0").strip() or "0.0.0.0"
+HTTP_PORT = int(os.getenv("PORT") or os.getenv("HTTP_PORT") or "8080")
 CHAIN_ID = int(os.getenv("CHAIN_ID", "137"))  # Polygon PoS
 
 # --- Polymarket Authentication (for MODE=live) ---

@@ -25,6 +25,7 @@ from polymarket_client import PolymarketPublicClient, PolymarketLiveClient
 from risk_manager import RiskManager
 from journal import configure as journal_configure
 from journal import write as journal_write
+from http_api import StatusServer
 
 logging.basicConfig(
     level=logging.INFO,
@@ -86,6 +87,8 @@ class TWAPBot:
             self.live_client = PolymarketLiveClient()
 
         self._stop = False
+        self._started_at = time.time()
+        self._http: StatusServer | None = None
         self._slot_done: set[str] = set()  # slugs we already traded/exited this process
         self._trades_log_path = config.STATE_DIR / "trades.json"
         for _slug in (self._load_slot_state().get("slot_done") or []):
@@ -171,11 +174,38 @@ class TWAPBot:
         except (TypeError, ValueError):
             return None
 
+    def snapshot(self) -> dict:
+        open_positions = []
+        for slot in self.slots.values():
+            if not slot.position:
+                continue
+            pos = slot.position
+            open_positions.append({
+                "asset": slot.asset,
+                "slug": pos.get("slot") or (slot.market or {}).get("slug"),
+                "side": pos.get("side"),
+                "price": pos.get("price"),
+                "shares": pos.get("shares"),
+                "cost_usd": pos.get("cost_usd"),
+                "strategy": pos.get("strategy"),
+            })
+        return {
+            "mode": config.MODE,
+            "strategy": config.STRATEGY,
+            "assets": list(config.ASSETS),
+            "bankroll": round(float(self.risk.bankroll), 2),
+            "daily_pnl": round(float(self.risk.daily_pnl), 2),
+            "open_positions": open_positions,
+            "uptime_seconds": round(time.time() - self._started_at, 1),
+        }
+
     def stop(self) -> None:
         logger.info("Stopping bot...")
         self._stop = True
         self.cl_stream.stop()
         self.book_stream.stop()
+        if self._http:
+            self._http.stop()
 
     async def start(self) -> None:
         logger.info("=" * 70)
@@ -230,6 +260,17 @@ class TWAPBot:
             except Exception:
                 pass
         logger.info("=" * 70)
+
+        try:
+            self._http = StatusServer(
+                snapshot=self.snapshot,
+                trades_path=self._trades_log_path,
+                host=config.HTTP_HOST,
+                port=config.HTTP_PORT,
+            )
+            self._http.start()
+        except Exception as e:
+            logger.warning(f"Status HTTP server failed to bind: {e}")
 
         # Start feeds
         logger.info("Connecting to Chainlink RTDS WebSocket (wss://ws-live-data.polymarket.com)...")

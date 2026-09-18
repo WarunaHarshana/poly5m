@@ -4,6 +4,7 @@
     "builder": "DOCKERFILE"
   },
   "deploy": {
+    "healthcheckPath": "/health",
     "restartPolicyType": "ALWAYS",
     "restartPolicyMaxRetries": 10,
     "multiRegionConfig": {
