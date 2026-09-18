@@ -104,6 +104,11 @@ MAX_STAKE_USD = float(os.getenv("MAX_STAKE_USD", "10.0"))
 DAILY_LOSS_LIMIT_USD = float(os.getenv("DAILY_LOSS_LIMIT_USD", "15.0"))
 MAX_CONSECUTIVE_LOSSES = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "4"))
 MIN_ORDER_SHARES = float(os.getenv("MIN_ORDER_SHARES", "5.0"))
+# Paper FOK must be fully fillable from the live book (no phantom size).
+PAPER_FOK_REQUIRE_SIZE = os.getenv("PAPER_FOK_REQUIRE_SIZE", "yes").strip().lower() in ("yes", "y", "true", "1")
+# Settle from Polymarket Gamma, not our local TWAP. Wait this long after the window.
+RESOLUTION_TIMEOUT_S = float(os.getenv("RESOLUTION_TIMEOUT_S", "180.0"))
+RESOLUTION_PRICE_MIN = float(os.getenv("RESOLUTION_PRICE_MIN", "0.99"))
 
 
 def _fenv(name: str, default: float) -> float:

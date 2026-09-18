@@ -11,6 +11,117 @@ import config
 logger = logging.getLogger("client")
 
 
+def _json_list(val) -> list:
+    if isinstance(val, list):
+        return val
+    if isinstance(val, str) and val.strip():
+        try:
+            parsed = json.loads(val)
+            return parsed if isinstance(parsed, list) else []
+        except Exception:
+            return []
+    return []
+
+
+def fillable_ask_shares(book: dict | None, limit_px: float) -> tuple[float, float]:
+    """Shares and VWAP available to a buy at or below limit_px (FOK simulation)."""
+    if not book or limit_px <= 0:
+        return 0.0, 0.0
+    asks = book.get("asks") or []
+    shares = 0.0
+    notional = 0.0
+    for level in asks:
+        try:
+            px = float(level.get("price"))
+            sz = float(level.get("size") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if px <= 0 or sz <= 0:
+            continue
+        if px <= float(limit_px) + 1e-9:
+            shares += sz
+            notional += sz * px
+    vwap = (notional / shares) if shares > 0 else 0.0
+    return shares, vwap
+
+
+def parse_event_resolution(ev: dict | None, now_ts: float | None = None) -> dict | None:
+    """Map a Gamma event to {side, source, final_price, price_to_beat} once the window is over.
+
+    Does not treat in-window book prices as a result. After close, uses outcomePrices
+    (>= RESOLUTION_PRICE_MIN) or eventMetadata.finalPrice vs priceToBeat.
+    """
+    if not isinstance(ev, dict):
+        return None
+    markets = ev.get("markets") or []
+    m = markets[0] if markets else {}
+    meta = ev.get("eventMetadata") if isinstance(ev.get("eventMetadata"), dict) else {}
+    end_ts = None
+    try:
+        # slug ...-{unix}
+        slug = str(ev.get("slug") or (m.get("slug") if isinstance(m, dict) else "") or "")
+        tail = slug.rsplit("-", 1)[-1]
+        end_ts = int(tail) + int(config.SLOT_SECONDS)
+    except Exception:
+        end_ts = None
+    now = time.time() if now_ts is None else float(now_ts)
+    window_over = True if end_ts is None else now >= float(end_ts) + 1.0
+
+    outcomes = _json_list(m.get("outcomes") if isinstance(m, dict) else None)
+    prices = _json_list(m.get("outcomePrices") if isinstance(m, dict) else None)
+    closed = bool(m.get("closed") or ev.get("closed") or m.get("automaticallyResolved"))
+    uma_done = str(m.get("umaResolutionStatus") or "").lower() == "resolved"
+
+    def _side_from_label(label: str) -> str | None:
+        o = str(label).strip().lower()
+        if o in ("up", "yes", "higher", "above"):
+            return "UP"
+        if o in ("down", "no", "lower", "below"):
+            return "DOWN"
+        return None
+
+    official = closed or uma_done
+    if official or window_over:
+        best_side = None
+        best_px = -1.0
+        for label, raw_px in zip(outcomes, prices):
+            try:
+                px = float(raw_px)
+            except (TypeError, ValueError):
+                continue
+            side = _side_from_label(label)
+            if side and px > best_px:
+                best_px = px
+                best_side = side
+        threshold = 0.99 if official else float(config.RESOLUTION_PRICE_MIN)
+        if best_side and best_px >= threshold:
+            return {
+                "side": best_side,
+                "source": "polymarket_outcome_prices",
+                "confidence": best_px,
+                "final_price": meta.get("finalPrice"),
+                "price_to_beat": meta.get("priceToBeat"),
+                "official": official,
+            }
+
+    try:
+        final_px = float(meta["finalPrice"]) if meta.get("finalPrice") is not None else None
+        beat = float(meta["priceToBeat"]) if meta.get("priceToBeat") is not None else None
+    except (TypeError, ValueError):
+        final_px, beat = None, None
+    if window_over and final_px is not None and beat is not None and beat > 0:
+        side = "UP" if final_px >= beat else "DOWN"
+        return {
+            "side": side,
+            "source": "polymarket_event_metadata",
+            "confidence": 1.0,
+            "final_price": final_px,
+            "price_to_beat": beat,
+            "official": official,
+        }
+    return None
+
+
 class PolymarketPublicClient:
     """Read-only client for Gamma market discovery and CLOB REST quotes."""
 
@@ -75,6 +186,19 @@ class PolymarketPublicClient:
                 continue
 
         return None
+
+    def get_event(self, slug: str) -> dict | None:
+        try:
+            r = self.session.get(f"{config.GAMMA_HOST}/events", params={"slug": slug}, timeout=self.timeout)
+            data = r.json()
+            ev = data[0] if isinstance(data, list) and data else (data if isinstance(data, dict) else None)
+            return ev if isinstance(ev, dict) else None
+        except Exception:
+            return None
+
+    def get_resolution(self, slug: str, now_ts: float | None = None) -> dict | None:
+        """Official (or post-close implied) Up/Down resolution from Gamma. None if still open."""
+        return parse_event_resolution(self.get_event(slug), now_ts=now_ts)
 
     def get_order_book(self, token_id: str) -> dict | None:
         """Fetch REST snapshot of the order book for token_id."""

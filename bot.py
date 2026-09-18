@@ -21,7 +21,11 @@ from pathlib import Path
 import config
 from twap_engine import TWAPEngine, MakerSignal, TWAPSignal
 from feeds import ChainlinkRTDSStream, PolymarketBookStream
-from polymarket_client import PolymarketPublicClient, PolymarketLiveClient
+from polymarket_client import (
+    PolymarketPublicClient,
+    PolymarketLiveClient,
+    fillable_ask_shares,
+)
 from risk_manager import RiskManager
 from journal import configure as journal_configure
 from journal import write as journal_write
@@ -90,6 +94,7 @@ class TWAPBot:
         self._started_at = time.time()
         self._http: StatusServer | None = None
         self._slot_done: set[str] = set()  # slugs we already traded/exited this process
+        self._pending_settles: list[dict] = []
         self._trades_log_path = config.STATE_DIR / "trades.json"
         for _slug in (self._load_slot_state().get("slot_done") or []):
             if _slug:
@@ -189,6 +194,17 @@ class TWAPBot:
                 "cost_usd": pos.get("cost_usd"),
                 "strategy": pos.get("strategy"),
             })
+        pending = []
+        for item in self._pending_settles:
+            pos = item.get("position") or {}
+            pending.append({
+                "asset": item.get("asset"),
+                "slug": (item.get("market") or {}).get("slug"),
+                "side": pos.get("side"),
+                "price": pos.get("price"),
+                "shares": pos.get("shares"),
+                "status": "awaiting_polymarket_resolution",
+            })
         return {
             "mode": config.MODE,
             "strategy": config.STRATEGY,
@@ -196,6 +212,7 @@ class TWAPBot:
             "bankroll": round(float(self.risk.bankroll), 2),
             "daily_pnl": round(float(self.risk.daily_pnl), 2),
             "open_positions": open_positions,
+            "pending_settlements": pending,
             "uptime_seconds": round(time.time() - self._started_at, 1),
         }
 
@@ -303,11 +320,12 @@ class TWAPBot:
                 if active_slot_ts != current_window:
                     if active_slot_ts is not None:
                         for slot in self.slots.values():
-                            if slot.position and slot.market and slot.strike:
-                                await self._settle_position(slot, slot.market, slot.strike)
+                            self._queue_settlement(slot)
                             slot.resting_order = None
                     active_slot_ts = current_window
                     await self._discover_slot(current_window, now)
+
+                await self._flush_pending_settlements(now)
 
                 for slot in self.slots.values():
                     await self._tick_asset(slot, now)
@@ -553,10 +571,16 @@ class TWAPBot:
                 cur_ask = best_ask or 1.0
                 elapsed_resting = time.time() - ro.get("placed_at", time.time())
 
-                is_paper_fill = (config.MODE != "live" and elapsed_resting >= config.MAKER_DWELL_SECONDS and signal.z_score >= params.min_z)
-                is_clob_fill = (cur_bid >= ro["price"] or cur_ask <= ro["price"])
+                # Paper must not invent a fill: only count it if the book would lift the bid.
+                is_clob_fill = (cur_ask <= ro["price"])
+                is_paper_fill = (
+                    config.MODE != "live"
+                    and elapsed_resting >= config.MAKER_DWELL_SECONDS
+                    and signal.z_score >= params.min_z
+                    and is_clob_fill
+                )
 
-                if is_paper_fill or is_clob_fill:
+                if is_paper_fill or (config.MODE == "live" and is_clob_fill):
                     slot.position = {
                         "asset": asset,
                         "slot": ro["slot"],
@@ -594,11 +618,11 @@ class TWAPBot:
         ):
             await self._manage_open_momentum_position(slot, market, remaining_s, tokens)
 
-        if remaining_s <= 0.5:
+        if remaining_s <= 0.0:
             if slot.resting_order:
                 slot.resting_order = None
             if slot.position:
-                await self._settle_position(slot, market, strike)
+                self._queue_settlement(slot)
 
     async def _place_taker_order(
         self, slot: CoinSlot, market: dict, signal: TWAPSignal, ask: float, strategy_tag: str = "H-001_SNIPER"
@@ -615,6 +639,38 @@ class TWAPBot:
         shares = max(config.MIN_ORDER_SHARES, round(stake_usd / ask, 2))
         cost_usd = round(shares * ask, 2)
         fee_usd = round(signal.fee_taker * shares, 4)
+        is_paper = config.MODE != "live"
+
+        if is_paper and config.PAPER_FOK_REQUIRE_SIZE:
+            book = self.pub_client.get_order_book(token_id)
+            fillable, vwap = fillable_ask_shares(book, ask)
+            if fillable + 1e-9 < shares:
+                top = self.book_stream.get_top(token_id) or {}
+                ws_sz = float(top.get("ask_size") or 0.0)
+                ws_ask = top.get("ask")
+                if ws_sz + 1e-9 >= shares and ws_ask is not None and float(ws_ask) <= float(ask) + 1e-9:
+                    fillable = ws_sz
+                    vwap = float(ws_ask)
+            if fillable + 1e-9 < shares:
+                logger.warning(
+                    f"[{slot.asset.upper()}] Paper FOK unfilled: need {shares:.2f} sh @ {ask:.3f} "
+                    f"but book only has {fillable:.2f} sh"
+                )
+                journal_write(
+                    "skip_round",
+                    reason="paper_fok_unfilled",
+                    asset=slot.asset,
+                    side=signal.side,
+                    ask=ask,
+                    shares=shares,
+                    fillable=round(fillable, 4),
+                    slot=market.get("slug"),
+                )
+                return
+            if vwap > 0:
+                ask = min(float(ask), float(vwap))
+                cost_usd = round(shares * ask, 2)
+                fee_usd = round(signal.fee_taker * shares, 4)
 
         logger.info("=" * 60)
         logger.info(f"[{slot.asset.upper()} {strategy_tag} ORDER EXECUTED] BUY {signal.side} @ {ask:.3f}")
@@ -623,7 +679,6 @@ class TWAPBot:
         logger.info("=" * 60)
 
         order_id = f"{strategy_tag.lower()}_paper_{int(time.time()*1000)}"
-        is_paper = config.MODE != "live"
         if config.MODE == "live" and self.live_client:
             try:
                 resp = self.live_client.place_order(token_id, "BUY", ask, shares, order_type="FOK")
@@ -948,81 +1003,154 @@ class TWAPBot:
         )
         self._save_trade_record(record)
 
-    async def _settle_position(self, slot: CoinSlot, market: dict, strike: float) -> None:
-        """Settle filled position against final Chainlink TWAP."""
-        pos = slot.position
-        slot.position = None
-        if not pos:
+    def _queue_settlement(self, slot: CoinSlot) -> None:
+        """Hold a fill until Polymarket posts the official Up/Down result."""
+        if not slot.position or not slot.market:
+            slot.position = None
             return
-
-        # Compute official 300s TWAP over slot window
-        final_twap, _ = self.cl_stream.compute_realized_twap(
-            start_ts=market["slot_start_ts"],
-            end_ts=market["end_ts"],
-            asset=slot.asset,
+        item = {
+            "asset": slot.asset,
+            "market": slot.market,
+            "position": slot.position,
+            "strike": slot.strike,
+            "queued_at": time.time(),
+            "end_ts": slot.market.get("end_ts"),
+        }
+        self._pending_settles.append(item)
+        logger.info(
+            f"[{slot.asset.upper()}] Queued for Polymarket resolution: {slot.market.get('slug')} "
+            f"(do not book PnL yet)"
         )
-        resolved_side = "UP" if final_twap >= strike else "DOWN"
-        won = (pos["side"] == resolved_side)
+        slot.position = None
 
+    async def _flush_pending_settlements(self, now: float) -> None:
+        if not self._pending_settles:
+            return
+        still: list[dict] = []
+        for item in self._pending_settles:
+            slug = (item.get("market") or {}).get("slug")
+            end_ts = float(item.get("end_ts") or 0.0)
+            if end_ts and now < end_ts + 2.0:
+                still.append(item)
+                continue
+            resolution = self.pub_client.get_resolution(slug, now_ts=now) if slug else None
+            waited = now - float(item.get("queued_at") or now)
+            if resolution is None and waited < config.RESOLUTION_TIMEOUT_S:
+                still.append(item)
+                continue
+            if resolution is None:
+                logger.warning(
+                    f"[{str(item.get('asset') or '').upper()}] No Polymarket resolution after "
+                    f"{waited:.0f}s for {slug}; recording unresolved (PnL not booked)"
+                )
+                self._record_unresolved(item)
+                continue
+            self._settle_filled(item, resolution)
+        self._pending_settles = still
+
+    def _record_unresolved(self, item: dict) -> None:
+        pos = item.get("position") or {}
+        market = item.get("market") or {}
+        record = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "asset": item.get("asset"),
+            "slot": market.get("slug"),
+            "strategy": pos.get("strategy", "H-001_SNIPER"),
+            "side": pos.get("side"),
+            "price": pos.get("price"),
+            "shares": pos.get("shares"),
+            "cost_usd": pos.get("cost_usd"),
+            "z_score": pos.get("z_score"),
+            "strike": item.get("strike"),
+            "outcome": None,
+            "won": None,
+            "pnl": 0.0,
+            "bankroll": round(self.risk.bankroll, 2),
+            "settlement_source": "unresolved",
+            "early_exit": False,
+        }
+        journal_write(
+            "settlement",
+            slot=market.get("slug"),
+            asset=item.get("asset"),
+            won=None,
+            pnl=0.0,
+            settlement_source="unresolved",
+        )
+        self._save_trade_record(record)
+
+    def _settle_filled(self, item: dict, resolution: dict) -> None:
+        """Settle a paper/live fill against Polymarket's official outcome only."""
+        pos = item.get("position") or {}
+        market = item.get("market") or {}
+        asset = str(item.get("asset") or "")
+        resolved_side = resolution["side"]
+        won = pos.get("side") == resolved_side
         strategy_name = pos.get("strategy", "H-001_SNIPER")
         fee = pos.get("fee", 0.0)
         rebate = pos.get("rebate", 0.0)
 
         if won:
-            revenue = pos["shares"] * 1.0
-            pnl = (revenue - pos["cost_usd"]) - fee + rebate
+            revenue = float(pos.get("shares") or 0.0) * 1.0
+            pnl = (revenue - float(pos.get("cost_usd") or 0.0)) - fee + rebate
         else:
-            pnl = -pos["cost_usd"] - fee + rebate
+            pnl = -float(pos.get("cost_usd") or 0.0) - fee + rebate
 
-        # If a micro-hedge was on, it resolves opposite the main outcome
         if pos.get("hedge_placed"):
             h_shares = float(pos.get("hedge_shares", 0.0))
             h_cost = float(pos.get("hedge_cost_usd", 0.0))
-            hedge_won = not won
-            if hedge_won:
+            if not won:
                 pnl += (h_shares * 1.0) - h_cost
             else:
                 pnl += -h_cost
 
         self.risk.record_trade_result(pnl)
+        strike = resolution.get("price_to_beat") if resolution.get("price_to_beat") is not None else item.get("strike")
+        final_twap = resolution.get("final_price")
 
         logger.info("=" * 60)
-        logger.info(f"🏁 [{slot.asset.upper()} SLOT SETTLEMENT] {market['slug']} ({strategy_name})")
-        logger.info(f"   Strike (S0): ${strike:,.2f} | Final TWAP: ${final_twap:,.2f}")
-        logger.info(f"   Outcome: {resolved_side} | Trade: {pos['side']} -> {'WON' if won else 'LOST'}")
+        logger.info(f"🏁 [{asset.upper()} SLOT SETTLEMENT] {market.get('slug')} ({strategy_name})")
+        logger.info(
+            f"   Source: {resolution.get('source')} | official={resolution.get('official')} "
+            f"| S0: {strike} | Final: {final_twap}"
+        )
+        logger.info(f"   Outcome: {resolved_side} | Trade: {pos.get('side')} -> {'WON' if won else 'LOST'}")
         logger.info(f"   Trade PnL: ${pnl:+.2f} | New Bankroll: ${self.risk.bankroll:.2f}")
         logger.info("=" * 60)
 
-        # Record to trades.json
         record = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "asset": slot.asset,
-            "slot": market["slug"],
+            "asset": asset,
+            "slot": market.get("slug"),
             "strategy": strategy_name,
-            "side": pos["side"],
-            "price": pos["price"],
-            "shares": pos["shares"],
-            "cost_usd": pos["cost_usd"],
+            "side": pos.get("side"),
+            "price": pos.get("price"),
+            "shares": pos.get("shares"),
+            "cost_usd": pos.get("cost_usd"),
             "fee": fee,
             "rebate": rebate,
-            "z_score": pos["z_score"],
+            "z_score": pos.get("z_score"),
             "strike": strike,
             "final_twap": final_twap,
             "outcome": resolved_side,
             "won": won,
             "pnl": round(pnl, 2),
             "bankroll": round(self.risk.bankroll, 2),
+            "settlement_source": resolution.get("source"),
+            "official": bool(resolution.get("official")),
+            "early_exit": False,
         }
         journal_write(
             "settlement",
-            slot=market["slug"],
-            asset=slot.asset,
+            slot=market.get("slug"),
+            asset=asset,
             strategy=strategy_name,
-            side=pos["side"],
+            side=pos.get("side"),
             outcome=resolved_side,
             won=won,
             pnl=round(pnl, 2),
             bankroll=round(self.risk.bankroll, 2),
+            settlement_source=resolution.get("source"),
             early_exit=False,
         )
         self._save_trade_record(record)

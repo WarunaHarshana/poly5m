@@ -43,7 +43,7 @@ def public_trade(row: dict) -> dict:
         "shares": row.get("shares"),
         "cost": round(cost, 4),
         "pnl": row.get("pnl"),
-        "won": bool(row.get("won")),
+        "won": None if row.get("won") is None else bool(row.get("won")),
         "outcome": row.get("outcome"),
         "strategy": row.get("strategy"),
         "z_score": row.get("z_score"),
@@ -52,13 +52,15 @@ def public_trade(row: dict) -> dict:
         "bankroll": row.get("bankroll"),
         "early_exit": bool(row.get("early_exit")),
         "entry_time_utc": row.get("timestamp"),
+        "settlement_source": row.get("settlement_source"),
+        "official": row.get("official"),
         "polymarket_url": f"https://polymarket.com/event/{slug}" if slug else None,
     }
 
 
 def build_stats(trades: list[dict], snapshot: dict[str, Any] | None = None) -> dict:
     rows = [public_trade(t) for t in trades]
-    resolved = [r for r in rows if r.get("pnl") is not None]
+    resolved = [r for r in rows if r.get("won") is not None and r.get("pnl") is not None]
     wins = sum(1 for r in resolved if r.get("won"))
     pnl = sum(float(r.get("pnl") or 0.0) for r in resolved)
     cost = sum(float(r.get("cost") or 0.0) for r in resolved)
@@ -134,7 +136,7 @@ def _make_handler(bot_snapshot: SnapshotFn, trades_path: Path):
                         "service": "poly5m-bot",
                         **{k: snap.get(k) for k in (
                             "mode", "strategy", "assets", "bankroll", "daily_pnl",
-                            "open_positions", "uptime_seconds",
+                            "open_positions", "pending_settlements", "uptime_seconds",
                         )},
                     })
                     return

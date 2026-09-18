@@ -8,7 +8,13 @@ from pathlib import Path
 
 import config
 import journal
-from polymarket_client import extract_filled_shares, extract_order_status, is_fill_confirmed
+from polymarket_client import (
+    extract_filled_shares,
+    extract_order_status,
+    fillable_ask_shares,
+    is_fill_confirmed,
+    parse_event_resolution,
+)
 from risk_manager import RiskManager
 
 
@@ -24,6 +30,56 @@ def test_journal_appends_jsonl(tmp_path: Path | None = None):
     assert r0["event"] == "paper_fill"
     assert r0["side"] == "UP"
     assert journal.last()["event"] == "settlement"
+
+
+def test_fillable_ask_shares_walks_book():
+    book = {
+        "asks": [
+            {"price": "0.80", "size": "3"},
+            {"price": "0.81", "size": "4"},
+            {"price": "0.90", "size": "100"},
+        ]
+    }
+    sh, vwap = fillable_ask_shares(book, 0.81)
+    assert abs(sh - 7.0) < 1e-9
+    assert abs(vwap - (3 * 0.80 + 4 * 0.81) / 7.0) < 1e-9
+    sh2, _ = fillable_ask_shares(book, 0.79)
+    assert sh2 == 0.0
+
+
+def test_parse_event_resolution_waits_until_close():
+    ev = {
+        "slug": "btc-updown-5m-1000",
+        "closed": False,
+        "markets": [{
+            "outcomes": '["Up", "Down"]',
+            "outcomePrices": '["0.20", "0.80"]',
+            "closed": False,
+        }],
+        "eventMetadata": {},
+    }
+    # Window still open (now << 1000+300)
+    assert parse_event_resolution(ev, now_ts=1100.0) is None
+
+
+def test_parse_event_resolution_uses_outcome_prices():
+    ev = {
+        "slug": "eth-updown-5m-1000",
+        "closed": True,
+        "markets": [{
+            "outcomes": '["Up", "Down"]',
+            "outcomePrices": '["0", "1"]',
+            "closed": True,
+            "automaticallyResolved": True,
+            "umaResolutionStatus": "resolved",
+        }],
+        "eventMetadata": {"finalPrice": 2500.0, "priceToBeat": 2510.0},
+    }
+    res = parse_event_resolution(ev, now_ts=2000.0)
+    assert res is not None
+    assert res["side"] == "DOWN"
+    assert res["source"] == "polymarket_outcome_prices"
+    assert res["official"] is True
 
 
 def test_fill_helpers_size_matched():
