@@ -1,64 +1,64 @@
-# Polymarket 5-Minute BTC TWAP Mispricing Bot (H-001)
+# Polymarket 5-Minute BTC TWAP Bot (`poly5m`)
 
-A clean, high-performance quantitative trading bot purpose-built to exploit **High-Conviction TWAP Path-Accumulation Mispricings (H-001)** on Polymarket's recurring 5-Minute Bitcoin Up/Down markets (`btc-updown-5m-{window_ts}`).
+Paper-first bot for Polymarket rolling **BTC 5-minute Up/Down** markets.
 
----
+## Settlement (read this first)
 
-## 1. Strategy & Mathematical Foundation
+These markets resolve on **Chainlink BTC/USD TWAP** (60s window via Polymarket RTDS), **not** Binance last price.
+This bot:
 
-Polymarket resolves 5-minute BTC markets on the **Chainlink 60-second TWAP stream**:
-$$\text{Outcome} = \begin{cases} \text{Up} & \text{if } \text{TWAP}_{[0, 300]} \ge S_0 \\ \text{Down} & \text{if } \text{TWAP}_{[0, 300]} < S_0 \end{cases}$$
+1. Streams Polymarket RTDS Chainlink ticks
+2. Builds a realized path TWAP inside the 300s slot
+3. Gates entries on Z-score + **net edge after crypto taker fees** (`fee ≈ rate · p · (1−p)`)
+4. Refuses trades when the oracle stream is stale
 
-At elapsed time $t \in [0, 300]$ (remaining time $\tau = 300 - t$):
-1. **Realized Integral:**
-   $$I_{\text{realized}}(t) = \int_0^t S(u) du \approx \sum_{k=0}^{n-1} \frac{S(u_k) + S(u_{k+1})}{2} \Delta u_k$$
-2. **Required Remaining Average Spot Price ($\overline{S}_{\text{req}}$):**
-   $$\overline{S}_{\text{req}}(\tau) = \frac{300 \cdot S_0 - I_{\text{realized}}(t)}{\tau}$$
-3. **Cubic Variance Decay of Remaining TWAP:**
-   $$\sigma_{\text{TWAP}}(\tau) = S(t) \cdot \sqrt{\frac{\sigma^2 \tau}{3}}$$
-4. **Standardized TWAP Z-Score ($Z_{\text{TWAP}}$):**
-   $$Z_{\text{TWAP}} = \frac{S(t) - \overline{S}_{\text{req}}(\tau)}{\sigma_{\text{TWAP}}(\tau)}$$
-5. **Calibrated Win Probability:**
-   $$P(Z) = \frac{1}{1 + e^{-\alpha |Z|}} \quad (\alpha = 1.75)$$
-6. **Polymarket Dynamic Crypto Taker Fee:**
-   $$\text{Fee}(p) = \text{rate} \cdot p \cdot (1 - p)$$
-7. **Net Edge Gating:**
-   $$\text{Edge}_{\text{net}} = P(Z) - \text{Ask} - \text{Fee}(\text{Ask}) \ge 3\%$$
+Default mode is **`paper_live`**: real websockets, simulated fills. Live trading requires `MODE=live` **and** `LIVE_CONFIRM=yes`.
 
----
+## Recommended strategy
 
-## 2. Codebase Architecture
+| Strategy | Env value | Notes |
+|----------|-----------|-------|
+| **H-001 Sniper (default)** | `STRATEGY=H-001_SNIPER` | Fee-aware TWAP late-window; best structural fit |
+| H-004 Maker | `STRATEGY=H-004_MAKER` | Resting bids; adverse-selection risk |
+| H-005 Momentum | `STRATEGY=H-005_MOMENTUM` | Speculative late follow-through — use only intentionally |
 
-* `twap_engine.py`: Pure mathematical pricing model, $S_{\text{req}}$ calculation, cubic variance decay, calibrated probability, dynamic taker fees, and decision gating.
-* `feeds.py`: Real-time WebSocket clients for **Polymarket RTDS Chainlink BTC/USD** (`wss://ws-live-data.polymarket.com`) and **Polymarket CLOB L2 Orderbook** (`wss://ws-subscriptions-clob.polymarket.com/ws/market`).
-* `polymarket_client.py`: Gamma market discovery and CLOB authenticated trading client.
-* `risk_manager.py`: Bankroll protection, daily loss limit, position sizing, and cooldown logic.
-* `bot.py`: Main asynchronous event loop executing trade cycles and settlement.
-* `test_twap_bot.py`: Unit test suite verifying mathematical derivations and integrations.
+## Quick start (paper)
 
----
-
-## 3. Running the Bot
-
-### Local Test Mode (Paper Trading with Live Data)
 ```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env
+# Keep MODE=paper_live and STRATEGY=H-001_SNIPER
+python test_twap_bot.py
 python bot.py
 ```
 
-### Local Test Suite
+## Live arming (real money)
+
+Only after paper journals look sane:
+
+```env
+MODE=live
+LIVE_CONFIRM=yes
+PRIVATE_KEY=0x...
+FUNDER_ADDRESS=0x...
+```
+
+Daily loss / consecutive-loss kill switches apply in **live** only so paper can accumulate sample size.
+
+## Layout
+
+- `twap_engine.py` — TWAP math, fee curve, sniper/maker/momentum gates
+- `feeds.py` — Chainlink RTDS + CLOB book websockets (stale-tick refusal)
+- `polymarket_client.py` — Gamma discovery + CLOB trading client
+- `risk_manager.py` — bankroll / daily loss / cooldown
+- `bot.py` — async loop, paper + live execution
+- `test_twap_bot.py` — unit tests (math, fees, stale feed, risk)
+
+## Verify
+
 ```bash
 python test_twap_bot.py
 ```
 
-### Live Real-Money Mode
-1. Configure credentials in `.env`:
-   ```env
-   MODE=live
-   LIVE_CONFIRM=yes
-   PRIVATE_KEY=0x...
-   FUNDER_ADDRESS=0x...
-   ```
-2. Run:
-   ```bash
-   python bot.py
-   ```
+Then run paper for several slots and read `state/journal.jsonl` before considering live.

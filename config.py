@@ -27,15 +27,16 @@ FUNDER_ADDRESS = os.getenv("FUNDER_ADDRESS", os.getenv("POLYMARKET_FUNDER_ADDRES
 SIGNATURE_TYPE = int(os.getenv("SIGNATURE_TYPE", os.getenv("POLYMARKET_SIGNATURE_TYPE", "3")))  # 3 = Polymarket Proxy Wallet
 
 # --- Strategy Selection ---
+# Default to fee-aware TWAP sniper. Set STRATEGY=H-005_MOMENTUM only intentionally.
 STRATEGY = os.getenv("STRATEGY", "H-001_SNIPER").strip().upper()
 # --- H-005 Momentum-Into-Close (Novals/igus-style) ---
-MOMENTUM_WINDOW_START_S = float(os.getenv('MOMENTUM_WINDOW_START_S', '150.0'))
-MOMENTUM_WINDOW_END_S = float(os.getenv('MOMENTUM_WINDOW_END_S', '60.0'))
-MOMENTUM_MIN_MOVE_USD = float(os.getenv('MOMENTUM_MIN_MOVE_USD', '70.0'))
-MOMENTUM_MAX_MOVE_USD = float(os.getenv('MOMENTUM_MAX_MOVE_USD', '300.0'))
-MOMENTUM_MIN_ASK = float(os.getenv('MOMENTUM_MIN_ASK', '0.70'))
-MOMENTUM_MAX_ASK = float(os.getenv('MOMENTUM_MAX_ASK', '0.92'))
-MOMENTUM_MIN_EDGE = float(os.getenv('MOMENTUM_MIN_EDGE', '0.00'))
+MOMENTUM_WINDOW_START_S = float(os.getenv("MOMENTUM_WINDOW_START_S", "150.0"))
+MOMENTUM_WINDOW_END_S = float(os.getenv("MOMENTUM_WINDOW_END_S", "60.0"))
+MOMENTUM_MIN_MOVE_USD = float(os.getenv("MOMENTUM_MIN_MOVE_USD", "70.0"))
+MOMENTUM_MAX_MOVE_USD = float(os.getenv("MOMENTUM_MAX_MOVE_USD", "300.0"))
+MOMENTUM_MIN_ASK = float(os.getenv("MOMENTUM_MIN_ASK", "0.70"))
+MOMENTUM_MAX_ASK = float(os.getenv("MOMENTUM_MAX_ASK", "0.92"))
+MOMENTUM_MIN_EDGE = float(os.getenv("MOMENTUM_MIN_EDGE", "0.00"))
 # Risk overlays for momentum (Novals conservative defaults)
 MOMENTUM_EXIT_BEFORE_S = float(os.getenv("MOMENTUM_EXIT_BEFORE_S", "20.0"))
 MOMENTUM_STOP_LOSS_PCT = float(os.getenv("MOMENTUM_STOP_LOSS_PCT", "0.25"))
@@ -52,12 +53,13 @@ MIN_Z_SCORE = float(os.getenv("MIN_Z_SCORE", "1.65"))                # Require >
 ALPHA = float(os.getenv("ALPHA", "1.75"))
 MIN_SIGMA_USD = float(os.getenv("MIN_SIGMA_USD", "2.0"))
 MAX_CHOP_CROSSES = int(os.getenv("MAX_CHOP_CROSSES", "2"))
-MIN_EDGE = float(os.getenv("MIN_EDGE", "0.035"))                     # Minimum +3.5% net profit edge
+MIN_EDGE = float(os.getenv("MIN_EDGE", "0.035"))                     # Minimum +3.5% net edge AFTER taker fee
 MIN_BUY_PRICE = float(os.getenv("MIN_BUY_PRICE", "0.20"))            # Capture discount mispricings down to $0.20
 MAX_BUY_PRICE = float(os.getenv("MAX_BUY_PRICE", "0.92"))            # Strict ceiling: NEVER pay > $0.92
 EVAL_WINDOW_START_S = float(os.getenv("EVAL_WINDOW_START_S", "270.0"))  # Start evaluating at t=30s (270s left)
 EVAL_WINDOW_END_S = float(os.getenv("EVAL_WINDOW_END_S", "40.0"))        # Stop evaluating at t=260s (40s left)
 TAKER_FEE_RATE = float(os.getenv("TAKER_FEE_RATE", "0.07"))
+MAX_ORACLE_STALE_S = float(os.getenv("MAX_ORACLE_STALE_S", "6.0"))
 
 # --- H-004 Passive Maker Limit Model Parameters (Optional) ---
 MIN_MAKER_EDGE = float(os.getenv("MIN_MAKER_EDGE", "0.05"))
