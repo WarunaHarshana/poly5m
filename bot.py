@@ -1,20 +1,20 @@
 """High-Conviction TWAP Mispricing & Passive Maker Trading Bot (H-004).
 
-Trades Polymarket 5-Minute BTC Up/Down markets using real-time WebSockets:
-- Polymarket RTDS Chainlink BTC/USD Stream
+Trades Polymarket 5-Minute Up/Down markets (BTC, ETH, SOL, BNB, XRP, DOGE, HYPE):
+- Polymarket RTDS Chainlink Stream
 - Polymarket CLOB Level 2 Orderbook Stream
 - Exact Analytical TWAP Integral & Cubic Variance Decay Engine
-- Passive Limit Maker Execution with 0% fees, 20% rebates, and adverse selection cancel guards.
+- One open position per coin in the same 5-minute window
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
-import os
 import signal
 import sys
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -34,23 +34,47 @@ logging.basicConfig(
 logger = logging.getLogger("twap-bot")
 
 
+def _engine_for(params: config.AssetParams) -> TWAPEngine:
+    return TWAPEngine(
+        alpha=config.ALPHA,
+        min_sigma_usd=params.min_sigma_usd(config._BTC_REF_SPOT if params.symbol == "btc" else 1.0),
+        min_z=params.min_z,
+        min_edge=params.min_edge,
+        min_entry=params.min_buy_price,
+        max_entry=params.max_buy_price,
+        min_maker_bid=params.min_maker_bid,
+        max_maker_bid=params.max_maker_bid,
+        min_maker_edge=params.min_maker_edge,
+        max_chop_crosses=params.max_chop_crosses,
+        default_daily_vol=params.daily_vol,
+    )
+
+
+@dataclass
+class CoinSlot:
+    """Per-coin state for one 5-minute window."""
+
+    asset: str
+    params: config.AssetParams
+    engine: TWAPEngine
+    market: dict | None = None
+    strike: float | None = None
+    position: dict | None = None
+    resting_order: dict | None = None
+    risk_block_logged: bool = False
+
+
 class TWAPBot:
-    """Trading Bot executing the H-004 Passive Maker Strategy."""
+    """Trading Bot executing H-001 / H-004 / H-005 across 5-minute Up/Down coins."""
 
     def __init__(self):
-        self.engine = TWAPEngine(
-            alpha=config.ALPHA,
-            min_sigma_usd=config.MIN_SIGMA_USD,
-            min_z=config.MIN_Z_SCORE,
-            min_edge=config.MIN_EDGE,
-            min_entry=config.MIN_BUY_PRICE,
-            max_entry=config.MAX_BUY_PRICE,
-            min_maker_bid=config.MIN_MAKER_BID,
-            max_maker_bid=config.MAX_MAKER_BID,
-            min_maker_edge=config.MIN_MAKER_EDGE,
-            max_chop_crosses=config.MAX_CHOP_CROSSES,
-        )
-        self.cl_stream = ChainlinkRTDSStream(asset=config.ASSET)
+        self.slots: dict[str, CoinSlot] = {
+            a: CoinSlot(asset=a, params=config.ASSET_PARAMS[a], engine=_engine_for(config.ASSET_PARAMS[a]))
+            for a in config.ASSETS
+        }
+        # Back-compat alias used by older tests/helpers
+        self.engine = next(iter(self.slots.values())).engine if self.slots else TWAPEngine()
+        self.cl_stream = ChainlinkRTDSStream(assets=config.ASSETS)
         self.book_stream = PolymarketBookStream()
         self.pub_client = PolymarketPublicClient()
         self.risk = RiskManager()
@@ -62,10 +86,7 @@ class TWAPBot:
             self.live_client = PolymarketLiveClient()
 
         self._stop = False
-        self._resting_order: dict | None = None
-        self._current_position: dict | None = None
         self._slot_done: set[str] = set()  # slugs we already traded/exited this process
-        self._risk_block_logged = False
         self._trades_log_path = config.STATE_DIR / "trades.json"
         for _slug in (self._load_slot_state().get("slot_done") or []):
             if _slug:
@@ -93,27 +114,62 @@ class TWAPBot:
         slot_ts: int | float | None,
         slug: str | None,
         strike: float | None,
+        asset: str | None = None,
     ) -> None:
         """Persist S0 + slot identity so redeploys keep impulse continuity."""
-        payload = {
-            "slot_ts": int(slot_ts) if slot_ts is not None else None,
-            "slug": slug,
-            "strike": float(strike) if strike is not None else None,
-            "slot_done": sorted(self._slot_done),
-            "updated_at": time.time(),
-        }
-        if payload["strike"] is None:
-            prev = self._load_slot_state()
+        coin = str(asset or "btc").lower()
+        prev = self._load_slot_state()
+        assets_map = dict(prev.get("assets") or {})
+        if not assets_map and prev.get("slug"):
+            assets_map["btc"] = {"slug": prev.get("slug"), "strike": prev.get("strike")}
+        entry = dict(assets_map.get(coin) or {})
+        if slug:
+            entry["slug"] = slug
+        if strike is not None:
+            entry["strike"] = float(strike)
+        elif entry.get("strike") is None:
             if prev.get("slug") == slug or (
                 slot_ts is not None and int(prev.get("slot_ts") or 0) == int(slot_ts)
             ):
                 if prev.get("strike") is not None:
-                    payload["strike"] = float(prev["strike"])
+                    entry["strike"] = float(prev["strike"])
+        assets_map[coin] = entry
+        payload = {
+            "slot_ts": int(slot_ts) if slot_ts is not None else prev.get("slot_ts"),
+            "slug": entry.get("slug", slug),
+            "strike": entry.get("strike"),
+            "asset": coin,
+            "assets": assets_map,
+            "slot_done": sorted(self._slot_done),
+            "updated_at": time.time(),
+        }
         try:
             with open(self._slot_state_path(), "w", encoding="utf-8") as f:
                 json.dump(payload, f, indent=2)
         except Exception as e:
             logger.warning(f"Failed to save slot state: {e}")
+
+    def _open_notional(self) -> float:
+        total = 0.0
+        for slot in self.slots.values():
+            if slot.position:
+                total += float(slot.position.get("cost_usd") or 0.0)
+            elif slot.resting_order:
+                total += float(slot.resting_order.get("cost_usd") or 0.0)
+        return total
+
+    def _restored_strike(self, saved: dict, asset: str, slug: str | None, slot_ts: int) -> float | None:
+        assets_map = saved.get("assets") or {}
+        entry = assets_map.get(asset) or {}
+        if not entry and asset == "btc":
+            if saved.get("slug") == slug or int(saved.get("slot_ts") or 0) == int(slot_ts):
+                entry = {"strike": saved.get("strike")}
+        raw = entry.get("strike")
+        try:
+            val = float(raw)
+            return val if val > 0 else None
+        except (TypeError, ValueError):
+            return None
 
     def stop(self) -> None:
         logger.info("Stopping bot...")
@@ -124,7 +180,16 @@ class TWAPBot:
     async def start(self) -> None:
         logger.info("=" * 70)
         logger.info(f"STARTING POLY 5M BOT | STRATEGY={config.STRATEGY}")
-        logger.info(f"Mode: {config.MODE.upper()} | Asset: {config.ASSET.upper()} | Timeframe: {config.TIMEFRAME}")
+        coins = ",".join(a.upper() for a in config.ASSETS)
+        logger.info(f"Mode: {config.MODE.upper()} | Assets: {coins} | Timeframe: {config.TIMEFRAME}")
+        logger.info("One position per coin per 5-minute window")
+        for a in config.ASSETS:
+            p = config.ASSET_PARAMS[a]
+            logger.info(
+                f"  {a.upper()}: min_z={p.min_z} edge>={p.min_edge:.1%} "
+                f"ask=[{p.min_buy_price:.2f}..{p.max_buy_price:.2f}] "
+                f"vol={p.daily_vol:.2%} sigma={p.min_sigma_bps:.2f}bps chop={p.chop_noise_bps:.2f}bps"
+            )
         if config.STRATEGY in ("H-005_MOMENTUM", "MOMENTUM", "H-005", "LATE_MOMENTUM"):
             logger.info(
                 f"Momentum: move>=${config.MOMENTUM_MIN_MOVE_USD:.0f} | ask=[{config.MOMENTUM_MIN_ASK:.2f}..{config.MOMENTUM_MAX_ASK:.2f}] | "
@@ -177,306 +242,34 @@ class TWAPBot:
                 break
             await asyncio.sleep(0.5)
 
-        spot = self.cl_stream.price()
-        logger.info(f"Chainlink BTC Spot: ${spot:,.2f} | Clock Offset: {self.cl_stream.clock_offset_s():+.2f}s")
+        for a in config.ASSETS:
+            px = self.cl_stream.price(a)
+            live = self.cl_stream.ready_for(a)
+            p = config.ASSET_PARAMS[a]
+            if live and px > 0:
+                logger.info(f"Chainlink {a.upper()} Spot: ${p.fmt_px(px)}")
+            else:
+                logger.warning(f"Chainlink {a.upper()} not ready yet")
+        logger.info(f"Clock Offset: {self.cl_stream.clock_offset_s():+.2f}s")
 
         active_slot_ts = None
-        current_market = None
-        slot_strike = None
 
         while not self._stop:
             try:
                 now = time.time()
                 current_window = int(now // config.SLOT_SECONDS * config.SLOT_SECONDS)
 
-                # Discover new slot if needed
                 if active_slot_ts != current_window:
+                    if active_slot_ts is not None:
+                        for slot in self.slots.values():
+                            if slot.position and slot.market and slot.strike:
+                                await self._settle_position(slot, slot.market, slot.strike)
+                            slot.resting_order = None
                     active_slot_ts = current_window
-                    slot_strike = None
-                    self._resting_order = None
-                    current_market = self.pub_client.find_active_5m_slot(now_ts=now)
-                    if current_market:
-                        logger.info(f"\n[SLOT {active_slot_ts}] Discovered market: {current_market['slug']}")
-                        saved = self._load_slot_state()
-                        same_slot = (
-                            int(saved.get("slot_ts") or 0) == int(active_slot_ts)
-                            or saved.get("slug") == current_market.get("slug")
-                        )
-                        if same_slot and saved.get("strike") is not None:
-                            try:
-                                restored = float(saved["strike"])
-                                if restored > 0:
-                                    slot_strike = restored
-                                    logger.info(
-                                        f"[SLOT {active_slot_ts}] Restored S0 ${slot_strike:,.2f} from volume "
-                                        f"(survived redeploy)"
-                                    )
-                            except (TypeError, ValueError):
-                                slot_strike = None
-                        tokens = current_market["tokens"]
-                        self.book_stream.watch(tokens.get("UP", ""), tokens.get("DOWN", ""))
-                    else:
-                        logger.warning(f"Could not discover market for slot {active_slot_ts}, retrying in 2s...")
-                        await asyncio.sleep(2.0)
-                        continue
+                    await self._discover_slot(current_window, now)
 
-                if not current_market:
-                    await asyncio.sleep(2.0)
-                    continue
-
-                end_ts = current_market["end_ts"]
-                slot_start_ts = current_market["slot_start_ts"]
-                remaining_s = max(0.0, end_ts - now)
-                elapsed_s = max(0.0, now - slot_start_ts)
-
-                # Latch slot strike S_0 once at or near slot open (persist to volume)
-                if slot_strike is None or slot_strike <= 0:
-                    slot_strike = self.cl_stream.get_slot_strike(slot_start_ts)
-                    if slot_strike is None or slot_strike <= 0:
-                        slot_strike = self.cl_stream.price()
-                    if slot_strike and slot_strike > 0:
-                        self._save_slot_state(
-                            slot_ts=active_slot_ts,
-                            slug=current_market.get("slug"),
-                            strike=slot_strike,
-                        )
-
-                strike = slot_strike
-                spot = self.cl_stream.price()
-
-                if self.cl_stream.is_stale(max_age_s=6.0):
-                    logger.warning(f"[FEED] Chainlink tick stream waiting for live tick... (last: ${spot:,.2f})")
-                    await asyncio.sleep(1.0)
-                    continue
-
-                realized_twap, _ = self.cl_stream.compute_realized_twap(start_ts=slot_start_ts, end_ts=now)
-                chop = self.cl_stream.strike_crossings_since(slot_start_ts, strike)
-
-                # Strategy flags
-                is_momentum = (config.STRATEGY in ("H-005_MOMENTUM", "MOMENTUM", "H-005", "LATE_MOMENTUM"))
-                is_sniper = (config.STRATEGY in ("H-001_SNIPER", "SNIPER", "H-001"))
-
-                # Evaluate strategy within entry window
-                if is_momentum:
-                    in_eval_window = (
-                        config.MOMENTUM_WINDOW_END_S <= remaining_s <= config.MOMENTUM_WINDOW_START_S
-                    )
-                else:
-                    in_eval_window = (
-                        config.EVAL_WINDOW_END_S <= remaining_s <= config.EVAL_WINDOW_START_S
-                    )
-
-                # Fetch top of book for UP and DOWN
-                tokens = current_market["tokens"]
-                prelim_side = "UP" if spot >= strike else "DOWN"
-                token_id = tokens.get(prelim_side)
-
-                top = self.book_stream.get_top(token_id) if token_id else None
-                best_bid = top.get("bid") if top else None
-                best_ask = top.get("ask") if top else None
-
-                # Fallback to REST if WebSocket had no quote
-                if best_bid is None and token_id:
-                    bk = self.pub_client.get_order_book(token_id)
-                    if bk:
-                        if bk.get("bids"):
-                            best_bid = float(bk["bids"][0]["price"])
-                        if bk.get("asks"):
-                            best_ask = float(bk["asks"][0]["price"])
-
-                if is_momentum:
-                    can_trade_now, risk_reason_now = self.risk.can_trade()
-                    if not can_trade_now:
-                        # Avoid per-second spam once daily loss / consecutive-loss lock is hit
-                        if not getattr(self, "_risk_block_logged", False):
-                            logger.warning(f"Momentum paused by risk manager: {risk_reason_now}")
-                            journal_write("risk_block", reason=risk_reason_now, mode=config.MODE)
-                            self._risk_block_logged = True
-                        await asyncio.sleep(2.0)
-                        continue
-                    self._risk_block_logged = False
-                    # Stronger-side check (Novals): also peek opposite ask when available
-                    opp_side = "DOWN" if prelim_side == "UP" else "UP"
-                    opp_token = tokens.get(opp_side)
-                    opp_ask = None
-                    if opp_token:
-                        opp_top = self.book_stream.get_top(opp_token)
-                        opp_ask = opp_top.get("ask") if opp_top else None
-                        if opp_ask is None:
-                            bk = self.pub_client.get_order_book(opp_token)
-                            if bk and bk.get("asks"):
-                                opp_ask = float(bk["asks"][0]["price"])
-                    # Prefer stronger ask >= threshold; still require with-trend side
-                    trade_side = prelim_side
-                    trade_ask = best_ask
-                    if best_ask is not None and opp_ask is not None:
-                        if opp_ask > best_ask and ((spot >= strike and opp_side == "UP") or (spot < strike and opp_side == "DOWN")):
-                            trade_side = opp_side
-                            trade_ask = opp_ask
-                        elif best_ask >= config.MOMENTUM_MIN_ASK or opp_ask >= config.MOMENTUM_MIN_ASK:
-                            # pick stronger among same-direction-compatible; default keep trend side
-                            if trade_side == prelim_side and (best_ask or 0) < config.MOMENTUM_MIN_ASK and (opp_ask or 0) >= config.MOMENTUM_MIN_ASK:
-                                # opposite meets threshold but would be a fade — skip via gate later
-                                pass
-
-                    signal = self.engine.evaluate_momentum(
-                        spot=spot,
-                        strike=strike,
-                        remaining_s=remaining_s,
-                        elapsed_s=elapsed_s,
-                        ask=trade_ask if trade_side == prelim_side else best_ask,
-                        fee_rate=current_market.get("fee_rate", config.TAKER_FEE_RATE),
-                        min_move_usd=config.MOMENTUM_MIN_MOVE_USD,
-                        max_move_usd=config.MOMENTUM_MAX_MOVE_USD,
-                        min_ask=config.MOMENTUM_MIN_ASK,
-                        max_ask=config.MOMENTUM_MAX_ASK,
-                        min_edge=config.MOMENTUM_MIN_EDGE,
-                        window_start_s=config.MOMENTUM_WINDOW_START_S,
-                        window_end_s=config.MOMENTUM_WINDOW_END_S,
-                    )
-
-                    if in_eval_window:
-                        move = spot - strike
-                        logger.info(
-                            f"[{remaining_s:3.0f}s left] BTC: ${spot:,.1f} | S0: ${strike:,.1f} | "
-                            f"Move: ${move:+.1f} | Ask({signal.side}): {best_ask or 0:.2f} | "
-                            f"P: {signal.model_prob:.1%} | Edge: {signal.edge_net:+.1%} | Pass: {signal.passed_gates}"
-                            + (f" | Skip: {signal.skip_reason}" if (not signal.passed_gates and signal.skip_reason) else "")
-                        )
-
-                        if signal.passed_gates and not self._current_position:
-                            slot_key = current_market.get("slug", "")
-                            if slot_key and slot_key in self._slot_done:
-                                pass  # already traded/exited this slot
-                            else:
-                                can_trade, risk_reason = self.risk.can_trade()
-                                if can_trade:
-                                    await self._place_taker_order(
-                                        current_market, signal, best_ask, strategy_tag="H-005_MOMENTUM"
-                                    )
-                                    if slot_key:
-                                        self._slot_done.add(slot_key)
-                                        self._save_slot_state(
-                                            slot_ts=active_slot_ts,
-                                            slug=slot_key,
-                                            strike=strike,
-                                        )
-                                else:
-                                    logger.warning(f"Momentum trade blocked by risk manager: {risk_reason}")
-
-                elif is_sniper:
-                    signal = self.engine.evaluate(
-                        spot=spot,
-                        strike=strike,
-                        remaining_s=remaining_s,
-                        elapsed_s=elapsed_s,
-                        realized_twap=realized_twap,
-                        ask=best_ask,
-                        chop_crosses=chop,
-                        fee_rate=current_market.get("fee_rate", config.TAKER_FEE_RATE),
-                    )
-
-                    if in_eval_window:
-                        logger.info(
-                            f"[{remaining_s:3.0f}s left] BTC: ${spot:,.1f} | S0: ${strike:,.1f} | "
-                            f"Z: {signal.z_score:4.2f} | P: {signal.model_prob:.1%} | "
-                            f"Ask({signal.side}): {best_ask or 0:.2f} | "
-                            f"Edge: {signal.edge_net:+.1%} | Pass: {signal.passed_gates}"
-                        )
-
-                        if signal.passed_gates and not self._current_position:
-                            can_trade, risk_reason = self.risk.can_trade()
-                            if can_trade:
-                                await self._place_taker_order(current_market, signal, best_ask)
-                            else:
-                                logger.warning(f"Sniper trade blocked by risk manager: {risk_reason}")
-                else:
-                    signal = self.engine.evaluate_maker(
-                        spot=spot,
-                        strike=strike,
-                        remaining_s=remaining_s,
-                        elapsed_s=elapsed_s,
-                        realized_twap=realized_twap,
-                        best_bid=best_bid,
-                        best_ask=best_ask,
-                        chop_crosses=chop,
-                        fee_rate=current_market.get("fee_rate", config.TAKER_FEE_RATE),
-                    )
-
-                    if in_eval_window:
-                        logger.info(
-                            f"[{remaining_s:3.0f}s left] BTC: ${spot:,.1f} | S0: ${strike:,.1f} | "
-                            f"Z: {signal.z_score:4.2f} | P: {signal.model_prob:.1%} | "
-                            f"TopBid: {best_bid or 0:.2f} | TargetBid({signal.side}): {signal.target_bid:.2f} | "
-                            f"Edge: {signal.edge_net:+.1%} | Pass: {signal.passed_gates}"
-                        )
-
-                        # Place Resting Maker Bid if not already active or positioned
-                        if signal.passed_gates and not self._resting_order and not self._current_position:
-                            can_trade, risk_reason = self.risk.can_trade()
-                            if can_trade:
-                                await self._place_maker_bid(current_market, signal)
-                            else:
-                                logger.warning(f"Maker trade blocked by risk manager: {risk_reason}")
-
-                    # Check Fill Simulation / Matching on Active Resting Maker Bid
-                    if self._resting_order and not self._current_position:
-                        ro = self._resting_order
-                        cur_bid = best_bid or 0.0
-                        cur_ask = best_ask or 1.0
-                        elapsed_resting = time.time() - ro.get("placed_at", time.time())
-
-                        # In paper mode: simulate queue priority fill after sustained dwell while conviction holds
-                        is_paper_fill = (config.MODE != "live" and elapsed_resting >= config.MAKER_DWELL_SECONDS and signal.z_score >= config.MIN_Z_SCORE)
-                        is_clob_fill = (cur_bid >= ro["price"] or cur_ask <= ro["price"])
-
-                        if is_paper_fill or is_clob_fill:
-                            self._current_position = {
-                                "slot": ro["slot"],
-                                "strategy": "H-004_MAKER",
-                                "side": ro["side"],
-                                "token_id": ro["token_id"],
-                                "price": ro["price"],
-                                "shares": ro["shares"],
-                                "cost_usd": ro["cost_usd"],
-                                "z_score": ro["z_score"],
-                                "prob": ro["prob"],
-                                "fee": 0.0,
-                                "rebate": ro["rebate"],
-                                "entry_time": time.time(),
-                                "order_id": ro["order_id"],
-                            }
-                            logger.info("=" * 60)
-                            logger.info(f"✅ [H-004 MAKER BID FILLED] BUY {ro['side']} @ {ro['price']:.2f}")
-                            logger.info(f"   Filled: {ro['shares']:.1f} shares (${ro['cost_usd']:.2f}) | Rebate: ${ro['rebate']:.3f}")
-                            logger.info("=" * 60)
-                            self._resting_order = None
-
-                        # Adverse Selection / Reversal Protection Cancellation
-                        elif signal.z_score < 0.80 or remaining_s < config.EVAL_WINDOW_END_S:
-                            reason = "spot reversal (Z < 0.80)" if signal.z_score < 0.80 else "end of quoting window"
-                            logger.info(f"🚫 [H-004 MAKER BID CANCELLED] Cancelled resting bid @ {ro['price']:.2f} ({reason})")
-                            if config.MODE == "live" and self.live_client:
-                                try:
-                                    self.live_client.cancel_order(ro["order_id"])
-                                except Exception as e:
-                                    logger.error(f"Error cancelling live order: {e}")
-                            self._resting_order = None
-
-                # Momentum overlays: stop-loss / early exit / micro-hedge
-                if self._current_position and self._current_position.get("strategy") in (
-                    "H-005_MOMENTUM", "LATE_MOMENTUM", "MOMENTUM", "H-005"
-                ):
-                    await self._manage_open_momentum_position(
-                        current_market, remaining_s, tokens
-                    )
-
-                # Handle settlement at slot end
-                if remaining_s <= 0.5:
-                    if self._resting_order:
-                        self._resting_order = None
-                    if self._current_position:
-                        await self._settle_position(current_market, strike)
+                for slot in self.slots.values():
+                    await self._tick_asset(slot, now)
 
                 await asyncio.sleep(1.0)
 
@@ -484,19 +277,306 @@ class TWAPBot:
                 logger.error(f"Error in main loop: {e}", exc_info=True)
                 await asyncio.sleep(2.0)
 
-    async def _place_taker_order(self, market: dict, signal: TWAPSignal, ask: float, strategy_tag: str = "H-001_SNIPER") -> None:
+    async def _discover_slot(self, window_ts: int, now: float) -> None:
+        saved = self._load_slot_state()
+        same_slot = int(saved.get("slot_ts") or 0) == int(window_ts)
+        for slot in self.slots.values():
+            slot.market = None
+            slot.strike = None
+            market = self.pub_client.find_active_5m_slot(now_ts=now, asset=slot.asset)
+            if not market:
+                logger.warning(f"[{slot.asset.upper()}] Could not discover market for slot {window_ts}")
+                continue
+            slot.market = market
+            logger.info(f"[SLOT {window_ts}] {slot.asset.upper()} {market['slug']}")
+            tokens = market["tokens"]
+            self.book_stream.watch(tokens.get("UP", ""), tokens.get("DOWN", ""))
+            restored = self._restored_strike(saved, slot.asset, market.get("slug"), window_ts) if same_slot else None
+            if restored:
+                slot.strike = restored
+                logger.info(
+                    f"[{slot.asset.upper()}] Restored S0 ${slot.params.fmt_px(slot.strike)} from volume "
+                    f"(survived redeploy)"
+                )
+
+    async def _tick_asset(self, slot: CoinSlot, now: float) -> None:
+        market = slot.market
+        if not market:
+            return
+        params = slot.params
+        asset = slot.asset
+        end_ts = market["end_ts"]
+        slot_start_ts = market["slot_start_ts"]
+        remaining_s = max(0.0, end_ts - now)
+        elapsed_s = max(0.0, now - slot_start_ts)
+
+        if not self.cl_stream.ready_for(asset):
+            return
+        if self.cl_stream.is_stale(max_age_s=config.MAX_ORACLE_STALE_S, asset=asset):
+            logger.warning(f"[FEED] {asset.upper()} Chainlink waiting for live tick...")
+            return
+
+        if slot.strike is None or slot.strike <= 0:
+            slot.strike = self.cl_stream.get_slot_strike(slot_start_ts, asset=asset)
+            if slot.strike is None or slot.strike <= 0:
+                slot.strike = self.cl_stream.price(asset)
+            if slot.strike and slot.strike > 0:
+                self._save_slot_state(
+                    slot_ts=slot_start_ts,
+                    slug=market.get("slug"),
+                    strike=slot.strike,
+                    asset=asset,
+                )
+
+        strike = slot.strike
+        spot = self.cl_stream.price(asset)
+        if not strike or strike <= 0 or not spot or spot <= 0:
+            return
+
+        realized_twap, _ = self.cl_stream.compute_realized_twap(
+            start_ts=slot_start_ts, end_ts=now, asset=asset
+        )
+        chop = self.cl_stream.strike_crossings_since(
+            slot_start_ts, strike, noise_buffer_usd=params.chop_noise_usd(spot), asset=asset
+        )
+        min_sigma = params.min_sigma_usd(spot)
+
+        is_momentum = (config.STRATEGY in ("H-005_MOMENTUM", "MOMENTUM", "H-005", "LATE_MOMENTUM"))
+        is_sniper = (config.STRATEGY in ("H-001_SNIPER", "SNIPER", "H-001"))
+
+        if is_momentum:
+            in_eval_window = (
+                config.MOMENTUM_WINDOW_END_S <= remaining_s <= config.MOMENTUM_WINDOW_START_S
+            )
+        else:
+            in_eval_window = (
+                config.EVAL_WINDOW_END_S <= remaining_s <= config.EVAL_WINDOW_START_S
+            )
+
+        tokens = market["tokens"]
+        prelim_side = "UP" if spot >= strike else "DOWN"
+        token_id = tokens.get(prelim_side)
+
+        top = self.book_stream.get_top(token_id) if token_id else None
+        best_bid = top.get("bid") if top else None
+        best_ask = top.get("ask") if top else None
+
+        if best_bid is None and token_id:
+            bk = self.pub_client.get_order_book(token_id)
+            if bk:
+                if bk.get("bids"):
+                    best_bid = float(bk["bids"][0]["price"])
+                if bk.get("asks"):
+                    best_ask = float(bk["asks"][0]["price"])
+
+        open_notional = self._open_notional()
+        tag = asset.upper()
+        px = params.fmt_px
+
+        if is_momentum:
+            can_trade_now, risk_reason_now = self.risk.can_trade(open_notional=open_notional)
+            if not can_trade_now:
+                if not slot.risk_block_logged:
+                    logger.warning(f"[{tag}] Momentum paused by risk manager: {risk_reason_now}")
+                    journal_write("risk_block", reason=risk_reason_now, mode=config.MODE, asset=asset)
+                    slot.risk_block_logged = True
+                return
+            slot.risk_block_logged = False
+            opp_side = "DOWN" if prelim_side == "UP" else "UP"
+            opp_token = tokens.get(opp_side)
+            opp_ask = None
+            if opp_token:
+                opp_top = self.book_stream.get_top(opp_token)
+                opp_ask = opp_top.get("ask") if opp_top else None
+                if opp_ask is None:
+                    bk = self.pub_client.get_order_book(opp_token)
+                    if bk and bk.get("asks"):
+                        opp_ask = float(bk["asks"][0]["price"])
+            trade_side = prelim_side
+            trade_ask = best_ask
+            if best_ask is not None and opp_ask is not None:
+                if opp_ask > best_ask and ((spot >= strike and opp_side == "UP") or (spot < strike and opp_side == "DOWN")):
+                    trade_side = opp_side
+                    trade_ask = opp_ask
+                elif best_ask >= config.MOMENTUM_MIN_ASK or opp_ask >= config.MOMENTUM_MIN_ASK:
+                    if trade_side == prelim_side and (best_ask or 0) < config.MOMENTUM_MIN_ASK and (opp_ask or 0) >= config.MOMENTUM_MIN_ASK:
+                        pass
+
+            signal = slot.engine.evaluate_momentum(
+                spot=spot,
+                strike=strike,
+                remaining_s=remaining_s,
+                elapsed_s=elapsed_s,
+                ask=trade_ask if trade_side == prelim_side else best_ask,
+                fee_rate=market.get("fee_rate", config.TAKER_FEE_RATE),
+                min_move_usd=params.momentum_min_move_usd(spot),
+                max_move_usd=params.momentum_max_move_usd(spot),
+                min_ask=config.MOMENTUM_MIN_ASK,
+                max_ask=config.MOMENTUM_MAX_ASK,
+                min_edge=config.MOMENTUM_MIN_EDGE,
+                window_start_s=config.MOMENTUM_WINDOW_START_S,
+                window_end_s=config.MOMENTUM_WINDOW_END_S,
+            )
+
+            if in_eval_window:
+                move = spot - strike
+                logger.info(
+                    f"[{remaining_s:3.0f}s left] {tag}: ${px(spot)} | S0: ${px(strike)} | "
+                    f"Move: ${move:+.4g} | Ask({signal.side}): {best_ask or 0:.2f} | "
+                    f"P: {signal.model_prob:.1%} | Edge: {signal.edge_net:+.1%} | Pass: {signal.passed_gates}"
+                    + (f" | Skip: {signal.skip_reason}" if (not signal.passed_gates and signal.skip_reason) else "")
+                )
+
+                if signal.passed_gates and not slot.position:
+                    slot_key = market.get("slug", "")
+                    if slot_key and slot_key in self._slot_done:
+                        pass
+                    else:
+                        can_trade, risk_reason = self.risk.can_trade(open_notional=open_notional)
+                        if can_trade:
+                            await self._place_taker_order(
+                                slot, market, signal, best_ask, strategy_tag="H-005_MOMENTUM"
+                            )
+                            if slot_key:
+                                self._slot_done.add(slot_key)
+                                self._save_slot_state(
+                                    slot_ts=slot_start_ts,
+                                    slug=slot_key,
+                                    strike=strike,
+                                    asset=asset,
+                                )
+                        else:
+                            logger.warning(f"[{tag}] Momentum trade blocked by risk manager: {risk_reason}")
+
+        elif is_sniper:
+            signal = slot.engine.evaluate(
+                spot=spot,
+                strike=strike,
+                remaining_s=remaining_s,
+                elapsed_s=elapsed_s,
+                realized_twap=realized_twap,
+                ask=best_ask,
+                chop_crosses=chop,
+                fee_rate=market.get("fee_rate", config.TAKER_FEE_RATE),
+                realized_vol_daily=params.daily_vol,
+                min_sigma_usd=min_sigma,
+            )
+
+            if in_eval_window:
+                logger.info(
+                    f"[{remaining_s:3.0f}s left] {tag}: ${px(spot)} | S0: ${px(strike)} | "
+                    f"Z: {signal.z_score:4.2f} | P: {signal.model_prob:.1%} | "
+                    f"Ask({signal.side}): {best_ask or 0:.2f} | "
+                    f"Edge: {signal.edge_net:+.1%} | Pass: {signal.passed_gates}"
+                )
+
+                if signal.passed_gates and not slot.position:
+                    can_trade, risk_reason = self.risk.can_trade(open_notional=open_notional)
+                    if can_trade:
+                        await self._place_taker_order(slot, market, signal, best_ask)
+                    else:
+                        logger.warning(f"[{tag}] Sniper trade blocked by risk manager: {risk_reason}")
+        else:
+            signal = slot.engine.evaluate_maker(
+                spot=spot,
+                strike=strike,
+                remaining_s=remaining_s,
+                elapsed_s=elapsed_s,
+                realized_twap=realized_twap,
+                best_bid=best_bid,
+                best_ask=best_ask,
+                chop_crosses=chop,
+                fee_rate=market.get("fee_rate", config.TAKER_FEE_RATE),
+                realized_vol_daily=params.daily_vol,
+                min_sigma_usd=min_sigma,
+            )
+
+            if in_eval_window:
+                logger.info(
+                    f"[{remaining_s:3.0f}s left] {tag}: ${px(spot)} | S0: ${px(strike)} | "
+                    f"Z: {signal.z_score:4.2f} | P: {signal.model_prob:.1%} | "
+                    f"TopBid: {best_bid or 0:.2f} | TargetBid({signal.side}): {signal.target_bid:.2f} | "
+                    f"Edge: {signal.edge_net:+.1%} | Pass: {signal.passed_gates}"
+                )
+
+                if signal.passed_gates and not slot.resting_order and not slot.position:
+                    can_trade, risk_reason = self.risk.can_trade(open_notional=open_notional)
+                    if can_trade:
+                        await self._place_maker_bid(slot, market, signal)
+                    else:
+                        logger.warning(f"[{tag}] Maker trade blocked by risk manager: {risk_reason}")
+
+            if slot.resting_order and not slot.position:
+                ro = slot.resting_order
+                cur_bid = best_bid or 0.0
+                cur_ask = best_ask or 1.0
+                elapsed_resting = time.time() - ro.get("placed_at", time.time())
+
+                is_paper_fill = (config.MODE != "live" and elapsed_resting >= config.MAKER_DWELL_SECONDS and signal.z_score >= params.min_z)
+                is_clob_fill = (cur_bid >= ro["price"] or cur_ask <= ro["price"])
+
+                if is_paper_fill or is_clob_fill:
+                    slot.position = {
+                        "asset": asset,
+                        "slot": ro["slot"],
+                        "strategy": "H-004_MAKER",
+                        "side": ro["side"],
+                        "token_id": ro["token_id"],
+                        "price": ro["price"],
+                        "shares": ro["shares"],
+                        "cost_usd": ro["cost_usd"],
+                        "z_score": ro["z_score"],
+                        "prob": ro["prob"],
+                        "fee": 0.0,
+                        "rebate": ro["rebate"],
+                        "entry_time": time.time(),
+                        "order_id": ro["order_id"],
+                    }
+                    logger.info("=" * 60)
+                    logger.info(f"✅ [{tag} H-004 MAKER BID FILLED] BUY {ro['side']} @ {ro['price']:.2f}")
+                    logger.info(f"   Filled: {ro['shares']:.1f} shares (${ro['cost_usd']:.2f}) | Rebate: ${ro['rebate']:.3f}")
+                    logger.info("=" * 60)
+                    slot.resting_order = None
+
+                elif signal.z_score < 0.80 or remaining_s < config.EVAL_WINDOW_END_S:
+                    reason = "spot reversal (Z < 0.80)" if signal.z_score < 0.80 else "end of quoting window"
+                    logger.info(f"🚫 [{tag} H-004 MAKER BID CANCELLED] Cancelled resting bid @ {ro['price']:.2f} ({reason})")
+                    if config.MODE == "live" and self.live_client:
+                        try:
+                            self.live_client.cancel_order(ro["order_id"])
+                        except Exception as e:
+                            logger.error(f"Error cancelling live order: {e}")
+                    slot.resting_order = None
+
+        if slot.position and slot.position.get("strategy") in (
+            "H-005_MOMENTUM", "LATE_MOMENTUM", "MOMENTUM", "H-005"
+        ):
+            await self._manage_open_momentum_position(slot, market, remaining_s, tokens)
+
+        if remaining_s <= 0.5:
+            if slot.resting_order:
+                slot.resting_order = None
+            if slot.position:
+                await self._settle_position(slot, market, strike)
+
+    async def _place_taker_order(
+        self, slot: CoinSlot, market: dict, signal: TWAPSignal, ask: float, strategy_tag: str = "H-001_SNIPER"
+    ) -> None:
         """Execute immediate taker sniper order against available ask."""
         token_id = market["tokens"].get(signal.side)
         if not token_id or not ask:
             return
 
-        stake_usd = self.risk.calculate_stake(signal.edge_net, ask)
+        stake_usd = self.risk.calculate_stake(signal.edge_net, ask, open_notional=self._open_notional())
+        if stake_usd < config.BASE_STAKE_USD:
+            logger.warning(f"[{slot.asset.upper()}] Stake ${stake_usd:.2f} below base; skip")
+            return
         shares = max(config.MIN_ORDER_SHARES, round(stake_usd / ask, 2))
         cost_usd = round(shares * ask, 2)
         fee_usd = round(signal.fee_taker * shares, 4)
 
         logger.info("=" * 60)
-        logger.info(f"[{strategy_tag} ORDER EXECUTED] BUY {signal.side} @ {ask:.3f}")
+        logger.info(f"[{slot.asset.upper()} {strategy_tag} ORDER EXECUTED] BUY {signal.side} @ {ask:.3f}")
         logger.info(f"   Z-Score: {signal.z_score:.2f} | Win Prob: {signal.model_prob:.1%} | Net Edge: {signal.edge_net:+.1%}")
         logger.info(f"   Size: {shares:.1f} shares (${cost_usd:.2f}) | Fee: ${fee_usd:.3f}")
         logger.info("=" * 60)
@@ -515,6 +595,7 @@ class TWAPBot:
                     journal_write(
                         "skip_round",
                         reason="fok_unfilled",
+                        asset=slot.asset,
                         side=signal.side,
                         ask=ask,
                         response=str(resp)[:300],
@@ -535,12 +616,14 @@ class TWAPBot:
             shares=shares,
             cost_usd=cost_usd,
             slot=market.get("slug"),
+            asset=slot.asset,
             order_id=order_id,
             z_score=signal.z_score,
             edge=signal.edge_net,
         )
 
-        self._current_position = {
+        slot.position = {
+            "asset": slot.asset,
             "slot": market["slug"],
             "strategy": strategy_tag,
             "side": signal.side,
@@ -556,19 +639,22 @@ class TWAPBot:
             "order_id": order_id,
         }
 
-    async def _place_maker_bid(self, market: dict, signal: MakerSignal) -> None:
+    async def _place_maker_bid(self, slot: CoinSlot, market: dict, signal: MakerSignal) -> None:
         """Post resting limit bid inside spread as Maker."""
         token_id = market["tokens"].get(signal.side)
         if not token_id or not signal.target_bid:
             return
 
-        stake_usd = self.risk.calculate_stake(signal.edge_net, signal.target_bid)
+        stake_usd = self.risk.calculate_stake(signal.edge_net, signal.target_bid, open_notional=self._open_notional())
+        if stake_usd < config.BASE_STAKE_USD:
+            logger.warning(f"[{slot.asset.upper()}] Stake ${stake_usd:.2f} below base; skip maker")
+            return
         shares = max(config.MIN_ORDER_SHARES, round(stake_usd / signal.target_bid, 2))
         cost_usd = round(shares * signal.target_bid, 2)
         total_rebate = round(signal.maker_rebate * shares, 4)
 
         logger.info("=" * 60)
-        logger.info(f"📥 [H-004 MAKER BID POSTED] RESTING BUY {signal.side} @ {signal.target_bid:.2f}")
+        logger.info(f"📥 [{slot.asset.upper()} H-004 MAKER BID POSTED] RESTING BUY {signal.side} @ {signal.target_bid:.2f}")
         logger.info(f"   Z-Score: {signal.z_score:.2f} | Fair Value: {signal.model_prob:.1%} | Net Edge: {signal.edge_net:+.1%}")
         logger.info(f"   Target Size: {shares:.1f} shares (${cost_usd:.2f}) | Expected Rebate: ${total_rebate:.3f}")
         logger.info("=" * 60)
@@ -586,7 +672,8 @@ class TWAPBot:
                 logger.error(f"Live limit order placement failed: {e}")
                 return
 
-        self._resting_order = {
+        slot.resting_order = {
+            "asset": slot.asset,
             "slot": market["slug"],
             "side": signal.side,
             "token_id": token_id,
@@ -601,9 +688,11 @@ class TWAPBot:
         }
 
 
-    async def _manage_open_momentum_position(self, market: dict, remaining_s: float, tokens: dict) -> None:
+    async def _manage_open_momentum_position(
+        self, slot: CoinSlot, market: dict, remaining_s: float, tokens: dict
+    ) -> None:
         """Stop-loss, exit-before-close, and optional micro-hedge for H-005 positions."""
-        pos = self._current_position
+        pos = slot.position
         if not pos:
             return
 
@@ -647,17 +736,17 @@ class TWAPBot:
                 f"[H-005 STOP-LOSS] mark {mark:.3f} <= entry {entry:.3f} * "
                 f"(1-{config.MOMENTUM_STOP_LOSS_PCT:.0%})"
             )
-            await self._exit_position_early(market, mark, reason="stop_loss")
+            await self._exit_position_early(slot, market, mark, reason="stop_loss")
             return
 
         # 2) Exit before final seconds (avoid last-second oracle chop)
         if remaining_s <= float(config.MOMENTUM_EXIT_BEFORE_S) and remaining_s > 0.5:
             exit_px = mark if mark is not None else entry
             logger.info(
-                f"[H-005 EXIT-BEFORE] {remaining_s:.1f}s left <= {config.MOMENTUM_EXIT_BEFORE_S:.0f}s; "
+                f"[{slot.asset.upper()} H-005 EXIT-BEFORE] {remaining_s:.1f}s left <= {config.MOMENTUM_EXIT_BEFORE_S:.0f}s; "
                 f"flatten @ {exit_px:.3f}"
             )
-            await self._exit_position_early(market, exit_px, reason="exit_before")
+            await self._exit_position_early(slot, market, exit_px, reason="exit_before")
             return
 
         # 3) Micro-hedge when main side ask is extremely rich / skew extreme
@@ -669,9 +758,11 @@ class TWAPBot:
             main_ask = float(best_ask) if best_ask is not None else None
             # Extreme conviction on our side (crowd piled in) -> tiny opposite hedge
             if main_ask is not None and main_ask >= float(config.MOMENTUM_HEDGE_TRIGGER_ASK):
-                await self._place_micro_hedge(market, tokens, pos, main_ask)
+                await self._place_micro_hedge(slot, market, tokens, pos, main_ask)
 
-    async def _place_micro_hedge(self, market: dict, tokens: dict, pos: dict, main_ask: float) -> None:
+    async def _place_micro_hedge(
+        self, slot: CoinSlot, market: dict, tokens: dict, pos: dict, main_ask: float
+    ) -> None:
         """Buy a small opposite-side ticket when skew is extreme (Novals-style)."""
         hedge_side = "DOWN" if pos["side"] == "UP" else "UP"
         hedge_token = tokens.get(hedge_side)
@@ -696,7 +787,7 @@ class TWAPBot:
 
         logger.info("=" * 60)
         logger.info(
-            f"[H-005 MICRO-HEDGE] BUY {hedge_side} @ {hedge_ask:.3f} | "
+            f"[{slot.asset.upper()} H-005 MICRO-HEDGE] BUY {hedge_side} @ {hedge_ask:.3f} | "
             f"{shares:.1f} sh (${cost:.2f}) | trigger main_ask={main_ask:.3f}"
         )
         logger.info("=" * 60)
@@ -718,12 +809,12 @@ class TWAPBot:
         pos["hedge_cost_usd"] = cost
         pos["hedge_order_id"] = order_id
 
-    async def _exit_position_early(self, market: dict, exit_price: float, reason: str) -> None:
+    async def _exit_position_early(self, slot: CoinSlot, market: dict, exit_price: float, reason: str) -> None:
         """Flatten main (+ optional hedge) before TWAP settlement; paper marks at exit_price."""
-        pos = self._current_position
+        pos = slot.position
         if not pos:
             return
-        self._current_position = None
+        slot.position = None
         slot_key = market.get("slug") or pos.get("slot")
         if slot_key:
             self._slot_done.add(slot_key)
@@ -731,6 +822,7 @@ class TWAPBot:
                 slot_ts=market.get("slot_start_ts"),
                 slug=slot_key,
                 strike=None,
+                asset=slot.asset,
             )
 
         shares = float(pos["shares"])
@@ -772,7 +864,7 @@ class TWAPBot:
         self.risk.record_trade_result(pnl)
 
         logger.info("=" * 60)
-        logger.info(f"[H-005 EARLY EXIT:{reason}] {market['slug']}")
+        logger.info(f"[{slot.asset.upper()} H-005 EARLY EXIT:{reason}] {market['slug']}")
         logger.info(
             f"   Main {pos['side']} entry={pos['price']:.3f} exit={exit_price:.3f} | "
             f"PnL ${pnl:+.2f} | Bankroll ${self.risk.bankroll:.2f}"
@@ -781,6 +873,7 @@ class TWAPBot:
 
         record = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
+            "asset": slot.asset,
             "slot": market["slug"],
             "strategy": pos.get("strategy", "H-005_MOMENTUM"),
             "side": pos["side"],
@@ -804,6 +897,7 @@ class TWAPBot:
         journal_write(
             "settlement",
             slot=record.get("slot"),
+            asset=slot.asset,
             strategy=record.get("strategy"),
             side=record.get("side"),
             won=record.get("won"),
@@ -813,10 +907,10 @@ class TWAPBot:
         )
         self._save_trade_record(record)
 
-    async def _settle_position(self, market: dict, strike: float) -> None:
+    async def _settle_position(self, slot: CoinSlot, market: dict, strike: float) -> None:
         """Settle filled position against final Chainlink TWAP."""
-        pos = self._current_position
-        self._current_position = None
+        pos = slot.position
+        slot.position = None
         if not pos:
             return
 
@@ -824,6 +918,7 @@ class TWAPBot:
         final_twap, _ = self.cl_stream.compute_realized_twap(
             start_ts=market["slot_start_ts"],
             end_ts=market["end_ts"],
+            asset=slot.asset,
         )
         resolved_side = "UP" if final_twap >= strike else "DOWN"
         won = (pos["side"] == resolved_side)
@@ -851,7 +946,7 @@ class TWAPBot:
         self.risk.record_trade_result(pnl)
 
         logger.info("=" * 60)
-        logger.info(f"🏁 [SLOT SETTLEMENT] {market['slug']} ({strategy_name})")
+        logger.info(f"🏁 [{slot.asset.upper()} SLOT SETTLEMENT] {market['slug']} ({strategy_name})")
         logger.info(f"   Strike (S0): ${strike:,.2f} | Final TWAP: ${final_twap:,.2f}")
         logger.info(f"   Outcome: {resolved_side} | Trade: {pos['side']} -> {'WON' if won else 'LOST'}")
         logger.info(f"   Trade PnL: ${pnl:+.2f} | New Bankroll: ${self.risk.bankroll:.2f}")
@@ -860,6 +955,7 @@ class TWAPBot:
         # Record to trades.json
         record = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
+            "asset": slot.asset,
             "slot": market["slug"],
             "strategy": strategy_name,
             "side": pos["side"],
@@ -879,6 +975,7 @@ class TWAPBot:
         journal_write(
             "settlement",
             slot=market["slug"],
+            asset=slot.asset,
             strategy=strategy_name,
             side=pos["side"],
             outcome=resolved_side,

@@ -14,22 +14,42 @@ logger = logging.getLogger("feeds")
 
 
 class ChainlinkRTDSStream:
-    """Streams live Chainlink Data Streams (BTC/USD) via Polymarket RTDS.
-    
-    This is Polymarket's exact settlement oracle source for 5-minute BTC markets.
+    """Streams live Chainlink Data Streams via Polymarket RTDS.
+
+    This is Polymarket's exact settlement oracle source for 5-minute Up/Down markets.
+    One socket; ticks are bucketed per asset (btc, eth, sol, ...).
     """
 
-    def __init__(self, url: str = config.CHAINLINK_RTDS_URL, asset: str = "btc"):
+    def __init__(
+        self,
+        url: str = config.CHAINLINK_RTDS_URL,
+        asset: str | None = None,
+        assets: list[str] | None = None,
+    ):
         self.url = url
-        self.asset = str(asset).lower()
+        if assets:
+            self.assets = [str(a).lower() for a in assets if a]
+        elif asset:
+            self.assets = [str(asset).lower()]
+        else:
+            self.assets = list(config.ASSETS)
+        if not self.assets:
+            self.assets = ["btc"]
+        self.asset = self.assets[0]
         self.symbol = f"{self.asset}/usd"
-        self._history: collections.deque[tuple[float, float]] = collections.deque(maxlen=10000)
+        self._symbol_to_asset: dict[str, str] = {}
+        for a in self.assets:
+            for alias in (f"{a}/usd", f"{a}-usd", f"{a}usd"):
+                self._symbol_to_asset[alias] = a
+        self._history: dict[str, collections.deque[tuple[float, float]]] = {
+            a: collections.deque(maxlen=10000) for a in self.assets
+        }
         self._lock = threading.Lock()
         self._stop = False
         self._thread: threading.Thread | None = None
         self._task: asyncio.Task | None = None
         self._ready_event = threading.Event()
-        self._last_tick_time: float = 0.0
+        self._last_tick_time: dict[str, float] = {a: 0.0 for a in self.assets}
         self._stream_clock_offset: float = 0.0  # (stream_ts - local_ts)
 
     def start(self) -> None:
@@ -56,23 +76,38 @@ class ChainlinkRTDSStream:
     def ready(self) -> bool:
         return self._ready_event.is_set()
 
-    def price(self) -> float:
+    def _asset_or_default(self, asset: str | None) -> str:
+        a = str(asset or self.asset).lower()
+        return a if a in self._history else self.asset
+
+    def price(self, asset: str | None = None) -> float:
+        a = self._asset_or_default(asset)
         with self._lock:
-            if not self._history:
+            hist = self._history.get(a)
+            if not hist:
                 return 0.0
-            return self._history[-1][1]
+            return hist[-1][1]
 
     def clock_offset_s(self) -> float:
         return self._stream_clock_offset
 
-    def get_slot_strike(self, slot_start_ts: float, max_dist_s: float = 30.0) -> float | None:
-        """Find the tick closest to slot start time."""
+    def ready_for(self, asset: str) -> bool:
+        a = str(asset).lower()
         with self._lock:
-            if not self._history:
+            return bool(self._history.get(a))
+
+    def get_slot_strike(
+        self, slot_start_ts: float, max_dist_s: float = 30.0, asset: str | None = None
+    ) -> float | None:
+        """Find the tick closest to slot start time."""
+        a = self._asset_or_default(asset)
+        with self._lock:
+            hist = self._history.get(a)
+            if not hist:
                 return None
             best_p = None
             best_diff = float("inf")
-            for ts, p in self._history:
+            for ts, p in hist:
                 diff = abs(ts - slot_start_ts)
                 if diff < best_diff:
                     best_diff = diff
@@ -81,13 +116,17 @@ class ChainlinkRTDSStream:
                 return best_p
             return None
 
-    def compute_realized_twap(self, start_ts: float, end_ts: float | None = None) -> tuple[float, float]:
+    def compute_realized_twap(
+        self, start_ts: float, end_ts: float | None = None, asset: str | None = None
+    ) -> tuple[float, float]:
         """Continuous trapezoidal TWAP integration over [start_ts, end_ts]."""
+        a = self._asset_or_default(asset)
         with self._lock:
-            if not self._history:
+            hist = self._history.get(a)
+            if not hist:
                 return 0.0, 0.0
 
-            ticks = list(self._history)
+            ticks = list(hist)
             end = float(end_ts) if end_ts is not None else (ticks[-1][0])
             start = float(start_ts)
             elapsed = max(0.0, end - start)
@@ -124,10 +163,18 @@ class ChainlinkRTDSStream:
             realized_twap = integral / elapsed if elapsed > 0 else pts[-1][1]
             return realized_twap, elapsed
 
-    def strike_crossings_since(self, start_ts: float, strike: float, noise_buffer_usd: float = 3.0) -> int:
+    def strike_crossings_since(
+        self,
+        start_ts: float,
+        strike: float,
+        noise_buffer_usd: float = 3.0,
+        asset: str | None = None,
+    ) -> int:
         """Count the number of times spot significantly crossed strike since start_ts, filtering noise."""
+        a = self._asset_or_default(asset)
         with self._lock:
-            ticks = [p for ts, p in self._history if ts >= start_ts]
+            hist = self._history.get(a) or []
+            ticks = [p for ts, p in hist if ts >= start_ts]
         if len(ticks) < 2 or strike <= 0:
             return 0
         crossings = 0
@@ -144,25 +191,34 @@ class ChainlinkRTDSStream:
             current_regime = new_regime
         return crossings
 
-    def mark_stale(self, reason: str = "") -> None:
+    def mark_stale(self, reason: str = "", asset: str | None = None) -> None:
         """Force is_stale() true until a fresh RTDS tick arrives (poly15m pattern)."""
+        targets = [self._asset_or_default(asset)] if asset else list(self.assets)
         with self._lock:
-            prev = self._last_tick_time
-            self._last_tick_time = 0.0
-        if prev > 0:
+            had = any(self._last_tick_time.get(a, 0.0) > 0 for a in targets)
+            for a in targets:
+                self._last_tick_time[a] = 0.0
+        if had:
+            who = asset.upper() if asset else "ALL"
             logger.warning(
-                f"[ChainlinkRTDS] Marked stale ({reason or 'unknown'}). Waiting for a fresh tick."
+                f"[ChainlinkRTDS] Marked stale {who} ({reason or 'unknown'}). Waiting for a fresh tick."
             )
-    def is_stale(self, max_age_s: float = 6.0) -> bool:
-        with self._lock:
-            if not self._history:
-                return True
-            return (time.time() - self._last_tick_time) > max_age_s
 
-    def _record(self, ts: float, price: float) -> None:
+    def is_stale(self, max_age_s: float | None = None, asset: str | None = None) -> bool:
+        a = self._asset_or_default(asset)
+        age = float(config.MAX_ORACLE_STALE_S if max_age_s is None else max_age_s)
         with self._lock:
-            self._history.append((ts, price))
-            self._last_tick_time = time.time()
+            hist = self._history.get(a)
+            if not hist:
+                return True
+            return (time.time() - self._last_tick_time.get(a, 0.0)) > age
+
+    def _record(self, ts: float, price: float, asset: str | None = None) -> None:
+        a = self._asset_or_default(asset)
+        with self._lock:
+            hist = self._history.setdefault(a, collections.deque(maxlen=10000))
+            hist.append((ts, price))
+            self._last_tick_time[a] = time.time()
             self._ready_event.set()
 
     def _run_loop(self) -> None:
@@ -207,7 +263,8 @@ class ChainlinkRTDSStream:
                             continue
                         payload = msg.get("payload") or msg.get("data") or (msg if "symbol" in msg else {})
                         sym = str(payload.get("symbol") or "").lower()
-                        if sym not in (self.symbol, f"{self.asset}-usd", f"{self.asset}usd"):
+                        asset = self._symbol_to_asset.get(sym)
+                        if not asset:
                             continue
                         try:
                             value = float(payload.get("value") if payload.get("value") is not None else payload.get("price"))
@@ -220,10 +277,10 @@ class ChainlinkRTDSStream:
                             ts_s = time.time()
                         self._stream_clock_offset = ts_s - time.time()
                         if value > 0:
-                            was_stale = self.is_stale(max_age_s=6.0)
-                            self._record(ts_s, value)
+                            was_stale = self.is_stale(max_age_s=6.0, asset=asset)
+                            self._record(ts_s, value, asset=asset)
                             if was_stale:
-                                logger.info(f"[ChainlinkRTDS] Stream resumed: ${value:,.2f}")
+                                logger.info(f"[ChainlinkRTDS] {asset.upper()} stream resumed: ${value}")
             except Exception as e:
                 self.mark_stale(f"rtds_error:{e}")
                 logger.warning(f"[ChainlinkRTDS] connection error: {e}")

@@ -95,6 +95,7 @@ class TWAPEngine:
         remaining_s: float,
         realized_vol_daily: float | None = None,
         var_per_sec: float | None = None,
+        min_sigma_usd: float | None = None,
     ) -> float:
         """Calculate analytical std dev of remaining TWAP: sigma_twap = spot * sqrt(var_sec * tau / 3)."""
         tau = max(1.0, min(300.0, float(remaining_s)))
@@ -107,7 +108,8 @@ class TWAPEngine:
 
         # Remaining TWAP integral variance is Var(1/tau * int_0^tau B_t dt) = sigma^2 * tau / 3
         sigma_twap = spot * math.sqrt(v_sec * tau / 3.0)
-        return max(self.min_sigma_usd, float(sigma_twap))
+        floor = self.min_sigma_usd if min_sigma_usd is None else float(min_sigma_usd)
+        return max(floor, float(sigma_twap))
 
     def compute_s_req_and_z(
         self,
@@ -130,7 +132,7 @@ class TWAPEngine:
         remaining_integral = target_integral - realized_integral
         s_req = remaining_integral / remaining
 
-        dispersion = max(self.min_sigma_usd, float(sigma_twap_usd))
+        dispersion = max(1e-12, float(sigma_twap_usd))
         signed_z = (spot - s_req) / dispersion
         abs_z = abs(signed_z)
         return abs_z, signed_z, s_req
@@ -159,6 +161,7 @@ class TWAPEngine:
         realized_vol_daily: float | None = None,
         var_per_sec: float | None = None,
         fee_rate: float = 0.07,
+        min_sigma_usd: float | None = None,
     ) -> TWAPSignal:
         """Evaluate TWAP mispricing and determine trade eligibility."""
         sigma_twap = self.estimate_sigma_twap_usd(
@@ -166,6 +169,7 @@ class TWAPEngine:
             remaining_s=remaining_s,
             realized_vol_daily=realized_vol_daily,
             var_per_sec=var_per_sec,
+            min_sigma_usd=min_sigma_usd,
         )
 
         abs_z, signed_z, s_req = self.compute_s_req_and_z(
@@ -254,6 +258,7 @@ class TWAPEngine:
         realized_vol_daily: float | None = None,
         var_per_sec: float | None = None,
         fee_rate: float = 0.07,
+        min_sigma_usd: float | None = None,
     ) -> MakerSignal:
         """Evaluate and price optimal resting limit bid for H-004 Passive Maker Strategy."""
         sigma_twap = self.estimate_sigma_twap_usd(
@@ -261,6 +266,7 @@ class TWAPEngine:
             remaining_s=remaining_s,
             realized_vol_daily=realized_vol_daily,
             var_per_sec=var_per_sec,
+            min_sigma_usd=min_sigma_usd,
         )
 
         abs_z, signed_z, s_req = self.compute_s_req_and_z(
@@ -371,7 +377,11 @@ class TWAPEngine:
         side = "UP" if move >= 0 else "DOWN"
 
         # Crude near-expiry confidence from move size (not TWAP math).
-        model_prob = 1.0 / (1.0 + math.exp(-0.04 * (abs_move - 50.0)))
+        # Scale the BTC-calibrated $50 / 0.04 logistic so alts with tiny USD moves still map.
+        move_ref = max(1e-9, float(min_move_usd))
+        offset = move_ref * (50.0 / 70.0)
+        k = 0.04 * (70.0 / move_ref)
+        model_prob = 1.0 / (1.0 + math.exp(-k * (abs_move - offset)))
         model_prob = min(0.97, max(0.55, model_prob))
 
         ask_v = float(ask) if ask is not None else None
@@ -413,8 +423,8 @@ class TWAPEngine:
 
         return TWAPSignal(
             side=side,
-            z_score=abs_move / 50.0,
-            signed_z=(abs_move / 50.0) if side == "UP" else -(abs_move / 50.0),
+            z_score=abs_move / max(offset, 1e-9),
+            signed_z=(abs_move / max(offset, 1e-9)) if side == "UP" else -(abs_move / max(offset, 1e-9)),
             model_prob=model_prob,
             ask=ask_v,
             edge_gross=edge_gross,

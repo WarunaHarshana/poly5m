@@ -18,15 +18,16 @@ class PolymarketPublicClient:
         self.session = requests.Session()
         self.timeout = timeout
 
-    def find_active_5m_slot(self, now_ts: float | None = None) -> dict | None:
-        """Find active Polymarket 5-minute BTC market metadata by deterministic slug."""
+    def find_active_5m_slot(self, now_ts: float | None = None, asset: str | None = None) -> dict | None:
+        """Find active Polymarket 5-minute Up/Down market metadata by deterministic slug."""
         now = time.time() if now_ts is None else float(now_ts)
         slot = config.SLOT_SECONDS
         window_start = int(now // slot * slot)
+        coin = str(asset or config.ASSET).strip().lower() or "btc"
 
         candidates = [window_start, window_start + slot, window_start - slot]
         for start_ts in candidates:
-            slug = f"{config.ASSET}-updown-5m-{start_ts}"
+            slug = f"{coin}-updown-5m-{start_ts}"
             try:
                 r = self.session.get(f"{config.GAMMA_HOST}/events", params={"slug": slug}, timeout=self.timeout)
                 data = r.json()
@@ -62,12 +63,13 @@ class PolymarketPublicClient:
 
                         return {
                             "slug": slug,
+                            "asset": coin,
                             "condition_id": m.get("conditionId", ""),
                             "slot_start_ts": start_ts,
                             "end_ts": start_ts + slot,
                             "tokens": tokens,
                             "fee_rate": fee_rate,
-                            "question": m.get("question", "BTC 5-minute Up/Down"),
+                            "question": m.get("question", f"{coin.upper()} 5-minute Up/Down"),
                         }
             except Exception:
                 continue

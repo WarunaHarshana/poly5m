@@ -34,7 +34,7 @@ class RiskManager:
         """Daily-loss / consecutive-loss caps are live-only; paper must keep filling."""
         return str(config.MODE).strip().lower() == "live"
 
-    def can_trade(self) -> tuple[bool, str]:
+    def can_trade(self, open_notional: float = 0.0) -> tuple[bool, str]:
         """Check if trading is allowed under current risk limits."""
         self._check_day_rollover()
 
@@ -47,21 +47,27 @@ class RiskManager:
             if self.consecutive_losses >= config.MAX_CONSECUTIVE_LOSSES:
                 return False, f"hit {self.consecutive_losses} consecutive losses (max {config.MAX_CONSECUTIVE_LOSSES})"
 
-        # Minimum bankroll check (always)
-        if self.bankroll < config.BASE_STAKE_USD:
-            return False, f"insufficient bankroll (${self.bankroll:.2f} < ${config.BASE_STAKE_USD:.2f})"
+        free = float(self.bankroll) - max(0.0, float(open_notional))
+        if free < config.BASE_STAKE_USD:
+            return False, (
+                f"insufficient free bankroll (${free:.2f} < ${config.BASE_STAKE_USD:.2f}; "
+                f"open ${float(open_notional):.2f})"
+            )
 
         return True, ""
 
-    def calculate_stake(self, edge: float, price: float) -> float:
+    def calculate_stake(self, edge: float, price: float, open_notional: float = 0.0) -> float:
         """Calculate dollar stake for trade."""
+        free = max(0.0, float(self.bankroll) - max(0.0, float(open_notional)))
         stake = config.BASE_STAKE_USD
         # Modest scale-up with edge
         if edge > 0.08:
             stake = min(config.MAX_STAKE_USD, stake * 1.5)
-        # Ensure bankroll constraint
-        stake = min(stake, self.bankroll * 0.20)
-        return max(config.BASE_STAKE_USD, round(stake, 2))
+        # Ensure bankroll constraint against capital already tied in open positions
+        stake = min(stake, free * 0.20, free)
+        if stake < config.BASE_STAKE_USD:
+            return round(max(0.0, min(free, config.BASE_STAKE_USD)), 2) if free >= config.BASE_STAKE_USD else 0.0
+        return round(stake, 2)
 
     def record_trade_result(self, pnl: float) -> None:
         """Update risk metrics upon trade settlement."""

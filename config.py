@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -9,10 +10,38 @@ load_dotenv(override=False)
 
 # --- Trading Mode & Asset ---
 MODE = os.getenv("MODE", "paper_live").strip().lower()  # 'paper_live' (real data, paper fills) or 'live'
-LIVE_CONFIRM = os.getenv("LIVE_CONFIRM", "no").strip().lower()
-ASSET = os.getenv("ASSET", "btc").strip().lower()
+LIVE_CONFIRM = os.getenv("LIVE_CONFIRM", os.getenv("CONFIRM_LIVE", "no")).strip().lower()
 TIMEFRAME = os.getenv("TIMEFRAME", "5m").strip().lower()
 SLOT_SECONDS = int(os.getenv("SLOT_SECONDS", "300"))
+MAX_ORACLE_STALE_S = float(os.getenv("MAX_ORACLE_STALE_S", os.getenv("ORACLE_STALE_S", os.getenv("MAX_STALE_S", "6.0"))))
+
+# Polymarket 5-minute Up/Down coins (Chainlink TWAP settlement).
+KNOWN_5M_ASSETS = ("btc", "eth", "sol", "bnb", "xrp", "doge", "hype")
+
+
+def _parse_asset_list(raw: str) -> list[str]:
+    out: list[str] = []
+    for tok in (raw or "").split(","):
+        a = tok.strip().lower()
+        if a in KNOWN_5M_ASSETS and a not in out:
+            out.append(a)
+    return out
+
+
+_assets_env = os.getenv("ASSETS", "").strip()
+if _assets_env:
+    ASSETS = _parse_asset_list(_assets_env)
+else:
+    ASSETS = list(KNOWN_5M_ASSETS)
+
+_asset_env = os.getenv("ASSET", "").strip().lower()
+if _asset_env in KNOWN_5M_ASSETS and not _assets_env:
+    # ASSET=btc with no ASSETS list still means "all 5m coins" unless ASSETS is set.
+    # Keep ASSET as the primary/display coin.
+    pass
+if not ASSETS:
+    ASSETS = [_asset_env] if _asset_env in KNOWN_5M_ASSETS else ["btc"]
+ASSET = _asset_env if _asset_env in ASSETS else ASSETS[0]
 
 # --- WebSocket Endpoints & Hosts ---
 CHAINLINK_RTDS_URL = os.getenv("CHAINLINK_RTDS_URL", "wss://ws-live-data.polymarket.com").strip()
@@ -73,6 +102,127 @@ MAX_STAKE_USD = float(os.getenv("MAX_STAKE_USD", "10.0"))
 DAILY_LOSS_LIMIT_USD = float(os.getenv("DAILY_LOSS_LIMIT_USD", "15.0"))
 MAX_CONSECUTIVE_LOSSES = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "4"))
 MIN_ORDER_SHARES = float(os.getenv("MIN_ORDER_SHARES", "5.0"))
+
+
+def _fenv(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        return float(default)
+    return float(raw)
+
+
+def _ienv(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        return int(default)
+    return int(raw)
+
+
+# BTC-calibrated dollar gates expressed as bps of spot so alts scale.
+# 2 USD / 78k, 3 USD / 78k, 70 USD / 78k, 300 USD / 78k
+_BTC_REF_SPOT = 78000.0
+DEFAULT_MIN_SIGMA_BPS = _fenv("MIN_SIGMA_BPS", 2.0 / _BTC_REF_SPOT * 1e4)
+DEFAULT_CHOP_NOISE_BPS = _fenv("CHOP_NOISE_BPS", 3.0 / _BTC_REF_SPOT * 1e4)
+DEFAULT_MOMENTUM_MIN_MOVE_BPS = _fenv("MOMENTUM_MIN_MOVE_BPS", 70.0 / _BTC_REF_SPOT * 1e4)
+DEFAULT_MOMENTUM_MAX_MOVE_BPS = _fenv("MOMENTUM_MAX_MOVE_BPS", 300.0 / _BTC_REF_SPOT * 1e4)
+
+# Per-coin realized-vol prior (alts chop more than BTC).
+_DAILY_VOL = {
+    "btc": 0.0106,
+    "eth": 0.0140,
+    "sol": 0.0220,
+    "bnb": 0.0160,
+    "xrp": 0.0200,
+    "doge": 0.0300,
+    "hype": 0.0350,
+}
+# Tighter ask ceiling on thinner books.
+_MAX_BUY = {
+    "btc": 0.92,
+    "eth": 0.92,
+    "sol": 0.92,
+    "bnb": 0.92,
+    "xrp": 0.90,
+    "doge": 0.88,
+    "hype": 0.90,
+}
+# Slightly higher Z on noisier coins.
+_MIN_Z = {
+    "btc": 1.65,
+    "eth": 1.65,
+    "sol": 1.70,
+    "bnb": 1.70,
+    "xrp": 1.75,
+    "doge": 1.80,
+    "hype": 1.80,
+}
+
+
+@dataclass(frozen=True, slots=True)
+class AssetParams:
+    """Per-coin sniper/maker/momentum gates. Dollar floors are bps of live spot."""
+
+    symbol: str
+    min_z: float
+    min_edge: float
+    min_buy_price: float
+    max_buy_price: float
+    min_sigma_bps: float
+    chop_noise_bps: float
+    max_chop_crosses: int
+    daily_vol: float
+    momentum_min_move_bps: float
+    momentum_max_move_bps: float
+    min_maker_edge: float
+    min_maker_bid: float
+    max_maker_bid: float
+
+    def min_sigma_usd(self, spot: float) -> float:
+        return max(1e-12, self.min_sigma_bps / 1e4 * float(spot))
+
+    def chop_noise_usd(self, spot: float) -> float:
+        return max(1e-12, self.chop_noise_bps / 1e4 * float(spot))
+
+    def momentum_min_move_usd(self, spot: float) -> float:
+        return self.momentum_min_move_bps / 1e4 * float(spot)
+
+    def momentum_max_move_usd(self, spot: float) -> float:
+        return self.momentum_max_move_bps / 1e4 * float(spot)
+
+    def fmt_px(self, px: float) -> str:
+        p = float(px)
+        if p >= 1000:
+            return f"{p:,.1f}"
+        if p >= 10:
+            return f"{p:,.2f}"
+        if p >= 1:
+            return f"{p:,.3f}"
+        if p >= 0.1:
+            return f"{p:.4f}"
+        return f"{p:.6f}"
+
+
+def _load_asset_params(symbol: str) -> AssetParams:
+    u = symbol.upper()
+    return AssetParams(
+        symbol=symbol,
+        min_z=_fenv(f"{u}_MIN_Z", _MIN_Z.get(symbol, MIN_Z_SCORE)),
+        min_edge=_fenv(f"{u}_MIN_EDGE", MIN_EDGE),
+        min_buy_price=_fenv(f"{u}_MIN_BUY_PRICE", MIN_BUY_PRICE),
+        max_buy_price=_fenv(f"{u}_MAX_BUY_PRICE", _MAX_BUY.get(symbol, MAX_BUY_PRICE)),
+        min_sigma_bps=_fenv(f"{u}_MIN_SIGMA_BPS", DEFAULT_MIN_SIGMA_BPS),
+        chop_noise_bps=_fenv(f"{u}_CHOP_NOISE_BPS", DEFAULT_CHOP_NOISE_BPS),
+        max_chop_crosses=_ienv(f"{u}_MAX_CHOP_CROSSES", MAX_CHOP_CROSSES),
+        daily_vol=_fenv(f"{u}_DAILY_VOL", _DAILY_VOL.get(symbol, 0.0200)),
+        momentum_min_move_bps=_fenv(f"{u}_MOMENTUM_MIN_MOVE_BPS", DEFAULT_MOMENTUM_MIN_MOVE_BPS),
+        momentum_max_move_bps=_fenv(f"{u}_MOMENTUM_MAX_MOVE_BPS", DEFAULT_MOMENTUM_MAX_MOVE_BPS),
+        min_maker_edge=_fenv(f"{u}_MIN_MAKER_EDGE", MIN_MAKER_EDGE),
+        min_maker_bid=_fenv(f"{u}_MIN_MAKER_BID", MIN_MAKER_BID),
+        max_maker_bid=_fenv(f"{u}_MAX_MAKER_BID", MAX_MAKER_BID),
+    )
+
+
+ASSET_PARAMS: dict[str, AssetParams] = {a: _load_asset_params(a) for a in ASSETS}
 
 # --- State Directory ---
 STATE_ROOT = os.getenv("STATE_ROOT", "").strip()
