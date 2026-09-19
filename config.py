@@ -1,4 +1,4 @@
-"""Configuration for High-Conviction TWAP Mispricing Bot (H-001)."""
+"""Configuration for Polymarket 5m bot (default: mid-band maker)."""
 from __future__ import annotations
 
 import os
@@ -60,7 +60,7 @@ FUNDER_ADDRESS = os.getenv("FUNDER_ADDRESS", os.getenv("POLYMARKET_FUNDER_ADDRES
 SIGNATURE_TYPE = int(os.getenv("SIGNATURE_TYPE", os.getenv("POLYMARKET_SIGNATURE_TYPE", "3")))  # 3 = Polymarket Proxy Wallet
 
 # --- Strategy Selection ---
-STRATEGY = os.getenv("STRATEGY", "H-001_SNIPER").strip().upper()
+STRATEGY = os.getenv("STRATEGY", "MIDBAND_MAKER").strip().upper()
 # --- H-005 Momentum-Into-Close (Novals/igus-style) ---
 MOMENTUM_WINDOW_START_S = float(os.getenv('MOMENTUM_WINDOW_START_S', '150.0'))
 MOMENTUM_WINDOW_END_S = float(os.getenv('MOMENTUM_WINDOW_END_S', '60.0'))
@@ -80,7 +80,21 @@ MOMENTUM_HEDGE_SHARE_PCT = float(os.getenv("MOMENTUM_HEDGE_SHARE_PCT", "3.0"))
 MOMENTUM_HEDGE_NOTIONAL_MIN = float(os.getenv("MOMENTUM_HEDGE_NOTIONAL_MIN", "1.0"))
 MOMENTUM_HEDGE_NOTIONAL_MAX = float(os.getenv("MOMENTUM_HEDGE_NOTIONAL_MAX", "2.0"))
 
-# --- H-001 Conservative Taker Sniper Parameters ---
+
+# --- Mid-band maker (default) ---
+# Resting post-only bids near mid while the market is still uncertain (~40-60c).
+# Not a late Z-score taker sniper.
+MIDBAND_LO = float(os.getenv("MIDBAND_LO", "0.40"))
+MIDBAND_HI = float(os.getenv("MIDBAND_HI", "0.60"))
+MIDBAND_HALF_SPREAD = float(os.getenv("MIDBAND_HALF_SPREAD", "0.02"))
+MIDBAND_MIN_SECONDS_LEFT = float(os.getenv("MIDBAND_MIN_SECONDS_LEFT", "75"))
+MIDBAND_MAX_SECONDS_LEFT = float(os.getenv("MIDBAND_MAX_SECONDS_LEFT", "270"))
+MIDBAND_REQUOTE_SECONDS = float(os.getenv("MIDBAND_REQUOTE_SECONDS", "3"))
+MIDBAND_MAX_SKEW_SHARES = float(os.getenv("MIDBAND_MAX_SKEW_SHARES", "40"))
+# Paper: require the ask to trade down through our bid (no phantom fills).
+MIDBAND_PAPER_REQUIRE_CROSS = os.getenv("MIDBAND_PAPER_REQUIRE_CROSS", "yes").strip().lower() in ("yes", "y", "true", "1")
+
+# --- Legacy H-001 sniper params (retired; kept for reference only) ---
 MIN_Z_SCORE = float(os.getenv("MIN_Z_SCORE", "1.65"))                # Require >=95.0% mathematical certainty (Z >= 1.65)
 ALPHA = float(os.getenv("ALPHA", "1.75"))
 MIN_SIGMA_USD = float(os.getenv("MIN_SIGMA_USD", "2.0"))

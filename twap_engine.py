@@ -344,6 +344,103 @@ class TWAPEngine:
             skip_reason="; ".join(skip_reasons),
         )
 
+
+    def evaluate_midband(
+        self,
+        *,
+        remaining_s: float,
+        best_bid: float | None,
+        best_ask: float | None,
+        midband_lo: float = 0.40,
+        midband_hi: float = 0.60,
+        half_spread: float = 0.02,
+        min_seconds_left: float = 75.0,
+        max_seconds_left: float = 270.0,
+        fee_rate: float = 0.07,
+        rebate_share: float = 0.20,
+        side: str = "UP",
+        spot: float = 0.0,
+        strike: float = 0.0,
+        realized_twap: float = 0.0,
+        elapsed_s: float = 0.0,
+    ) -> MakerSignal:
+        """Mid-band maker: rest a bid near mid only while mid is in [lo, hi].
+
+        No Z-score / expensive-favorite logic. Designed for Railway-class hosting
+        (requote every few seconds is fine).
+        """
+        skip_reasons: list[str] = []
+        passed = True
+
+        if best_bid is None or best_ask is None or best_bid <= 0 or best_ask <= 0:
+            return MakerSignal(
+                side=side,
+                z_score=0.0,
+                signed_z=0.0,
+                model_prob=0.5,
+                target_bid=0.0,
+                best_bid=best_bid,
+                best_ask=best_ask,
+                maker_rebate=0.0,
+                edge_net=0.0,
+                s_req=0.0,
+                s_0=strike,
+                spot=spot,
+                realized_twap=realized_twap,
+                elapsed_s=elapsed_s,
+                remaining_s=remaining_s,
+                sigma_twap_usd=0.0,
+                passed_gates=False,
+                skip_reason="missing book",
+            )
+
+        mid = 0.5 * (float(best_bid) + float(best_ask))
+        if remaining_s < min_seconds_left:
+            passed = False
+            skip_reasons.append(f"too late ({remaining_s:.0f}s < {min_seconds_left:.0f}s)")
+        if remaining_s > max_seconds_left:
+            passed = False
+            skip_reasons.append(f"too early ({remaining_s:.0f}s > {max_seconds_left:.0f}s)")
+        if not (midband_lo <= mid <= midband_hi):
+            passed = False
+            skip_reasons.append(f"mid {mid:.3f} outside [{midband_lo:.2f},{midband_hi:.2f}]")
+
+        target_bid = round(mid - float(half_spread), 2)
+        target_bid = max(midband_lo, min(midband_hi, target_bid))
+        # Never cross the ask
+        target_bid = min(target_bid, round(float(best_ask) - 0.01, 2))
+        if target_bid < midband_lo or target_bid > midband_hi:
+            passed = False
+            skip_reasons.append(f"target bid {target_bid:.2f} outside band")
+        if target_bid <= 0:
+            passed = False
+            skip_reasons.append("non-positive target bid")
+
+        maker_rebate = self.calculate_maker_rebate(target_bid, fee_rate=fee_rate, rebate_share=rebate_share)
+        # Fair value proxy = mid; edge is mid - bid + rebate
+        edge_net = (mid - target_bid) + maker_rebate
+
+        return MakerSignal(
+            side=side,
+            z_score=0.0,
+            signed_z=0.0,
+            model_prob=mid,
+            target_bid=target_bid,
+            best_bid=best_bid,
+            best_ask=best_ask,
+            maker_rebate=maker_rebate,
+            edge_net=edge_net,
+            s_req=0.0,
+            s_0=strike,
+            spot=spot,
+            realized_twap=realized_twap,
+            elapsed_s=elapsed_s,
+            remaining_s=remaining_s,
+            sigma_twap_usd=0.0,
+            passed_gates=passed,
+            skip_reason="; ".join(skip_reasons),
+        )
+
     def evaluate_momentum(
         self,
         spot: float,

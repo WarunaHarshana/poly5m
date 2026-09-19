@@ -70,7 +70,7 @@ class CoinSlot:
 
 
 class TWAPBot:
-    """Trading Bot executing H-001 / H-004 / H-005 across 5-minute Up/Down coins."""
+    """Trading Bot — default MIDBAND_MAKER; H-001 sniper retired."""
 
     def __init__(self):
         self.slots: dict[str, CoinSlot] = {
@@ -269,7 +269,13 @@ class TWAPBot:
                 f"ask=[{p.min_buy_price:.2f}..{p.max_buy_price:.2f}] "
                 f"vol={p.daily_vol:.2%} sigma={p.min_sigma_bps:.2f}bps chop={p.chop_noise_bps:.2f}bps"
             )
-        if config.STRATEGY in ("H-005_MOMENTUM", "MOMENTUM", "H-005", "LATE_MOMENTUM"):
+        if config.STRATEGY in ("MIDBAND_MAKER", "MIDBAND", "H-006_MIDBAND_MAKER", "H-006"):
+            logger.info(
+                f"Mid-band maker: band=[{config.MIDBAND_LO:.2f}..{config.MIDBAND_HI:.2f}] "
+                f"half_spread={config.MIDBAND_HALF_SPREAD:.2f} "
+                f"time_left=[{config.MIDBAND_MIN_SECONDS_LEFT:.0f}..{config.MIDBAND_MAX_SECONDS_LEFT:.0f}]s"
+            )
+        elif config.STRATEGY in ("H-005_MOMENTUM", "MOMENTUM", "H-005", "LATE_MOMENTUM"):
             logger.info(
                 f"Momentum: move>=${config.MOMENTUM_MIN_MOVE_USD:.0f} | ask=[{config.MOMENTUM_MIN_ASK:.2f}..{config.MOMENTUM_MAX_ASK:.2f}] | "
                 f"window=[{config.MOMENTUM_WINDOW_END_S:.0f}s..{config.MOMENTUM_WINDOW_START_S:.0f}s left]"
@@ -279,7 +285,7 @@ class TWAPBot:
                 f"exit_before={config.MOMENTUM_EXIT_BEFORE_S:g}s "
                 f"hedge={'on' if config.MOMENTUM_HEDGE_ENABLED else 'off'}"
             )
-        elif config.STRATEGY in ("H-001_SNIPER", "SNIPER", "H-001"):
+        elif False and config.STRATEGY in ("H-001_SNIPER", "SNIPER", "H-001"):  # retired
             logger.info(
                 f"Sniper: min_z={config.MIN_Z_SCORE} | edge>={config.MIN_EDGE:.1%} | "
                 f"ask=[{config.MIN_BUY_PRICE:.2f}..{config.MAX_BUY_PRICE:.2f}]"
@@ -440,7 +446,8 @@ class TWAPBot:
         min_sigma = params.min_sigma_usd(spot)
 
         is_momentum = (config.STRATEGY in ("H-005_MOMENTUM", "MOMENTUM", "H-005", "LATE_MOMENTUM"))
-        is_sniper = (config.STRATEGY in ("H-001_SNIPER", "SNIPER", "H-001"))
+        is_midband = (config.STRATEGY in ("MIDBAND_MAKER", "MIDBAND", "H-006_MIDBAND_MAKER", "H-006"))
+        is_sniper = False  # H-001 retired
 
         if is_momentum:
             in_eval_window = (
@@ -551,41 +558,125 @@ class TWAPBot:
                         else:
                             logger.warning(f"[{tag}] Momentum trade blocked by risk manager: {risk_reason}")
 
-        elif is_sniper:
-            signal = slot.engine.evaluate(
-                spot=spot,
-                strike=strike,
-                remaining_s=remaining_s,
-                elapsed_s=elapsed_s,
-                realized_twap=realized_twap,
-                ask=best_ask,
-                chop_crosses=chop,
-                fee_rate=market.get("fee_rate", config.TAKER_FEE_RATE),
-                realized_vol_daily=params.daily_vol,
-                min_sigma_usd=min_sigma,
-            )
-
-            if in_eval_window:
-                logger.info(
-                    f"[{remaining_s:3.0f}s left] {tag}: ${px(spot)} | S0: ${px(strike)} | "
-                    f"Z: {signal.z_score:4.2f} | P: {signal.model_prob:.1%} | "
-                    f"Ask({signal.side}): {best_ask or 0:.2f} | "
-                    f"Edge: {signal.edge_net:+.1%} | Pass: {signal.passed_gates}"
+        elif is_midband:
+            # Quote BOTH up and down tokens when each mid is in-band (bid-only paper maker).
+            for quote_side in ("UP", "DOWN"):
+                q_token = tokens.get(quote_side)
+                if not q_token:
+                    continue
+                q_top = self.book_stream.get_top(q_token)
+                q_bid = q_top.get("bid") if q_top else None
+                q_ask = q_top.get("ask") if q_top else None
+                if q_bid is None or q_ask is None:
+                    bk = self.pub_client.get_order_book(q_token)
+                    if bk:
+                        if bk.get("bids"):
+                            q_bid = float(bk["bids"][0]["price"])
+                        if bk.get("asks"):
+                            q_ask = float(bk["asks"][0]["price"])
+                msig = slot.engine.evaluate_midband(
+                    remaining_s=remaining_s,
+                    best_bid=q_bid,
+                    best_ask=q_ask,
+                    midband_lo=config.MIDBAND_LO,
+                    midband_hi=config.MIDBAND_HI,
+                    half_spread=config.MIDBAND_HALF_SPREAD,
+                    min_seconds_left=config.MIDBAND_MIN_SECONDS_LEFT,
+                    max_seconds_left=config.MIDBAND_MAX_SECONDS_LEFT,
+                    fee_rate=market.get("fee_rate", config.TAKER_FEE_RATE),
+                    rebate_share=config.MAKER_REBATE_SHARE,
+                    side=quote_side,
+                    spot=spot,
+                    strike=strike,
+                    realized_twap=realized_twap,
+                    elapsed_s=elapsed_s,
                 )
-
-                if signal.passed_gates and not slot.position:
+                mid_px = None
+                if q_bid is not None and q_ask is not None:
+                    mid_px = 0.5 * (float(q_bid) + float(q_ask))
+                if config.EVAL_WINDOW_END_S <= remaining_s <= config.EVAL_WINDOW_START_S:
+                    logger.info(
+                        f"[{remaining_s:3.0f}s left] {tag} {quote_side}: mid={mid_px or 0:.3f} "
+                        f"bid={q_bid or 0:.2f} ask={q_ask or 0:.2f} target={msig.target_bid:.2f} "
+                        f"Pass={msig.passed_gates}"
+                        + (f" | Skip: {msig.skip_reason}" if not msig.passed_gates else "")
+                    )
+                # One resting order / position per asset slot
+                if (
+                    msig.passed_gates
+                    and not slot.resting_order
+                    and not slot.position
+                ):
                     if self._slot_entries_count() >= config.MAX_CONCURRENT_ENTRIES:
                         logger.warning(
-                            f"[{tag}] Sniper trade skipped: slot entry cap ({config.MAX_CONCURRENT_ENTRIES}) reached"
+                            f"[{tag}] Midband skipped: slot entry cap ({config.MAX_CONCURRENT_ENTRIES}) reached"
                         )
+                        break
+                    can_trade, risk_reason = self.risk.can_trade(open_notional=open_notional)
+                    if can_trade:
+                        # Reuse maker placement with strategy tag override via signal side
+                        await self._place_maker_bid(slot, market, msig, strategy_tag="MIDBAND_MAKER")
+                        break
                     else:
-                        can_trade, risk_reason = self.risk.can_trade(open_notional=open_notional)
-                        if can_trade:
-                            await self._place_taker_order(slot, market, signal, best_ask)
-                        else:
-                            logger.warning(f"[{tag}] Sniper trade blocked by risk manager: {risk_reason}")
+                        logger.warning(f"[{tag}] Midband blocked by risk manager: {risk_reason}")
+                        break
+
+            if slot.resting_order and not slot.position:
+                ro = slot.resting_order
+                ro_token = ro.get("token_id")
+                ro_top = self.book_stream.get_top(ro_token) if ro_token else None
+                cur_bid = (ro_top or {}).get("bid") or 0.0
+                cur_ask = (ro_top or {}).get("ask") or 1.0
+                if ro_token and (ro_top is None or ro_top.get("ask") is None):
+                    bk = self.pub_client.get_order_book(ro_token)
+                    if bk and bk.get("asks"):
+                        cur_ask = float(bk["asks"][0]["price"])
+                    if bk and bk.get("bids"):
+                        cur_bid = float(bk["bids"][0]["price"])
+                elapsed_resting = time.time() - ro.get("placed_at", time.time())
+                is_clob_fill = (cur_ask <= ro["price"])
+                is_paper_fill = (
+                    config.MODE != "live"
+                    and elapsed_resting >= max(1.0, config.MIDBAND_REQUOTE_SECONDS)
+                    and (is_clob_fill if config.MIDBAND_PAPER_REQUIRE_CROSS else is_clob_fill)
+                )
+                # Cancel if mid left the band or time ran out
+                mid_now = 0.5 * (float(cur_bid) + float(cur_ask)) if cur_bid and cur_ask else None
+                cancel = False
+                if remaining_s < config.MIDBAND_MIN_SECONDS_LEFT:
+                    cancel = True
+                if mid_now is not None and not (config.MIDBAND_LO <= mid_now <= config.MIDBAND_HI):
+                    cancel = True
+                if cancel and not is_paper_fill:
+                    logger.info(f"[{tag}] Midband cancel resting @{ro['price']:.2f} (band/time)")
+                    slot.resting_order = None
+                elif is_paper_fill or (config.MODE == "live" and is_clob_fill):
+                    slot.position = {
+                        "asset": asset,
+                        "slot": ro["slot"],
+                        "strategy": "MIDBAND_MAKER",
+                        "side": ro["side"],
+                        "token_id": ro["token_id"],
+                        "price": ro["price"],
+                        "shares": ro["shares"],
+                        "cost_usd": ro["cost_usd"],
+                        "z_score": 0.0,
+                        "prob": ro.get("prob", ro["price"]),
+                        "fee": 0.0,
+                        "opened_at": time.time(),
+                        "strike": strike,
+                        "official": False,
+                    }
+                    slot.resting_order = None
+                    logger.info(
+                        f"[{tag}] MIDBAND FILL {ro['side']} @{ro['price']:.3f} x {ro['shares']:.2f}"
+                    )
+
+        elif is_sniper:
+            logger.warning(f"[{tag}] H-001 sniper is retired — no trade")
         else:
             signal = slot.engine.evaluate_maker(
+
                 spot=spot,
                 strike=strike,
                 remaining_s=remaining_s,
@@ -638,7 +729,7 @@ class TWAPBot:
                     slot.position = {
                         "asset": asset,
                         "slot": ro["slot"],
-                        "strategy": "H-004_MAKER",
+                        "strategy": strategy_tag,
                         "side": ro["side"],
                         "token_id": ro["token_id"],
                         "price": ro["price"],
@@ -789,7 +880,7 @@ class TWAPBot:
             "order_id": order_id,
         }
 
-    async def _place_maker_bid(self, slot: CoinSlot, market: dict, signal: MakerSignal) -> None:
+    async def _place_maker_bid(self, slot: CoinSlot, market: dict, signal, strategy_tag: str = "H-004_MAKER": MakerSignal) -> None:
         """Post resting limit bid inside spread as Maker."""
         token_id = market["tokens"].get(signal.side)
         if not token_id or not signal.target_bid:
