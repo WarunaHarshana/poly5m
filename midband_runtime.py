@@ -9,9 +9,10 @@ from pathlib import Path
 _log = logging.getLogger("midband_runtime")
 
 _dir = Path(__file__).resolve().parent
+_n_methods = 19
 _PAYLOAD = "".join(
-    "".join((_dir / f"_methods.{i}.b64").read_text(encoding="ascii").split())
-    for i in range(1, 5)
+    (_dir / f"_m.{i:02d}").read_text(encoding="ascii").strip()
+    for i in range(1, _n_methods + 1)
 )
 
 

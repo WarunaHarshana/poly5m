@@ -1,23 +1,32 @@
-"""Assemble H-006 midband bot from _bs.* shards; retire H-001 sniper."""
+"""Inflate stock TWAPBot + install H-006 midband runtime (H-001 retired)."""
 from __future__ import annotations
 
 import base64
+import types
+import zlib
 from pathlib import Path
 
 _dir = Path(__file__).resolve().parent
-_n = 68
-_code = "".join(
-    base64.b64decode((_dir / f"_bs.{i:02d}").read_text().strip()).decode("utf-8")
-    for i in range(1, _n + 1)
+_n_stock = 40
+_payload = "".join(
+    (_dir / f"_s.{i:02d}").read_text(encoding="ascii").strip()
+    for i in range(1, _n_stock + 1)
 )
-exec(compile(_code, str(_dir / "_assembled_bot.py"), "exec"), globals())
+_code = zlib.decompress(base64.b64decode(_payload)).decode("utf-8")
+exec(compile(_code, str(_dir / "_stock_bot.py"), "exec"), globals())
 
-try:
-    import twap_engine as _te
-    from twap_midband_patch import patch_twap_engine as _patch
-    _patch(_te.TWAPEngine)
-except Exception as _e:
-    print("midband engine patch warn:", _e)
+import midband_runtime as _mr
+
+_mod = types.ModuleType("bot")
+for _k, _v in list(globals().items()):
+    if _k.startswith("_") and _k not in ("_mr",):
+        continue
+    setattr(_mod, _k, _v)
+for _k in ("TWAPBot", "TWAPEngine", "CoinSlot", "main"):
+    if _k in globals():
+        setattr(_mod, _k, globals()[_k])
+_mr.install(_mod)
+TWAPBot = _mod.TWAPBot
 
 if __name__ == "__main__":
     main()
