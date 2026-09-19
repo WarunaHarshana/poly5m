@@ -1,22 +1,15 @@
-"""Materialize stock-bot shards, inflate, install H-006 midband runtime."""
+"""Inflate stock TWAPBot + install H-006 midband runtime (H-001 retired)."""
 from __future__ import annotations
 
 import base64
-import runpy
 import types
 import zlib
 from pathlib import Path
 
 _dir = Path(__file__).resolve().parent
-runpy.run_path(str(_dir / "_decode_shards.py"), run_name="__main__")
-for _i in range(1, 6):
-    for _j in (1, 2):
-        runpy.run_path(str(_dir / f"_write_ob{_i}_{_j}.py"), run_name="__main__")
-
 _payload = "".join(
-    (_dir / f"_ob.{i}.{j}.b64").read_text(encoding="ascii").strip()
-    for i in range(1, 6)
-    for j in (1, 2)
+    "".join((_dir / f"_stock.{i}.b64").read_text(encoding="ascii").split())
+    for i in range(1, 9)
 )
 _code = zlib.decompress(base64.b64decode(_payload)).decode("utf-8")
 exec(compile(_code, str(_dir / "_stock_bot.py"), "exec"), globals())
