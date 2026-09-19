@@ -880,7 +880,7 @@ class TWAPBot:
             "order_id": order_id,
         }
 
-    async def _place_maker_bid(self, slot: CoinSlot, market: dict, signal, strategy_tag: str = "H-004_MAKER": MakerSignal) -> None:
+    async def _place_maker_bid(self, slot: CoinSlot, market: dict, signal: MakerSignal, strategy_tag: str = "H-004_MAKER") -> None:
         """Post resting limit bid inside spread as Maker."""
         token_id = market["tokens"].get(signal.side)
         if not token_id or not signal.target_bid:
