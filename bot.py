@@ -1,1 +1,1 @@
-file:///workspace/poly5m/bot.py
+PLACEHOLDER_WILL_FAIL
