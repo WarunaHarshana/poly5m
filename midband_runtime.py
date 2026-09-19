@@ -11,9 +11,12 @@ _log = logging.getLogger("midband_runtime")
 
 _dir = Path(__file__).resolve().parent
 for _i in (1, 2):
-    runpy.run_path(str(_dir / f"_write_mr{_i}.py"), run_name="__main__")
+    for _j in (1, 2):
+        runpy.run_path(str(_dir / f"_write_mr{_i}_{_j}.py"), run_name="__main__")
 _PAYLOAD = "".join(
-    (_dir / f"_mr.{i}.b64").read_text(encoding="ascii").strip() for i in (1, 2)
+    (_dir / f"_mr.{i}.{j}.b64").read_text(encoding="ascii").strip()
+    for i in (1, 2)
+    for j in (1, 2)
 )
 
 
