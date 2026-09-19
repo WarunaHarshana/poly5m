@@ -8,6 +8,9 @@ import sys
 os.environ.pop("STRATEGY", None)
 
 from twap_engine import TWAPEngine
+from twap_midband_patch import patch_twap_engine
+
+patch_twap_engine(TWAPEngine)
 import config
 
 
