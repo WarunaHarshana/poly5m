@@ -1,16 +1,30 @@
-"""Inflate stock TWAPBot + install H-006 midband runtime (H-001 retired)."""
+"""High-Conviction TWAP Mispricing & Passive Maker Trading Bot (H-004).
+
+Trades Polymarket 5-Minute Up/Down markets (BTC, ETH, SOL, BNB, XRP, DOGE, HYPE):
+- Polymarket RTDS Chainlink Stream
+- Polymarket CLOB Level 2 Orderbook Stream
+- Exact Analytical TWAP Integral & Cubic Variance Decay Engine
+- One open position per coin in the same 5-minute window
+"""
 from __future__ import annotations
 
-import base64
-import types
-import zlib
+import asyncio
+import json
+import logging
+import signal
+import sys
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
-_dir = Path(__file__).resolve().parent
-_n_stock = 40
-_payload = "".join(
-    (_dir / f"_s.{i:02d}").read_text(encoding="ascii").strip()
-    for i in range(1, _n_stock + 1)
+import config
+from twap_engine import TWAPEngine, MakerSignal, TWAPSignal
+from feeds import ChainlinkRTDSStream, PolymarketBookStream
+from polymarket_client import (
+    PolymarketPublicClient,
+    PolymarketLiveClient,
+    fillable_ask_shares,
 )
 from risk_manager import RiskManager
 from journal import configure as journal_configure

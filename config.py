@@ -38,6 +38,8 @@ else:
 
 _asset_env = os.getenv("ASSET", "").strip().lower()
 if _asset_env in KNOWN_5M_ASSETS and not _assets_env:
+    # ASSET=btc with no ASSETS list still means "all 5m coins" unless ASSETS is set.
+    # Keep ASSET as the primary/display coin.
     pass
 if not ASSETS:
     ASSETS = [_asset_env] if _asset_env in KNOWN_5M_ASSETS else ["btc"]
@@ -50,11 +52,12 @@ GAMMA_HOST = os.getenv("GAMMA_HOST", "https://gamma-api.polymarket.com").strip()
 CLOB_HOST = os.getenv("CLOB_HOST", "https://clob.polymarket.com").strip()
 HTTP_HOST = os.getenv("HTTP_HOST", "0.0.0.0").strip() or "0.0.0.0"
 HTTP_PORT = int(os.getenv("PORT") or os.getenv("HTTP_PORT") or "8080")
-CHAIN_ID = int(os.getenv("CHAIN_ID", "137"))
+CHAIN_ID = int(os.getenv("CHAIN_ID", "137"))  # Polygon PoS
 
+# --- Polymarket Authentication (for MODE=live) ---
 PRIVATE_KEY = os.getenv("PRIVATE_KEY", os.getenv("POLYMARKET_PRIVATE_KEY", "")).strip()
 FUNDER_ADDRESS = os.getenv("FUNDER_ADDRESS", os.getenv("POLYMARKET_FUNDER_ADDRESS", "")).strip()
-SIGNATURE_TYPE = int(os.getenv("SIGNATURE_TYPE", os.getenv("POLYMARKET_SIGNATURE_TYPE", "3")))
+SIGNATURE_TYPE = int(os.getenv("SIGNATURE_TYPE", os.getenv("POLYMARKET_SIGNATURE_TYPE", "3")))  # 3 = Polymarket Proxy Wallet
 
 # --- Strategy Selection ---
 STRATEGY = os.getenv("STRATEGY", "MIDBAND_MAKER").strip().upper()
@@ -66,6 +69,7 @@ MOMENTUM_MAX_MOVE_USD = float(os.getenv('MOMENTUM_MAX_MOVE_USD', '300.0'))
 MOMENTUM_MIN_ASK = float(os.getenv('MOMENTUM_MIN_ASK', '0.70'))
 MOMENTUM_MAX_ASK = float(os.getenv('MOMENTUM_MAX_ASK', '0.92'))
 MOMENTUM_MIN_EDGE = float(os.getenv('MOMENTUM_MIN_EDGE', '0.00'))
+# Risk overlays for momentum (Novals conservative defaults)
 MOMENTUM_EXIT_BEFORE_S = float(os.getenv("MOMENTUM_EXIT_BEFORE_S", "20.0"))
 MOMENTUM_STOP_LOSS_PCT = float(os.getenv("MOMENTUM_STOP_LOSS_PCT", "0.25"))
 MOMENTUM_STOP_LOSS_ENABLED = os.getenv("MOMENTUM_STOP_LOSS_ENABLED", "no").strip().lower() in ("yes", "y", "true", "1")
@@ -95,14 +99,14 @@ MIN_Z_SCORE = float(os.getenv("MIN_Z_SCORE", "1.65"))                # Require >
 ALPHA = float(os.getenv("ALPHA", "1.75"))
 MIN_SIGMA_USD = float(os.getenv("MIN_SIGMA_USD", "2.0"))
 MAX_CHOP_CROSSES = int(os.getenv("MAX_CHOP_CROSSES", "2"))
-MIN_EDGE = float(os.getenv("MIN_EDGE", "0.035"))
-MIN_BUY_PRICE = float(os.getenv("MIN_BUY_PRICE", "0.20"))
-MAX_BUY_PRICE = float(os.getenv("MAX_BUY_PRICE", "0.92"))
-EVAL_WINDOW_START_S = float(os.getenv("EVAL_WINDOW_START_S", "270.0"))
-EVAL_WINDOW_END_S = float(os.getenv("EVAL_WINDOW_END_S", "40.0"))
+MIN_EDGE = float(os.getenv("MIN_EDGE", "0.035"))                     # Minimum +3.5% net profit edge
+MIN_BUY_PRICE = float(os.getenv("MIN_BUY_PRICE", "0.20"))            # Capture discount mispricings down to $0.20
+MAX_BUY_PRICE = float(os.getenv("MAX_BUY_PRICE", "0.92"))            # Strict ceiling: NEVER pay > $0.92
+EVAL_WINDOW_START_S = float(os.getenv("EVAL_WINDOW_START_S", "270.0"))  # Start evaluating at t=30s (270s left)
+EVAL_WINDOW_END_S = float(os.getenv("EVAL_WINDOW_END_S", "40.0"))        # Stop evaluating at t=260s (40s left)
 TAKER_FEE_RATE = float(os.getenv("TAKER_FEE_RATE", "0.07"))
 
-# --- H-004 Passive Maker Limit Model Parameters (Z-score FV maker — NOT mid-band) ---
+# --- H-004 Passive Maker Limit Model Parameters (Optional) ---
 MIN_MAKER_EDGE = float(os.getenv("MIN_MAKER_EDGE", "0.05"))
 MIN_MAKER_BID = float(os.getenv("MIN_MAKER_BID", "0.55"))
 MAX_MAKER_BID = float(os.getenv("MAX_MAKER_BID", "0.90"))
@@ -116,9 +120,13 @@ MAX_STAKE_USD = float(os.getenv("MAX_STAKE_USD", "10.0"))
 DAILY_LOSS_LIMIT_USD = float(os.getenv("DAILY_LOSS_LIMIT_USD", "15.0"))
 MAX_CONSECUTIVE_LOSSES = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "4"))
 MIN_ORDER_SHARES = float(os.getenv("MIN_ORDER_SHARES", "5.0"))
+# Paper FOK must be fully fillable from the live book (no phantom size).
 PAPER_FOK_REQUIRE_SIZE = os.getenv("PAPER_FOK_REQUIRE_SIZE", "yes").strip().lower() in ("yes", "y", "true", "1")
+# Settle from Polymarket Gamma, not our local TWAP. Wait this long after the window.
 RESOLUTION_TIMEOUT_S = float(os.getenv("RESOLUTION_TIMEOUT_S", "180.0"))
 RESOLUTION_PRICE_MIN = float(os.getenv("RESOLUTION_PRICE_MIN", "0.99"))
+# Cap how many coins can open new positions in a single 5-minute slot.
+# Prevents correlated multi-asset blowups when all crypto trends together.
 MAX_CONCURRENT_ENTRIES = int(os.getenv("MAX_CONCURRENT_ENTRIES", "3"))
 
 
@@ -136,12 +144,15 @@ def _ienv(name: str, default: int) -> int:
     return int(raw)
 
 
+# BTC-calibrated dollar gates expressed as bps of spot so alts scale.
+# 2 USD / 78k, 3 USD / 78k, 70 USD / 78k, 300 USD / 78k
 _BTC_REF_SPOT = 78000.0
 DEFAULT_MIN_SIGMA_BPS = _fenv("MIN_SIGMA_BPS", 2.0 / _BTC_REF_SPOT * 1e4)
 DEFAULT_CHOP_NOISE_BPS = _fenv("CHOP_NOISE_BPS", 3.0 / _BTC_REF_SPOT * 1e4)
 DEFAULT_MOMENTUM_MIN_MOVE_BPS = _fenv("MOMENTUM_MIN_MOVE_BPS", 70.0 / _BTC_REF_SPOT * 1e4)
 DEFAULT_MOMENTUM_MAX_MOVE_BPS = _fenv("MOMENTUM_MAX_MOVE_BPS", 300.0 / _BTC_REF_SPOT * 1e4)
 
+# Per-coin realized-vol prior (alts chop more than BTC).
 _DAILY_VOL = {
     "btc": 0.0106,
     "eth": 0.0140,
@@ -151,23 +162,25 @@ _DAILY_VOL = {
     "doge": 0.0300,
     "hype": 0.0350,
 }
+# Tighter ask ceiling on thinner books.
 _MAX_BUY = {
     "btc": 0.92,
     "eth": 0.92,
-    "sol": 0.88,
+    "sol": 0.88,   # was 0.92 — force cheaper entries (SOL lost at 0.91)
     "bnb": 0.92,
-    "xrp": 0.88,
-    "doge": 0.85,
-    "hype": 0.85,
+    "xrp": 0.88,   # was 0.90
+    "doge": 0.85,   # was 0.88
+    "hype": 0.85,   # was 0.90
 }
+# Higher Z on noisier coins to prevent coin-flip entries.
 _MIN_Z = {
     "btc": 1.65,
     "eth": 1.65,
-    "sol": 2.00,
+    "sol": 2.00,    # was 1.70 — lost at Z=1.94
     "bnb": 1.70,
-    "xrp": 2.20,
-    "doge": 2.50,
-    "hype": 2.50,
+    "xrp": 2.20,    # was 1.75 — lost at Z=7.5 but asset is too noisy
+    "doge": 2.50,   # was 1.80 — lost at Z=4.1
+    "hype": 2.50,   # was 1.80 — 33% WR, toxic
 }
 
 
@@ -237,12 +250,15 @@ def _load_asset_params(symbol: str) -> AssetParams:
 
 ASSET_PARAMS: dict[str, AssetParams] = {a: _load_asset_params(a) for a in ASSETS}
 
+# --- State Directory ---
 STATE_ROOT = os.getenv("STATE_ROOT", "").strip()
+# Prefer explicit STATE_ROOT (e.g. Railway volume at /data) even before first mkdir
 if STATE_ROOT:
     STATE_DIR = Path(STATE_ROOT)
 else:
     STATE_DIR = Path("state")
 STATE_DIR.mkdir(parents=True, exist_ok=True)
+# --- Event journal (JSONL) ---
 JOURNAL_PATH = os.getenv("JOURNAL_PATH", "").strip()
 if not JOURNAL_PATH:
     JOURNAL_PATH = str(STATE_DIR / "journal.jsonl")
