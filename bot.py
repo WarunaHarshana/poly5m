@@ -11,6 +11,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import shutil
 import signal
 import sys
 import time
@@ -157,6 +159,63 @@ class TWAPBot:
         except Exception as e:
             logger.warning(f"Failed to save slot state: {e}")
 
+    def _check_reset_trade_data(self) -> None:
+        """Archive and reset old trades, journal, slot states, and risk metrics if RESET_TRADE_DATA is set."""
+        reset_flag = os.getenv("RESET_TRADE_DATA", "false").strip().lower() in ("true", "1", "yes")
+        if not reset_flag:
+            return
+
+        logger.info("=" * 70)
+        logger.info("🧹 RESET_TRADE_DATA=true: archiving and resetting historical trades...")
+        ts = int(time.time())
+
+        # 1. Archive & reset trades.json
+        if self._trades_log_path.exists():
+            archive_path = config.STATE_DIR / f"trades_archive_{ts}.json"
+            try:
+                shutil.copy2(self._trades_log_path, archive_path)
+                logger.info(f"   Archived trades.json -> {archive_path.name}")
+            except Exception as e:
+                logger.error(f"   Failed to archive trades.json: {e}")
+            try:
+                with open(self._trades_log_path, "w", encoding="utf-8") as f:
+                    json.dump([], f)
+                logger.info("   Reset trades.json to []")
+            except Exception as e:
+                logger.error(f"   Failed to reset trades.json: {e}")
+
+        # 2. Archive & reset journal.jsonl
+        journal_p = Path(config.JOURNAL_PATH)
+        if journal_p.exists():
+            j_archive = config.STATE_DIR / f"journal_archive_{ts}.jsonl"
+            try:
+                shutil.copy2(journal_p, j_archive)
+                logger.info(f"   Archived journal.jsonl -> {j_archive.name}")
+                with open(journal_p, "w", encoding="utf-8") as f:
+                    pass
+                logger.info("   Truncated journal.jsonl")
+            except Exception as e:
+                logger.error(f"   Failed to archive/reset journal: {e}")
+
+        # 3. Reset slot state
+        slot_p = self._slot_state_path()
+        if slot_p.exists():
+            try:
+                slot_p.unlink()
+                logger.info("   Cleared slot_state.json")
+            except Exception as e:
+                logger.error(f"   Failed to delete slot_state.json: {e}")
+        self._slot_done.clear()
+
+        # 4. Reset risk manager state
+        self.risk.bankroll = config.STARTING_BANKROLL
+        self.risk.daily_pnl = 0.0
+        self.risk.consecutive_losses = 0
+        self.risk.trades_today = 0
+        self.risk.save_state()
+        logger.info(f"   Risk state reset to STARTING_BANKROLL (${config.STARTING_BANKROLL:.2f})")
+        logger.info("=" * 70)
+
     def _reconcile_paper_blotter(self) -> None:
         """Paper bankroll follows official Polymarket settlements only."""
         if config.MODE == "live":
@@ -296,7 +355,7 @@ class TWAPBot:
                 f"Maker: min_z={config.MIN_Z_SCORE} | min_maker_edge={config.MIN_MAKER_EDGE:.1%} | "
                 f"bid_range=[${config.MIN_MAKER_BID:.2f} .. ${config.MAX_MAKER_BID:.2f}]"
             )
-            logger.info(f"Quoting Window: [{config.EVAL_WINDOW_END_S:.0f}s .. {config.EVAL_WINDOW_START_S:.0f}s remaining]")
+        self._check_reset_trade_data()
         journal_configure(config.JOURNAL_PATH)
         logger.info(f"Journal: {config.JOURNAL_PATH}")
         logger.info(f"Bankroll: ${self.risk.bankroll:.2f} | Base Stake: ${config.BASE_STAKE_USD:.2f}")
