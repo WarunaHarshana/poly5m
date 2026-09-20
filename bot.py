@@ -559,8 +559,21 @@ class TWAPBot:
                             logger.warning(f"[{tag}] Momentum trade blocked by risk manager: {risk_reason}")
 
         elif is_midband:
-            # Quote BOTH up and down tokens when each mid is in-band (bid-only paper maker).
-            for quote_side in ("UP", "DOWN"):
+            # Directional mid-band maker: use TWAP Z-score to pick ONE side.
+            # Compute favored direction from spot vs required TWAP level.
+            sigma_twap_mb = slot.engine.estimate_sigma_twap_usd(
+                spot=spot, remaining_s=remaining_s,
+                realized_vol_daily=params.daily_vol,
+            )
+            _, signed_z_mb, _ = slot.engine.compute_s_req_and_z(
+                spot=spot, strike=strike,
+                realized_twap=realized_twap, elapsed_s=elapsed_s,
+                remaining_s=remaining_s, sigma_twap_usd=sigma_twap_mb,
+            )
+            favored_side = "UP" if signed_z_mb >= 0 else "DOWN"
+
+            # Only quote the TWAP-favored side (eliminates BUG #4 UP-bias)
+            for quote_side in (favored_side,):
                 q_token = tokens.get(quote_side)
                 if not q_token:
                     continue
@@ -590,6 +603,8 @@ class TWAPBot:
                     strike=strike,
                     realized_twap=realized_twap,
                     elapsed_s=elapsed_s,
+                    min_z=config.MIDBAND_MIN_Z,
+                    realized_vol_daily=params.daily_vol,
                 )
                 mid_px = None
                 if q_bid is not None and q_ask is not None:
@@ -598,7 +613,7 @@ class TWAPBot:
                     logger.info(
                         f"[{remaining_s:3.0f}s left] {tag} {quote_side}: mid={mid_px or 0:.3f} "
                         f"bid={q_bid or 0:.2f} ask={q_ask or 0:.2f} target={msig.target_bid:.2f} "
-                        f"Pass={msig.passed_gates}"
+                        f"Z={msig.z_score:.2f} Pass={msig.passed_gates}"
                         + (f" | Skip: {msig.skip_reason}" if not msig.passed_gates else "")
                     )
                 # One resting order / position per asset slot
@@ -638,7 +653,7 @@ class TWAPBot:
                 is_paper_fill = (
                     config.MODE != "live"
                     and elapsed_resting >= max(1.0, config.MIDBAND_REQUOTE_SECONDS)
-                    and (is_clob_fill if config.MIDBAND_PAPER_REQUIRE_CROSS else is_clob_fill)
+                    and (is_clob_fill if config.MIDBAND_PAPER_REQUIRE_CROSS else True)
                 )
                 # Cancel if mid left the band or time ran out
                 mid_now = 0.5 * (float(cur_bid) + float(cur_ask)) if cur_bid and cur_ask else None
@@ -649,6 +664,12 @@ class TWAPBot:
                     cancel = True
                 if cancel and not is_paper_fill:
                     logger.info(f"[{tag}] Midband cancel resting @{ro['price']:.2f} (band/time)")
+                    # BUG #1 fix: cancel live CLOB order too, not just in-memory state
+                    if config.MODE == "live" and ro.get("order_id"):
+                        try:
+                            self.live_client.cancel_order(ro["order_id"])
+                        except Exception as e:
+                            logger.warning(f"[{tag}] Failed to cancel live order {ro['order_id']}: {e}")
                     slot.resting_order = None
                 elif is_paper_fill or (config.MODE == "live" and is_clob_fill):
                     slot.position = {
@@ -660,9 +681,12 @@ class TWAPBot:
                         "price": ro["price"],
                         "shares": ro["shares"],
                         "cost_usd": ro["cost_usd"],
-                        "z_score": 0.0,
+                        "z_score": ro.get("z_score", 0.0),
                         "prob": ro.get("prob", ro["price"]),
                         "fee": 0.0,
+                        "rebate": ro.get("rebate", 0.0),
+                        "order_id": ro.get("order_id"),
+                        "entry_time": ro.get("placed_at", time.time()),
                         "opened_at": time.time(),
                         "strike": strike,
                         "official": False,

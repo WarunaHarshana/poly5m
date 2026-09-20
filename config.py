@@ -83,10 +83,11 @@ MOMENTUM_HEDGE_NOTIONAL_MAX = float(os.getenv("MOMENTUM_HEDGE_NOTIONAL_MAX", "2.
 
 # --- Mid-band maker (default) ---
 # Resting post-only bids near mid while the market is still uncertain (~40-60c).
-# Not a late Z-score taker sniper.
+# Uses TWAP Z-score for directional bias — only bids the side spot is trending toward.
 MIDBAND_LO = float(os.getenv("MIDBAND_LO", "0.40"))
 MIDBAND_HI = float(os.getenv("MIDBAND_HI", "0.60"))
-MIDBAND_HALF_SPREAD = float(os.getenv("MIDBAND_HALF_SPREAD", "0.02"))
+MIDBAND_HALF_SPREAD = float(os.getenv("MIDBAND_HALF_SPREAD", "0.04"))
+MIDBAND_MIN_Z = float(os.getenv("MIDBAND_MIN_Z", "0.50"))       # Minimum Z-score for directional conviction
 MIDBAND_MIN_SECONDS_LEFT = float(os.getenv("MIDBAND_MIN_SECONDS_LEFT", "75"))
 MIDBAND_MAX_SECONDS_LEFT = float(os.getenv("MIDBAND_MAX_SECONDS_LEFT", "270"))
 MIDBAND_REQUOTE_SECONDS = float(os.getenv("MIDBAND_REQUOTE_SECONDS", "3"))

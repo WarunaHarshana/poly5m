@@ -353,7 +353,7 @@ class TWAPEngine:
         best_ask: float | None,
         midband_lo: float = 0.40,
         midband_hi: float = 0.60,
-        half_spread: float = 0.02,
+        half_spread: float = 0.04,
         min_seconds_left: float = 75.0,
         max_seconds_left: float = 270.0,
         fee_rate: float = 0.07,
@@ -363,11 +363,13 @@ class TWAPEngine:
         strike: float = 0.0,
         realized_twap: float = 0.0,
         elapsed_s: float = 0.0,
+        min_z: float = 0.50,
+        realized_vol_daily: float | None = None,
     ) -> MakerSignal:
         """Mid-band maker: rest a bid near mid only while mid is in [lo, hi].
 
-        No Z-score / expensive-favorite logic. Designed for Railway-class hosting
-        (requote every few seconds is fine).
+        Uses TWAP Z-score for directional conviction — only passes gates if
+        the requested `side` matches the direction spot is trending (signed_z).
         """
         skip_reasons: list[str] = []
         passed = True
@@ -395,6 +397,33 @@ class TWAPEngine:
             )
 
         mid = 0.5 * (float(best_bid) + float(best_ask))
+
+        # --- TWAP Z-score for directional conviction ---
+        sigma_twap = self.estimate_sigma_twap_usd(
+            spot=spot,
+            remaining_s=remaining_s,
+            realized_vol_daily=realized_vol_daily,
+        )
+        abs_z, signed_z, s_req = self.compute_s_req_and_z(
+            spot=spot,
+            strike=strike,
+            realized_twap=realized_twap,
+            elapsed_s=elapsed_s,
+            remaining_s=remaining_s,
+            sigma_twap_usd=sigma_twap,
+        )
+        favored_side = "UP" if signed_z >= 0 else "DOWN"
+
+        # Gate: side must match TWAP direction
+        if side != favored_side:
+            passed = False
+            skip_reasons.append(f"side {side} != favored {favored_side} (Z={signed_z:+.2f})")
+
+        # Gate: minimum Z-score for directional conviction
+        if abs_z < min_z:
+            passed = False
+            skip_reasons.append(f"Z-score {abs_z:.2f} < min {min_z:.2f}")
+
         if remaining_s < min_seconds_left:
             passed = False
             skip_reasons.append(f"too late ({remaining_s:.0f}s < {min_seconds_left:.0f}s)")
@@ -417,26 +446,27 @@ class TWAPEngine:
             skip_reasons.append("non-positive target bid")
 
         maker_rebate = self.calculate_maker_rebate(target_bid, fee_rate=fee_rate, rebate_share=rebate_share)
+        model_prob = self.calibrated_probability(abs_z)
         # Fair value proxy = mid; edge is mid - bid + rebate
         edge_net = (mid - target_bid) + maker_rebate
 
         return MakerSignal(
             side=side,
-            z_score=0.0,
-            signed_z=0.0,
-            model_prob=mid,
+            z_score=abs_z,
+            signed_z=signed_z,
+            model_prob=model_prob,
             target_bid=target_bid,
             best_bid=best_bid,
             best_ask=best_ask,
             maker_rebate=maker_rebate,
             edge_net=edge_net,
-            s_req=0.0,
+            s_req=s_req,
             s_0=strike,
             spot=spot,
             realized_twap=realized_twap,
             elapsed_s=elapsed_s,
             remaining_s=remaining_s,
-            sigma_twap_usd=0.0,
+            sigma_twap_usd=sigma_twap,
             passed_gates=passed,
             skip_reason="; ".join(skip_reasons),
         )
