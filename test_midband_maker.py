@@ -130,3 +130,75 @@ def test_midband_rejects_too_late():
     )
     assert not sig.passed_gates
     assert "too late" in sig.skip_reason
+
+
+def test_midband_rejects_too_early():
+    """Reject when remaining_s > 210s (too early, <90s of TWAP path accumulated)."""
+    eng = _engine()
+    sig = eng.evaluate_midband(
+        remaining_s=240.0,
+        elapsed_s=60.0,
+        spot=101.50,
+        strike=100.00,
+        realized_twap=100.20,
+        best_bid=0.46,
+        best_ask=0.50,
+        side="UP",
+        max_seconds_left=210.0,
+    )
+    assert not sig.passed_gates
+    assert "too early" in sig.skip_reason
+
+
+def test_midband_rejects_expensive_mid():
+    """Reject when mid > 0.52 to ensure positive payout asymmetry (never pay > 0.48)."""
+    eng = _engine()
+    sig = eng.evaluate_midband(
+        remaining_s=150.0,
+        elapsed_s=150.0,
+        spot=101.50,
+        strike=100.00,
+        realized_twap=100.20,
+        best_bid=0.52,
+        best_ask=0.56,
+        side="UP",
+        midband_hi=0.52,
+    )
+    assert not sig.passed_gates
+    assert "outside" in sig.skip_reason
+
+
+def test_midband_altcoin_conviction_filter():
+    """Test that DOGE/SOL require higher Z-score than BTC (e.g. Z=0.85 passes BTC but fails DOGE)."""
+    eng = _engine()
+    btc_params = config._load_asset_params("btc")
+    doge_params = config._load_asset_params("doge")
+
+    # Signal with Z ≈ 0.85
+    btc_sig = eng.evaluate_midband(
+        remaining_s=120.0,
+        elapsed_s=120.0,
+        spot=101.50,
+        strike=100.00,
+        realized_twap=100.20,
+        best_bid=0.46,
+        best_ask=0.50,
+        side="UP",
+        min_z=btc_params.midband_min_z,  # 0.50
+    )
+    assert btc_sig.passed_gates
+
+    doge_sig = eng.evaluate_midband(
+        remaining_s=120.0,
+        elapsed_s=120.0,
+        spot=101.50,
+        strike=100.00,
+        realized_twap=100.20,
+        best_bid=0.46,
+        best_ask=0.50,
+        side="UP",
+        min_z=doge_params.midband_min_z,  # 1.20
+    )
+    assert not doge_sig.passed_gates
+    assert "Z-score" in doge_sig.skip_reason
+

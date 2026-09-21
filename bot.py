@@ -324,7 +324,7 @@ class TWAPBot:
         for a in config.ASSETS:
             p = config.ASSET_PARAMS[a]
             logger.info(
-                f"  {a.upper()}: min_z={p.min_z} edge>={p.min_edge:.1%} "
+                f"  {a.upper()}: min_z={p.min_z} midband_z={p.midband_min_z} edge>={p.min_edge:.1%} "
                 f"ask=[{p.min_buy_price:.2f}..{p.max_buy_price:.2f}] "
                 f"vol={p.daily_vol:.2%} sigma={p.min_sigma_bps:.2f}bps chop={p.chop_noise_bps:.2f}bps"
             )
@@ -662,7 +662,7 @@ class TWAPBot:
                     strike=strike,
                     realized_twap=realized_twap,
                     elapsed_s=elapsed_s,
-                    min_z=config.MIDBAND_MIN_Z,
+                    min_z=params.midband_min_z,
                     realized_vol_daily=params.daily_vol,
                 )
                 mid_px = None

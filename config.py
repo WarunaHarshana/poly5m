@@ -85,11 +85,11 @@ MOMENTUM_HEDGE_NOTIONAL_MAX = float(os.getenv("MOMENTUM_HEDGE_NOTIONAL_MAX", "2.
 # Resting post-only bids near mid while the market is still uncertain (~40-60c).
 # Uses TWAP Z-score for directional bias — only bids the side spot is trending toward.
 MIDBAND_LO = float(os.getenv("MIDBAND_LO", "0.40"))
-MIDBAND_HI = float(os.getenv("MIDBAND_HI", "0.60"))
+MIDBAND_HI = float(os.getenv("MIDBAND_HI", "0.52"))             # Ceiling at 52c so we never pay > 48c (positive payout asymmetry)
 MIDBAND_HALF_SPREAD = float(os.getenv("MIDBAND_HALF_SPREAD", "0.04"))
 MIDBAND_MIN_Z = float(os.getenv("MIDBAND_MIN_Z", "0.50"))       # Minimum Z-score for directional conviction
 MIDBAND_MIN_SECONDS_LEFT = float(os.getenv("MIDBAND_MIN_SECONDS_LEFT", "75"))
-MIDBAND_MAX_SECONDS_LEFT = float(os.getenv("MIDBAND_MAX_SECONDS_LEFT", "270"))
+MIDBAND_MAX_SECONDS_LEFT = float(os.getenv("MIDBAND_MAX_SECONDS_LEFT", "210")) # Wait >=90s of TWAP path before quoting
 MIDBAND_REQUOTE_SECONDS = float(os.getenv("MIDBAND_REQUOTE_SECONDS", "3"))
 MIDBAND_MAX_SKEW_SHARES = float(os.getenv("MIDBAND_MAX_SKEW_SHARES", "40"))
 # Paper: require the ask to trade down through our bid (no phantom fills).
@@ -128,7 +128,7 @@ RESOLUTION_TIMEOUT_S = float(os.getenv("RESOLUTION_TIMEOUT_S", "180.0"))
 RESOLUTION_PRICE_MIN = float(os.getenv("RESOLUTION_PRICE_MIN", "0.99"))
 # Cap how many coins can open new positions in a single 5-minute slot.
 # Prevents correlated multi-asset blowups when all crypto trends together.
-MAX_CONCURRENT_ENTRIES = int(os.getenv("MAX_CONCURRENT_ENTRIES", "3"))
+MAX_CONCURRENT_ENTRIES = int(os.getenv("MAX_CONCURRENT_ENTRIES", "2"))
 
 
 def _fenv(name: str, default: float) -> float:
@@ -183,6 +183,16 @@ _MIN_Z = {
     "doge": 2.50,   # was 1.80 — lost at Z=4.1
     "hype": 2.50,   # was 1.80 — 33% WR, toxic
 }
+# Per-coin minimum Z-score for mid-band maker (higher conviction on noisy alts).
+_MIDBAND_MIN_Z = {
+    "btc": 0.50,    # 100% WR so far, solid signal fidelity
+    "eth": 0.65,    # baseline major
+    "sol": 1.00,    # filter weak chop (lost at Z=0.50)
+    "bnb": 0.80,    # mid-tier alt
+    "xrp": 1.20,    # noisy alt, require clear trend
+    "doge": 1.20,   # meme coin, filter weak flips (lost at Z=0.55)
+    "hype": 1.20,
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -203,6 +213,7 @@ class AssetParams:
     min_maker_edge: float
     min_maker_bid: float
     max_maker_bid: float
+    midband_min_z: float = 0.50
 
     def min_sigma_usd(self, spot: float) -> float:
         return max(1e-12, self.min_sigma_bps / 1e4 * float(spot))
@@ -246,6 +257,7 @@ def _load_asset_params(symbol: str) -> AssetParams:
         min_maker_edge=_fenv(f"{u}_MIN_MAKER_EDGE", MIN_MAKER_EDGE),
         min_maker_bid=_fenv(f"{u}_MIN_MAKER_BID", MIN_MAKER_BID),
         max_maker_bid=_fenv(f"{u}_MAX_MAKER_BID", MAX_MAKER_BID),
+        midband_min_z=_fenv(f"{u}_MIDBAND_MIN_Z", _MIDBAND_MIN_Z.get(symbol, MIDBAND_MIN_Z)),
     )
 
 

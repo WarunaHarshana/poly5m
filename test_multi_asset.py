@@ -22,6 +22,8 @@ def test_per_coin_sigma_and_chop_scale_with_spot():
     xrp = config.ASSET_PARAMS["xrp"] if "xrp" in config.ASSET_PARAMS else config._load_asset_params("xrp")
     doge = config.ASSET_PARAMS["doge"] if "doge" in config.ASSET_PARAMS else config._load_asset_params("doge")
 
+    sol = config.ASSET_PARAMS["sol"] if "sol" in config.ASSET_PARAMS else config._load_asset_params("sol")
+
     assert abs(btc.min_sigma_usd(78000.0) - 2.0) < 1e-6
     assert abs(btc.chop_noise_usd(78000.0) - 3.0) < 1e-6
     assert abs(btc.momentum_min_move_usd(78000.0) - 70.0) < 1e-6
@@ -32,6 +34,11 @@ def test_per_coin_sigma_and_chop_scale_with_spot():
     assert doge.min_z >= btc.min_z
     assert doge.max_buy_price <= btc.max_buy_price
     assert eth.daily_vol > btc.daily_vol
+    # Altcoins require higher midband conviction than BTC
+    assert doge.midband_min_z > btc.midband_min_z
+    assert sol.midband_min_z > btc.midband_min_z
+    assert btc.midband_min_z == 0.50
+    assert doge.midband_min_z == 1.20
 
 
 def test_feed_isolates_assets():
