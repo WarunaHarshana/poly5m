@@ -94,6 +94,9 @@ MIDBAND_REQUOTE_SECONDS = float(os.getenv("MIDBAND_REQUOTE_SECONDS", "3"))
 MIDBAND_MAX_SKEW_SHARES = float(os.getenv("MIDBAND_MAX_SKEW_SHARES", "40"))
 # Paper: require the ask to trade down through our bid (no phantom fills).
 MIDBAND_PAPER_REQUIRE_CROSS = os.getenv("MIDBAND_PAPER_REQUIRE_CROSS", "yes").strip().lower() in ("yes", "y", "true", "1")
+# Reject entry when CLOB is illiquid (bid=0.01, ask=0.99 → spread=0.98 >> threshold).
+# Set to 0.20 so any book with real two-sided depth (ask-bid ≤ 20¢) is accepted.
+MIDBAND_MAX_BOOK_SPREAD = float(os.getenv("MIDBAND_MAX_BOOK_SPREAD", "0.20"))
 
 # --- Legacy H-001 sniper params (retired; kept for reference only) ---
 MIN_Z_SCORE = float(os.getenv("MIN_Z_SCORE", "1.65"))                # Require >=95.0% mathematical certainty (Z >= 1.65)

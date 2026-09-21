@@ -664,6 +664,7 @@ class TWAPBot:
                     elapsed_s=elapsed_s,
                     min_z=params.midband_min_z,
                     realized_vol_daily=params.daily_vol,
+                    max_book_spread=config.MIDBAND_MAX_BOOK_SPREAD,
                 )
                 mid_px = None
                 if q_bid is not None and q_ask is not None:

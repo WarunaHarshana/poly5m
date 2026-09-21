@@ -202,3 +202,41 @@ def test_midband_altcoin_conviction_filter():
     assert not doge_sig.passed_gates
     assert "Z-score" in doge_sig.skip_reason
 
+
+def test_midband_rejects_illiquid_book():
+    """Reject when CLOB is empty (bid=0.01, ask=0.99 → spread=0.98 >> 0.20 threshold)."""
+    eng = _engine()
+    sig = eng.evaluate_midband(
+        remaining_s=150.0,
+        elapsed_s=150.0,
+        spot=101.50,
+        strike=100.00,
+        realized_twap=100.20,
+        best_bid=0.01,
+        best_ask=0.99,
+        side="UP",
+        min_z=0.50,
+        max_book_spread=0.20,
+    )
+    assert not sig.passed_gates
+    assert "illiquid book" in sig.skip_reason
+
+
+def test_midband_accepts_liquid_book():
+    """Accept when CLOB has real depth (bid=0.46, ask=0.54 → spread=0.08 < 0.20)."""
+    eng = _engine()
+    sig = eng.evaluate_midband(
+        remaining_s=150.0,
+        elapsed_s=150.0,
+        spot=101.50,
+        strike=100.00,
+        realized_twap=100.20,
+        best_bid=0.46,
+        best_ask=0.54,
+        midband_lo=0.40,
+        midband_hi=0.60,
+        side="UP",
+        min_z=0.50,
+        max_book_spread=0.20,
+    )
+    assert sig.passed_gates, sig.skip_reason

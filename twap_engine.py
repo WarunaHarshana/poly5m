@@ -365,6 +365,7 @@ class TWAPEngine:
         elapsed_s: float = 0.0,
         min_z: float = 0.50,
         realized_vol_daily: float | None = None,
+        max_book_spread: float = 0.20,
     ) -> MakerSignal:
         """Mid-band maker: rest a bid near mid only while mid is in [lo, hi].
 
@@ -394,6 +395,30 @@ class TWAPEngine:
                 sigma_twap_usd=0.0,
                 passed_gates=False,
                 skip_reason="missing book",
+            )
+
+        # --- Book quality gate: reject illiquid / empty CLOB ---
+        clob_spread = float(best_ask) - float(best_bid)
+        if clob_spread > max_book_spread:
+            return MakerSignal(
+                side=side,
+                z_score=0.0,
+                signed_z=0.0,
+                model_prob=0.5,
+                target_bid=0.0,
+                best_bid=best_bid,
+                best_ask=best_ask,
+                maker_rebate=0.0,
+                edge_net=0.0,
+                s_req=0.0,
+                s_0=strike,
+                spot=spot,
+                realized_twap=realized_twap,
+                elapsed_s=elapsed_s,
+                remaining_s=remaining_s,
+                sigma_twap_usd=0.0,
+                passed_gates=False,
+                skip_reason=f"illiquid book (spread={clob_spread:.2f} > {max_book_spread:.2f})",
             )
 
         mid = 0.5 * (float(best_bid) + float(best_ask))
