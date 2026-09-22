@@ -27,6 +27,8 @@ from polymarket_client import (
     PolymarketPublicClient,
     PolymarketLiveClient,
     fillable_ask_shares,
+    extract_best_bid_ask,
+    extract_market_top,
 )
 from risk_manager import RiskManager
 from journal import configure as journal_configure
@@ -533,19 +535,22 @@ class TWAPBot:
 
         tokens = market["tokens"]
         prelim_side = "UP" if spot >= strike else "DOWN"
+        prelim_opp = "DOWN" if prelim_side == "UP" else "UP"
         token_id = tokens.get(prelim_side)
+        opp_token_id = tokens.get(prelim_opp)
 
-        top = self.book_stream.get_top(token_id) if token_id else None
+        top = self.book_stream.get_top(token_id, opp_token_id=opp_token_id) if token_id else None
         best_bid = top.get("bid") if top else None
         best_ask = top.get("ask") if top else None
 
-        if best_bid is None and token_id:
-            bk = self.pub_client.get_order_book(token_id)
-            if bk:
-                if bk.get("bids"):
-                    best_bid = float(bk["bids"][0]["price"])
-                if bk.get("asks"):
-                    best_ask = float(bk["asks"][0]["price"])
+        if (best_bid is None or best_ask is None) and token_id:
+            bk_fav = self.pub_client.get_order_book(token_id)
+            bk_opp = self.pub_client.get_order_book(opp_token_id) if opp_token_id else None
+            r_bid, r_ask, _ = extract_market_top(bk_fav, bk_opp)
+            if best_bid is None:
+                best_bid = r_bid
+            if best_ask is None:
+                best_ask = r_ask
 
         open_notional = self._open_notional()
         tag = asset.upper()
@@ -570,21 +575,24 @@ class TWAPBot:
                 elapsed_s=elapsed_s, remaining_s=remaining_s, sigma_twap_usd=sigma_twap_dyn
             )
             favored_side = "UP" if signed_z_dyn >= 0 else "DOWN"
+            fav_opp_side = "DOWN" if favored_side == "UP" else "UP"
             fav_token = tokens.get(favored_side)
+            opp_token = tokens.get(fav_opp_side)
 
             q_bid = None
             q_ask = None
             if fav_token:
-                q_top = self.book_stream.get_top(fav_token)
+                q_top = self.book_stream.get_top(fav_token, opp_token_id=opp_token)
                 q_bid = q_top.get("bid") if q_top else None
                 q_ask = q_top.get("ask") if q_top else None
                 if q_bid is None or q_ask is None:
-                    bk = self.pub_client.get_order_book(fav_token)
-                    if bk:
-                        if bk.get("bids"):
-                            q_bid = float(bk["bids"][0]["price"])
-                        if bk.get("asks"):
-                            q_ask = float(bk["asks"][0]["price"])
+                    bk_fav = self.pub_client.get_order_book(fav_token)
+                    bk_opp = self.pub_client.get_order_book(opp_token) if opp_token else None
+                    r_bid, r_ask, _ = extract_market_top(bk_fav, bk_opp)
+                    if q_bid is None:
+                        q_bid = r_bid
+                    if q_ask is None:
+                        q_ask = r_ask
 
             mid_px = 0.5 * (float(q_bid) + float(q_ask)) if (q_bid is not None and q_ask is not None) else None
             spread = (float(q_ask) - float(q_bid)) if (q_bid is not None and q_ask is not None) else 1.0
@@ -772,15 +780,22 @@ class TWAPBot:
             if slot.resting_order and not slot.position:
                 ro = slot.resting_order
                 ro_token = ro.get("token_id")
-                ro_top = self.book_stream.get_top(ro_token) if ro_token else None
-                cur_bid = (ro_top or {}).get("bid") or 0.0
-                cur_ask = (ro_top or {}).get("ask") or 1.0
-                if ro_token and (ro_top is None or ro_top.get("ask") is None):
-                    bk = self.pub_client.get_order_book(ro_token)
-                    if bk and bk.get("asks"):
-                        cur_ask = float(bk["asks"][0]["price"])
-                    if bk and bk.get("bids"):
-                        cur_bid = float(bk["bids"][0]["price"])
+                ro_side = ro.get("side")
+                ro_opp_side = "DOWN" if ro_side == "UP" else "UP"
+                ro_opp_token = tokens.get(ro_opp_side)
+                ro_top = self.book_stream.get_top(ro_token, opp_token_id=ro_opp_token) if ro_token else None
+                cur_bid = (ro_top or {}).get("bid")
+                cur_ask = (ro_top or {}).get("ask")
+                if ro_token and (cur_bid is None or cur_ask is None):
+                    bk_ro = self.pub_client.get_order_book(ro_token)
+                    bk_opp = self.pub_client.get_order_book(ro_opp_token) if ro_opp_token else None
+                    r_bid, r_ask, _ = extract_market_top(bk_ro, bk_opp)
+                    if cur_bid is None:
+                        cur_bid = r_bid
+                    if cur_ask is None:
+                        cur_ask = r_ask
+                cur_bid = cur_bid or 0.0
+                cur_ask = cur_ask or 1.0
                 elapsed_resting = time.time() - ro.get("placed_at", time.time())
                 is_clob_fill = (cur_ask <= ro["price"])
                 is_paper_fill = (
@@ -841,12 +856,13 @@ class TWAPBot:
             opp_token = tokens.get(opp_side)
             opp_ask = None
             if opp_token:
-                opp_top = self.book_stream.get_top(opp_token)
+                opp_top = self.book_stream.get_top(opp_token, opp_token_id=token_id)
                 opp_ask = opp_top.get("ask") if opp_top else None
                 if opp_ask is None:
-                    bk = self.pub_client.get_order_book(opp_token)
-                    if bk and bk.get("asks"):
-                        opp_ask = float(bk["asks"][0]["price"])
+                    bk_opp = self.pub_client.get_order_book(opp_token)
+                    bk_prelim = self.pub_client.get_order_book(token_id) if token_id else None
+                    _, r_ask, _ = extract_market_top(bk_opp, bk_prelim)
+                    opp_ask = r_ask
             trade_side = prelim_side
             trade_ask = best_ask
             if best_ask is not None and opp_ask is not None:
@@ -961,18 +977,21 @@ class TWAPBot:
             # Only quote the TWAP-favored side (eliminates BUG #4 UP-bias)
             for quote_side in (favored_side,):
                 q_token = tokens.get(quote_side)
+                opp_quote_side = "DOWN" if quote_side == "UP" else "UP"
+                opp_q_token = tokens.get(opp_quote_side)
                 if not q_token:
                     continue
-                q_top = self.book_stream.get_top(q_token)
+                q_top = self.book_stream.get_top(q_token, opp_token_id=opp_q_token)
                 q_bid = q_top.get("bid") if q_top else None
                 q_ask = q_top.get("ask") if q_top else None
                 if q_bid is None or q_ask is None:
                     bk = self.pub_client.get_order_book(q_token)
-                    if bk:
-                        if bk.get("bids"):
-                            q_bid = float(bk["bids"][0]["price"])
-                        if bk.get("asks"):
-                            q_ask = float(bk["asks"][0]["price"])
+                    bk_opp = self.pub_client.get_order_book(opp_q_token) if opp_q_token else None
+                    r_bid, r_ask, _ = extract_market_top(bk, bk_opp)
+                    if q_bid is None:
+                        q_bid = r_bid
+                    if q_ask is None:
+                        q_ask = r_ask
                 msig = slot.engine.evaluate_midband(
                     remaining_s=remaining_s,
                     best_bid=q_bid,
@@ -1064,15 +1083,22 @@ class TWAPBot:
             if slot.resting_order and not slot.position:
                 ro = slot.resting_order
                 ro_token = ro.get("token_id")
-                ro_top = self.book_stream.get_top(ro_token) if ro_token else None
-                cur_bid = (ro_top or {}).get("bid") or 0.0
-                cur_ask = (ro_top or {}).get("ask") or 1.0
-                if ro_token and (ro_top is None or ro_top.get("ask") is None):
+                ro_side = ro.get("side")
+                ro_opp_side = "DOWN" if ro_side == "UP" else "UP"
+                ro_opp_token = tokens.get(ro_opp_side)
+                ro_top = self.book_stream.get_top(ro_token, opp_token_id=ro_opp_token) if ro_token else None
+                cur_bid = (ro_top or {}).get("bid")
+                cur_ask = (ro_top or {}).get("ask")
+                if ro_token and (cur_bid is None or cur_ask is None):
                     bk = self.pub_client.get_order_book(ro_token)
-                    if bk and bk.get("asks"):
-                        cur_ask = float(bk["asks"][0]["price"])
-                    if bk and bk.get("bids"):
-                        cur_bid = float(bk["bids"][0]["price"])
+                    bk_opp = self.pub_client.get_order_book(ro_opp_token) if ro_opp_token else None
+                    r_bid, r_ask, _ = extract_market_top(bk, bk_opp)
+                    if cur_bid is None:
+                        cur_bid = r_bid
+                    if cur_ask is None:
+                        cur_ask = r_ask
+                cur_bid = cur_bid or 0.0
+                cur_ask = cur_ask or 1.0
                 elapsed_resting = time.time() - ro.get("placed_at", time.time())
                 is_clob_fill = (cur_ask <= ro["price"])
                 is_paper_fill = (
@@ -1419,20 +1445,23 @@ class TWAPBot:
             return
 
         side = pos["side"]
+        opp_pos_side = "DOWN" if side == "UP" else "UP"
         token_id = pos.get("token_id") or tokens.get(side)
+        opp_token_id = tokens.get(opp_pos_side)
         best_bid = None
         best_ask = None
         if token_id:
-            top = self.book_stream.get_top(token_id)
+            top = self.book_stream.get_top(token_id, opp_token_id=opp_token_id)
             best_bid = top.get("bid") if top else None
             best_ask = top.get("ask") if top else None
-            if best_bid is None:
+            if best_bid is None or best_ask is None:
                 bk = self.pub_client.get_order_book(token_id)
-                if bk:
-                    if bk.get("bids"):
-                        best_bid = float(bk["bids"][0]["price"])
-                    if bk.get("asks"):
-                        best_ask = float(bk["asks"][0]["price"])
+                bk_opp = self.pub_client.get_order_book(opp_token_id) if opp_token_id else None
+                r_bid, r_ask, _ = extract_market_top(bk, bk_opp)
+                if best_bid is None:
+                    best_bid = r_bid
+                if best_ask is None:
+                    best_ask = r_ask
 
         entry = float(pos["price"])
         # Mark carefully: raw best bid on thin CLOB books is often garbage (e.g. 0.28 vs 0.87 ask).
@@ -1488,15 +1517,17 @@ class TWAPBot:
         """Buy a small opposite-side ticket when skew is extreme (Novals-style)."""
         hedge_side = "DOWN" if pos["side"] == "UP" else "UP"
         hedge_token = tokens.get(hedge_side)
+        main_token = tokens.get(pos["side"])
         if not hedge_token:
             return
 
-        top = self.book_stream.get_top(hedge_token)
+        top = self.book_stream.get_top(hedge_token, opp_token_id=main_token)
         hedge_ask = top.get("ask") if top else None
         if hedge_ask is None:
             bk = self.pub_client.get_order_book(hedge_token)
-            if bk and bk.get("asks"):
-                hedge_ask = float(bk["asks"][0]["price"])
+            bk_main = self.pub_client.get_order_book(main_token) if main_token else None
+            _, r_ask, _ = extract_market_top(bk, bk_main)
+            hedge_ask = r_ask
         if hedge_ask is None or hedge_ask <= 0:
             return
 

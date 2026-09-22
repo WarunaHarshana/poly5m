@@ -337,25 +337,47 @@ class PolymarketBookStream:
             except Exception:
                 pass
 
-    def get_top(self, token_id: str) -> dict | None:
-        """Return {bid, ask, spread, bid_size, ask_size, age_s} or None if missing/stale."""
+    def get_top(self, token_id: str, opp_token_id: str | None = None) -> dict | None:
+        """Return {bid, ask, spread, bid_size, ask_size, age_s} or None if missing/stale.
+
+        If opp_token_id is provided, infers complementary quotes (e.g. ask = 1.0 - opp_bid)
+        when one side of the book is empty.
+        """
         now = time.time()
         with self._lock:
             b = self._books.get(token_id)
-            if not b:
+            b_opp = self._books.get(opp_token_id) if opp_token_id else None
+
+            if not b and not b_opp:
                 return None
-            age = now - b["updated_at"]
+
+            age = (now - b["updated_at"]) if b else (now - b_opp["updated_at"])
             if self.max_age_s > 0 and age > self.max_age_s:
                 return None
-            ask = b.get("ask")
-            bid = b.get("bid")
+
+            bid = b.get("bid") if b else None
+            ask = b.get("ask") if b else None
+            bid_size = b.get("bid_size", 0) if b else 0
+            ask_size = b.get("ask_size", 0) if b else 0
+
+            # Complementary inference
+            if b_opp:
+                opp_bid = b_opp.get("bid")
+                opp_ask = b_opp.get("ask")
+                if ask is None and opp_bid is not None and 0.0 < opp_bid < 1.0:
+                    ask = round(1.0 - opp_bid, 4)
+                    ask_size = b_opp.get("bid_size", 0)
+                if bid is None and opp_ask is not None and 0.0 < opp_ask < 1.0:
+                    bid = round(1.0 - opp_ask, 4)
+                    bid_size = b_opp.get("ask_size", 0)
+
             spread = round(ask - bid, 4) if (ask is not None and bid is not None) else None
             return {
                 "bid": bid,
                 "ask": ask,
                 "spread": spread,
-                "bid_size": b.get("bid_size"),
-                "ask_size": b.get("ask_size"),
+                "bid_size": bid_size,
+                "ask_size": ask_size,
                 "age_s": age,
             }
 
@@ -404,27 +426,47 @@ class PolymarketBookStream:
                                 continue
                             try:
                                 msg = json.loads(raw)
-                                event_type = msg.get("event_type")
-                                if event_type == "book":
-                                    asset_id = msg.get("asset_id")
-                                    bids = msg.get("bids") or []
-                                    asks = msg.get("asks") or []
-                                    best_bid = float(bids[0]["price"]) if bids else None
-                                    best_bid_sz = float(bids[0].get("size", 0)) if bids else 0
-                                    best_ask = float(asks[0]["price"]) if asks else None
-                                    best_ask_sz = float(asks[0].get("size", 0)) if asks else 0
-                                    if asset_id:
-                                        self._apply_update(asset_id, best_bid, best_ask, best_bid_sz, best_ask_sz)
-                                elif event_type == "price_change":
-                                    changes = msg.get("price_changes") or []
-                                    for c in changes:
-                                        asset_id = c.get("asset_id")
-                                        if not asset_id:
-                                            continue
-                                        b_px = float(c["price"]) if c.get("side") == "BUY" else None
-                                        a_px = float(c["price"]) if c.get("side") == "SELL" else None
-                                        sz = float(c.get("size", 0) or 0)
-                                        self._apply_update(asset_id, b_px, a_px, sz if b_px else 0, sz if a_px else 0)
+                                items = msg if isinstance(msg, list) else [msg]
+                                for item in items:
+                                    if not isinstance(item, dict):
+                                        continue
+                                    event_type = item.get("event_type")
+                                    if event_type == "book":
+                                        asset_id = item.get("asset_id")
+                                        bids = item.get("bids") or []
+                                        asks = item.get("asks") or []
+                                        best_bid = None
+                                        best_bid_sz = 0.0
+                                        best_ask = None
+                                        best_ask_sz = 0.0
+                                        for b in bids:
+                                            try:
+                                                p = float(b["price"])
+                                                if 0.0 < p < 1.0 and (best_bid is None or p > best_bid):
+                                                    best_bid = p
+                                                    best_bid_sz = float(b.get("size", 0) or 0)
+                                            except (KeyError, TypeError, ValueError):
+                                                continue
+                                        for a in asks:
+                                            try:
+                                                p = float(a["price"])
+                                                if 0.0 < p < 1.0 and (best_ask is None or p < best_ask):
+                                                    best_ask = p
+                                                    best_ask_sz = float(a.get("size", 0) or 0)
+                                            except (KeyError, TypeError, ValueError):
+                                                continue
+                                        if asset_id:
+                                            self._apply_update(asset_id, best_bid, best_ask, best_bid_sz, best_ask_sz)
+                                    elif event_type == "price_change":
+                                        changes = item.get("price_changes") or []
+                                        for c in changes:
+                                            asset_id = c.get("asset_id")
+                                            if not asset_id:
+                                                continue
+                                            b_px = float(c["price"]) if c.get("side") == "BUY" else None
+                                            a_px = float(c["price"]) if c.get("side") == "SELL" else None
+                                            sz = float(c.get("size", 0) or 0)
+                                            self._apply_update(asset_id, b_px, a_px, sz if b_px else 0, sz if a_px else 0)
                             except Exception:
                                 continue
                     finally:

@@ -54,6 +54,59 @@ def fillable_ask_shares(book: dict | None, limit_px: float, requested_shares: fl
     return shares, vwap
 
 
+def extract_best_bid_ask(book: dict | None) -> tuple[float | None, float | None]:
+    """Extract true best bid and true best ask from a Polymarket orderbook dict.
+
+    Polymarket CLOB orderbooks may list bids ascending (0.01 -> highest)
+    and asks descending (0.99 -> lowest).
+    Best bid is the HIGHEST bid price.
+    Best ask is the LOWEST ask price.
+    """
+    if not book:
+        return None, None
+    bids = book.get("bids") or []
+    asks = book.get("asks") or []
+    best_bid: float | None = None
+    best_ask: float | None = None
+    for b in bids:
+        try:
+            p = float(b.get("price") if isinstance(b, dict) else b)
+            if 0.0 < p < 1.0:
+                best_bid = p if best_bid is None else max(best_bid, p)
+        except (KeyError, TypeError, ValueError):
+            continue
+    for a in asks:
+        try:
+            p = float(a.get("price") if isinstance(a, dict) else a)
+            if 0.0 < p < 1.0:
+                best_ask = p if best_ask is None else min(best_ask, p)
+        except (KeyError, TypeError, ValueError):
+            continue
+    return best_bid, best_ask
+
+
+def extract_market_top(
+    book_fav: dict | None, book_opp: dict | None = None
+) -> tuple[float | None, float | None, float | None]:
+    """Extract (bid, ask, spread) for a token with binary complement inference.
+
+    If ask is missing from book_fav but book_opp has a bid,
+    implied ask = round(1.0 - opp_bid, 4).
+    If bid is missing from book_fav but book_opp has an ask,
+    implied bid = round(1.0 - opp_ask, 4).
+    """
+    fav_bid, fav_ask = extract_best_bid_ask(book_fav)
+    opp_bid, opp_ask = extract_best_bid_ask(book_opp)
+
+    if fav_ask is None and opp_bid is not None:
+        fav_ask = round(1.0 - opp_bid, 4)
+    if fav_bid is None and opp_ask is not None:
+        fav_bid = round(1.0 - opp_ask, 4)
+
+    spread = round(fav_ask - fav_bid, 4) if (fav_bid is not None and fav_ask is not None) else None
+    return fav_bid, fav_ask, spread
+
+
 def parse_event_resolution(ev: dict | None, now_ts: float | None = None) -> dict | None:
     """Map a Gamma event to {side, source, final_price, price_to_beat} once the window is over.
 

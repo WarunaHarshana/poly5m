@@ -66,7 +66,7 @@ STRATEGY = os.getenv("STRATEGY", "JEV_DYNAMIC").strip().upper()
 # Trades nearly every 5-minute round by continuously evaluating both maker and momentum
 # opportunities across all active assets, filtered & sized by TypeSafe Jev.
 DYNAMIC_MIDBAND_LO = float(os.getenv("DYNAMIC_MIDBAND_LO", "0.35"))
-DYNAMIC_MIDBAND_HI = float(os.getenv("DYNAMIC_MIDBAND_HI", "0.50"))
+DYNAMIC_MIDBAND_HI = float(os.getenv("DYNAMIC_MIDBAND_HI", "0.65"))
 DYNAMIC_HALF_SPREAD = float(os.getenv("DYNAMIC_HALF_SPREAD", "0.03"))
 DYNAMIC_MIN_Z = float(os.getenv("DYNAMIC_MIN_Z", "0.20"))
 DYNAMIC_WINDOW_START_S = float(os.getenv("DYNAMIC_WINDOW_START_S", "265.0"))
@@ -304,6 +304,6 @@ TYPESAFE_BASE_URL = os.getenv("TYPESAFE_BASE_URL", "").strip() or None
 JEV_ENABLED = os.getenv("JEV_ENABLED", "yes").strip().lower() in ("yes", "y", "true", "1") and bool(TYPESAFE_API_KEY)
 JEV_MODEL = os.getenv("JEV_MODEL", "jev-latest").strip()
 JEV_TIMEOUT_S = _fenv("JEV_TIMEOUT_S", 1.2)
-JEV_MAX_REVERSAL_NOUL = _fenv("JEV_MAX_REVERSAL_NOUL", 0.35)
-JEV_MIN_CONVICTION_SCORE = _fenv("JEV_MIN_CONVICTION_SCORE", 1.50)
+JEV_MAX_REVERSAL_NOUL = _fenv("JEV_MAX_REVERSAL_NOUL", 0.40)
+JEV_MIN_CONVICTION_SCORE = _fenv("JEV_MIN_CONVICTION_SCORE", 1.00)
 JEV_DOWNSIZE_FACTOR = _fenv("JEV_DOWNSIZE_FACTOR", 0.50)
