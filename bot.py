@@ -616,6 +616,9 @@ class TWAPBot:
                     )
 
                     if is_momentum_candidate:
+                        logger.info(
+                            f"[{tag}] 🤖 Consulting Jev on MOMENTUM ({favored_side} @ {q_ask:.2f} | spot: {px(spot)} | S0: {px(strike)})..."
+                        )
                         jev_dec = await self.jev.evaluate_dynamic(
                             asset=asset,
                             opportunity_type="MOMENTUM_TAKER",
@@ -676,6 +679,7 @@ class TWAPBot:
                                     asset=asset,
                                 )
                         else:
+                            logger.info(f"[{tag}] 🛑 Jev VETOED momentum: {jev_dec.reason}")
                             journal_write(
                                 "jev_veto",
                                 strategy="JEV_DYNAMIC_MOMENTUM",
@@ -685,12 +689,16 @@ class TWAPBot:
                                 jev=jev_dec.to_dict(),
                             )
 
-                    elif is_maker_candidate and not slot.resting_order and mid_px is not None:
+                    # If no position open/filled and no resting order, evaluate maker spread opportunity
+                    if not slot.position and not slot.resting_order and is_maker_candidate and mid_px is not None:
                         target_bid = round(mid_px - config.DYNAMIC_HALF_SPREAD, 2)
                         target_bid = max(config.DYNAMIC_MIDBAND_LO, min(config.DYNAMIC_MIDBAND_HI, target_bid))
                         target_bid = min(target_bid, round(float(q_ask) - 0.01, 2))
 
                         if target_bid < float(q_ask):
+                            logger.info(
+                                f"[{tag}] 🤖 Consulting Jev on MAKER ({favored_side} @ {target_bid:.2f} | mid: {mid_px:.2f} | spread: {spread:.2f})..."
+                            )
                             jev_dec = await self.jev.evaluate_dynamic(
                                 asset=asset,
                                 opportunity_type="MAKER_BID",
@@ -747,6 +755,7 @@ class TWAPBot:
                                     jev_decision=jev_dec,
                                 )
                             else:
+                                logger.info(f"[{tag}] 🛑 Jev VETOED maker bid: {jev_dec.reason}")
                                 journal_write(
                                     "jev_veto",
                                     strategy="JEV_DYNAMIC_MAKER",
