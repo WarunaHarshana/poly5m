@@ -1649,12 +1649,14 @@ class TWAPBot:
             "hedge_cost_usd": pos.get("hedge_cost_usd", 0.0),
             "hedge_pnl": round(hedge_pnl, 2),
             "z_score": pos.get("z_score"),
+            "strike": slot.strike,
             "won": pnl > 0,
             "pnl": round(pnl, 2),
             "bankroll": round(self.risk.bankroll, 2),
             "early_exit": True,
             "official": True,
             "settlement_source": f"early_exit_{reason}",
+            "jev": pos.get("jev"),
         }
         journal_write(
             "settlement",

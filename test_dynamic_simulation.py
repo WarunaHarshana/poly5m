@@ -20,6 +20,8 @@ class TestDynamicSimulation(unittest.IsolatedAsyncioTestCase):
         self.temp_dir = Path(tempfile.mkdtemp())
         self.old_mode = config.MODE
         self.old_strat = config.STRATEGY
+        self.old_mom_min_ask = config.DYNAMIC_MOMENTUM_MIN_ASK
+        self.old_mom_max_ask = config.DYNAMIC_MOMENTUM_MAX_ASK
 
         config.MODE = "paper_live"
         config.STRATEGY = "JEV_DYNAMIC"
@@ -33,6 +35,8 @@ class TestDynamicSimulation(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         config.MODE = self.old_mode
         config.STRATEGY = self.old_strat
+        config.DYNAMIC_MOMENTUM_MIN_ASK = self.old_mom_min_ask
+        config.DYNAMIC_MOMENTUM_MAX_ASK = self.old_mom_max_ask
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     async def test_dynamic_momentum_taker_flow(self):
@@ -62,8 +66,11 @@ class TestDynamicSimulation(unittest.IsolatedAsyncioTestCase):
         self.bot.cl_stream._record(slot_start + 120.0, 91080.0, asset=asset)
         self.bot.cl_stream._record(now, 91300.0, asset=asset)  # spot=91300, +$300 move (~33 bps)
 
-        # Setup order book with liquid ask
-        self.bot.book_stream._apply_update("tok_up_btc", bid=0.70, ask=0.74, bid_sz=500, ask_sz=500)
+        # Setup order book with liquid ask (within positive payout range)
+        # Temporarily widen momentum ask range for test (production effectively disables momentum taker)
+        config.DYNAMIC_MOMENTUM_MIN_ASK = 0.40
+        config.DYNAMIC_MOMENTUM_MAX_ASK = 0.50
+        self.bot.book_stream._apply_update("tok_up_btc", bid=0.45, ask=0.49, bid_sz=500, ask_sz=500)
 
         # Mock Jev decision: Approved clean trend
         mock_jev_decision = JevDecision(
@@ -88,7 +95,7 @@ class TestDynamicSimulation(unittest.IsolatedAsyncioTestCase):
         pos = slot.position
         self.assertEqual(pos["strategy"], "JEV_DYNAMIC_MOMENTUM")
         self.assertEqual(pos["side"], "UP")
-        self.assertEqual(pos["price"], 0.74)
+        self.assertEqual(pos["price"], 0.49)
         self.assertIn("jev", pos)
         self.assertEqual(pos["jev"]["action"], "proceed")
         self.assertEqual(pos["jev"]["market_regime"], "clean_trend")
