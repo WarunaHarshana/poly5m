@@ -63,6 +63,7 @@ def public_trade(row: dict) -> dict:
         "official": is_official_trade(row),
         "unofficial": not is_official_trade(row),
         "polymarket_url": f"https://polymarket.com/event/{slug}" if slug else None,
+        "jev": row.get("jev"),
     }
 
 
@@ -114,6 +115,7 @@ def build_stats(trades: list[dict], snapshot: dict[str, Any] | None = None) -> d
         "open_positions": snap.get("open_positions") or [],
         "uptime_seconds": snap.get("uptime_seconds"),
         "by_asset": by_asset,
+        "jev": snap.get("jev"),
     }
 
 
@@ -145,6 +147,7 @@ def _make_handler(bot_snapshot: SnapshotFn, trades_path: Path):
                         **{k: snap.get(k) for k in (
                             "mode", "strategy", "assets", "bankroll", "daily_pnl",
                             "open_positions", "pending_settlements", "uptime_seconds",
+                            "jev",
                         )},
                     })
                     return

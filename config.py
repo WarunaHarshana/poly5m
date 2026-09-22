@@ -60,7 +60,23 @@ FUNDER_ADDRESS = os.getenv("FUNDER_ADDRESS", os.getenv("POLYMARKET_FUNDER_ADDRES
 SIGNATURE_TYPE = int(os.getenv("SIGNATURE_TYPE", os.getenv("POLYMARKET_SIGNATURE_TYPE", "3")))  # 3 = Polymarket Proxy Wallet
 
 # --- Strategy Selection ---
-STRATEGY = os.getenv("STRATEGY", "MIDBAND_MAKER").strip().upper()
+STRATEGY = os.getenv("STRATEGY", "JEV_DYNAMIC").strip().upper()
+
+# --- JEV_DYNAMIC Hybrid Adaptive Strategy Parameters ---
+# Trades nearly every 5-minute round by continuously evaluating both maker and momentum
+# opportunities across all active assets, filtered & sized by TypeSafe Jev.
+DYNAMIC_MIDBAND_LO = float(os.getenv("DYNAMIC_MIDBAND_LO", "0.35"))
+DYNAMIC_MIDBAND_HI = float(os.getenv("DYNAMIC_MIDBAND_HI", "0.65"))
+DYNAMIC_HALF_SPREAD = float(os.getenv("DYNAMIC_HALF_SPREAD", "0.03"))
+DYNAMIC_MIN_Z = float(os.getenv("DYNAMIC_MIN_Z", "0.25"))
+DYNAMIC_WINDOW_START_S = float(os.getenv("DYNAMIC_WINDOW_START_S", "265.0"))
+DYNAMIC_WINDOW_END_S = float(os.getenv("DYNAMIC_WINDOW_END_S", "30.0"))
+DYNAMIC_MOMENTUM_MIN_MOVE_BPS = float(os.getenv("DYNAMIC_MOMENTUM_MIN_MOVE_BPS", "25.0"))
+DYNAMIC_MOMENTUM_MIN_ASK = float(os.getenv("DYNAMIC_MOMENTUM_MIN_ASK", "0.65"))
+DYNAMIC_MOMENTUM_MAX_ASK = float(os.getenv("DYNAMIC_MOMENTUM_MAX_ASK", "0.92"))
+DYNAMIC_MAX_BOOK_SPREAD = float(os.getenv("DYNAMIC_MAX_BOOK_SPREAD", "0.15"))
+DYNAMIC_ENTRY_COOLDOWN_S = float(os.getenv("DYNAMIC_ENTRY_COOLDOWN_S", "10.0"))
+
 # --- H-005 Momentum-Into-Close (Novals/igus-style) ---
 MOMENTUM_WINDOW_START_S = float(os.getenv('MOMENTUM_WINDOW_START_S', '150.0'))
 MOMENTUM_WINDOW_END_S = float(os.getenv('MOMENTUM_WINDOW_END_S', '60.0'))
@@ -119,8 +135,8 @@ MAKER_REBATE_SHARE = float(os.getenv("MAKER_REBATE_SHARE", "0.20"))
 
 # --- Risk & Sizing Parameters ---
 STARTING_BANKROLL = float(os.getenv("STARTING_BANKROLL", "50.0"))
-BASE_STAKE_USD = float(os.getenv("BASE_STAKE_USD", "5.0"))
-MAX_STAKE_USD = float(os.getenv("MAX_STAKE_USD", "10.0"))
+BASE_STAKE_USD = float(os.getenv("BASE_STAKE_USD", "3.0"))
+MAX_STAKE_USD = float(os.getenv("MAX_STAKE_USD", "6.0"))
 DAILY_LOSS_LIMIT_USD = float(os.getenv("DAILY_LOSS_LIMIT_USD", "15.0"))
 MAX_CONSECUTIVE_LOSSES = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "4"))
 MIN_ORDER_SHARES = float(os.getenv("MIN_ORDER_SHARES", "5.0"))
@@ -130,8 +146,8 @@ PAPER_FOK_REQUIRE_SIZE = os.getenv("PAPER_FOK_REQUIRE_SIZE", "yes").strip().lowe
 RESOLUTION_TIMEOUT_S = float(os.getenv("RESOLUTION_TIMEOUT_S", "180.0"))
 RESOLUTION_PRICE_MIN = float(os.getenv("RESOLUTION_PRICE_MIN", "0.99"))
 # Cap how many coins can open new positions in a single 5-minute slot.
-# Prevents correlated multi-asset blowups when all crypto trends together.
-MAX_CONCURRENT_ENTRIES = int(os.getenv("MAX_CONCURRENT_ENTRIES", "2"))
+# Increased to 3 for JEV_DYNAMIC mode to participate actively across coins.
+MAX_CONCURRENT_ENTRIES = int(os.getenv("MAX_CONCURRENT_ENTRIES", "3"))
 
 
 def _fenv(name: str, default: float) -> float:
@@ -227,6 +243,9 @@ class AssetParams:
     def momentum_min_move_usd(self, spot: float) -> float:
         return self.momentum_min_move_bps / 1e4 * float(spot)
 
+    def dynamic_momentum_min_move_usd(self, spot: float) -> float:
+        return DYNAMIC_MOMENTUM_MIN_MOVE_BPS / 1e4 * float(spot)
+
     def momentum_max_move_usd(self, spot: float) -> float:
         return self.momentum_max_move_bps / 1e4 * float(spot)
 
@@ -278,3 +297,13 @@ STATE_DIR.mkdir(parents=True, exist_ok=True)
 JOURNAL_PATH = os.getenv("JOURNAL_PATH", "").strip()
 if not JOURNAL_PATH:
     JOURNAL_PATH = str(STATE_DIR / "journal.jsonl")
+
+# --- TypeSafe Jev System One AI Guardian ---
+TYPESAFE_API_KEY = os.getenv("TYPESAFE_API_KEY", "").strip()
+TYPESAFE_BASE_URL = os.getenv("TYPESAFE_BASE_URL", "").strip() or None
+JEV_ENABLED = os.getenv("JEV_ENABLED", "yes").strip().lower() in ("yes", "y", "true", "1") and bool(TYPESAFE_API_KEY)
+JEV_MODEL = os.getenv("JEV_MODEL", "jev-latest").strip()
+JEV_TIMEOUT_S = _fenv("JEV_TIMEOUT_S", 1.2)
+JEV_MAX_REVERSAL_NOUL = _fenv("JEV_MAX_REVERSAL_NOUL", 0.60)
+JEV_MIN_CONVICTION_SCORE = _fenv("JEV_MIN_CONVICTION_SCORE", 1.0)
+JEV_DOWNSIZE_FACTOR = _fenv("JEV_DOWNSIZE_FACTOR", 0.50)

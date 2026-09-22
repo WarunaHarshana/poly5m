@@ -32,6 +32,7 @@ from risk_manager import RiskManager
 from journal import configure as journal_configure
 from journal import write as journal_write
 from http_api import StatusServer, is_official_trade, load_trades
+from jev_advisor import JevAdvisor, JevDecision
 
 logging.basicConfig(
     level=logging.INFO,
@@ -85,6 +86,7 @@ class TWAPBot:
         self.book_stream = PolymarketBookStream()
         self.pub_client = PolymarketPublicClient()
         self.risk = RiskManager()
+        self.jev = JevAdvisor()
         self.live_client = None
         if config.MODE == "live":
             if config.LIVE_CONFIRM not in ("yes", "y", "true", "1"):
@@ -305,6 +307,7 @@ class TWAPBot:
             "open_positions": open_positions,
             "pending_settlements": pending,
             "uptime_seconds": round(time.time() - self._started_at, 1),
+            "jev": self.jev.stats(),
         }
 
     def stop(self) -> None:
@@ -328,7 +331,13 @@ class TWAPBot:
                 f"ask=[{p.min_buy_price:.2f}..{p.max_buy_price:.2f}] "
                 f"vol={p.daily_vol:.2%} sigma={p.min_sigma_bps:.2f}bps chop={p.chop_noise_bps:.2f}bps"
             )
-        if config.STRATEGY in ("MIDBAND_MAKER", "MIDBAND", "H-006_MIDBAND_MAKER", "H-006"):
+        if config.STRATEGY in ("JEV_DYNAMIC", "DYNAMIC", "HYBRID", "ADAPTIVE"):
+            logger.info(
+                f"JEV_DYNAMIC Hybrid: band=[{config.DYNAMIC_MIDBAND_LO:.2f}..{config.DYNAMIC_MIDBAND_HI:.2f}] "
+                f"min_z={config.DYNAMIC_MIN_Z:.2f} time_left=[{config.DYNAMIC_WINDOW_END_S:.0f}..{config.DYNAMIC_WINDOW_START_S:.0f}]s "
+                f"concurrency_cap={config.MAX_CONCURRENT_ENTRIES} base_stake=${config.BASE_STAKE_USD:.2f}"
+            )
+        elif config.STRATEGY in ("MIDBAND_MAKER", "MIDBAND", "H-006_MIDBAND_MAKER", "H-006"):
             logger.info(
                 f"Mid-band maker: band=[{config.MIDBAND_LO:.2f}..{config.MIDBAND_HI:.2f}] "
                 f"half_spread={config.MIDBAND_HALF_SPREAD:.2f} "
@@ -504,11 +513,16 @@ class TWAPBot:
         )
         min_sigma = params.min_sigma_usd(spot)
 
+        is_dynamic = (config.STRATEGY in ("JEV_DYNAMIC", "DYNAMIC", "HYBRID", "ADAPTIVE"))
         is_momentum = (config.STRATEGY in ("H-005_MOMENTUM", "MOMENTUM", "H-005", "LATE_MOMENTUM"))
         is_midband = (config.STRATEGY in ("MIDBAND_MAKER", "MIDBAND", "H-006_MIDBAND_MAKER", "H-006"))
         is_sniper = False  # H-001 retired
 
-        if is_momentum:
+        if is_dynamic:
+            in_eval_window = (
+                config.DYNAMIC_WINDOW_END_S <= remaining_s <= config.DYNAMIC_WINDOW_START_S
+            )
+        elif is_momentum:
             in_eval_window = (
                 config.MOMENTUM_WINDOW_END_S <= remaining_s <= config.MOMENTUM_WINDOW_START_S
             )
@@ -537,7 +551,272 @@ class TWAPBot:
         tag = asset.upper()
         px = params.fmt_px
 
-        if is_momentum:
+        if is_dynamic:
+            slot_key = market.get("slug", "")
+            can_trade_now, risk_reason_now = self.risk.can_trade(open_notional=open_notional)
+            if not can_trade_now and not slot.position and not slot.resting_order:
+                if not slot.risk_block_logged:
+                    logger.warning(f"[{tag}] Dynamic trading paused by risk manager: {risk_reason_now}")
+                    journal_write("risk_block", reason=risk_reason_now, mode=config.MODE, asset=asset)
+                    slot.risk_block_logged = True
+                return
+            slot.risk_block_logged = False
+
+            sigma_twap_dyn = slot.engine.estimate_sigma_twap_usd(
+                spot=spot, remaining_s=remaining_s, realized_vol_daily=params.daily_vol
+            )
+            _, signed_z_dyn, _ = slot.engine.compute_s_req_and_z(
+                spot=spot, strike=strike, realized_twap=realized_twap,
+                elapsed_s=elapsed_s, remaining_s=remaining_s, sigma_twap_usd=sigma_twap_dyn
+            )
+            favored_side = "UP" if signed_z_dyn >= 0 else "DOWN"
+            fav_token = tokens.get(favored_side)
+
+            q_bid = None
+            q_ask = None
+            if fav_token:
+                q_top = self.book_stream.get_top(fav_token)
+                q_bid = q_top.get("bid") if q_top else None
+                q_ask = q_top.get("ask") if q_top else None
+                if q_bid is None or q_ask is None:
+                    bk = self.pub_client.get_order_book(fav_token)
+                    if bk:
+                        if bk.get("bids"):
+                            q_bid = float(bk["bids"][0]["price"])
+                        if bk.get("asks"):
+                            q_ask = float(bk["asks"][0]["price"])
+
+            mid_px = 0.5 * (float(q_bid) + float(q_ask)) if (q_bid is not None and q_ask is not None) else None
+            spread = (float(q_ask) - float(q_bid)) if (q_bid is not None and q_ask is not None) else 1.0
+            move_usd = spot - strike
+            abs_z = abs(signed_z_dyn)
+            min_move_usd = params.dynamic_momentum_min_move_usd(spot)
+
+            # Seek new entry across both Momentum and Maker plays
+            if in_eval_window and not slot.position and not slot.resting_order:
+                if slot_key and slot_key in self._slot_done:
+                    pass
+                elif self._slot_entries_count() >= config.MAX_CONCURRENT_ENTRIES:
+                    pass
+                elif (
+                    q_bid is not None
+                    and q_ask is not None
+                    and 0.0 < float(q_bid) < float(q_ask) < 1.0
+                    and spread <= config.DYNAMIC_MAX_BOOK_SPREAD
+                ):
+                    is_momentum_candidate = (
+                        abs(move_usd) >= min_move_usd
+                        and config.DYNAMIC_MOMENTUM_MIN_ASK <= float(q_ask) <= config.DYNAMIC_MOMENTUM_MAX_ASK
+                        and remaining_s <= config.MOMENTUM_WINDOW_START_S
+                    )
+                    is_maker_candidate = (
+                        mid_px is not None
+                        and config.DYNAMIC_MIDBAND_LO <= mid_px <= config.DYNAMIC_MIDBAND_HI
+                        and abs_z >= config.DYNAMIC_MIN_Z
+                    )
+
+                    if is_momentum_candidate:
+                        jev_dec = await self.jev.evaluate_dynamic(
+                            asset=asset,
+                            opportunity_type="MOMENTUM_TAKER",
+                            side=favored_side,
+                            spot=spot,
+                            strike=strike,
+                            realized_twap=realized_twap,
+                            z_score=abs_z,
+                            move_usd=move_usd,
+                            remaining_s=remaining_s,
+                            elapsed_s=elapsed_s,
+                            best_bid=float(q_bid),
+                            best_ask=float(q_ask),
+                            proposed_price=float(q_ask),
+                            spread=spread,
+                            chop_crosses=chop,
+                            daily_vol=params.daily_vol,
+                        )
+                        if jev_dec.passed:
+                            logger.info(
+                                f"[{tag}] ⚡ JEV_DYNAMIC MOMENTUM ({favored_side} @ {q_ask:.2f} x {jev_dec.size_multiplier:.0%}): {jev_dec.reason}"
+                            )
+                            taker_fee = market.get("fee_rate", config.TAKER_FEE_RATE) * float(q_ask) * (1.0 - float(q_ask))
+                            fake_signal = TWAPSignal(
+                                side=favored_side,
+                                z_score=abs_z,
+                                signed_z=signed_z_dyn,
+                                model_prob=mid_px or 0.5,
+                                ask=float(q_ask),
+                                edge_gross=max(0.01, 1.0 - float(q_ask)),
+                                fee_taker=taker_fee,
+                                edge_net=max(0.01, (1.0 - float(q_ask)) - taker_fee),
+                                s_req=spot,
+                                s_0=strike,
+                                spot=spot,
+                                realized_twap=realized_twap,
+                                elapsed_s=elapsed_s,
+                                remaining_s=remaining_s,
+                                sigma_twap_usd=sigma_twap_dyn,
+                                passed_gates=True,
+                                skip_reason="",
+                            )
+                            await self._place_taker_order(
+                                slot,
+                                market,
+                                fake_signal,
+                                float(q_ask),
+                                strategy_tag="JEV_DYNAMIC_MOMENTUM",
+                                size_multiplier=jev_dec.size_multiplier,
+                                jev_decision=jev_dec,
+                            )
+                            if slot.position and slot_key:
+                                self._slot_done.add(slot_key)
+                                self._save_slot_state(
+                                    slot_ts=slot_start_ts,
+                                    slug=slot_key,
+                                    strike=strike,
+                                    asset=asset,
+                                )
+                        else:
+                            journal_write(
+                                "jev_veto",
+                                strategy="JEV_DYNAMIC_MOMENTUM",
+                                asset=asset,
+                                side=favored_side,
+                                reason=jev_dec.reason,
+                                jev=jev_dec.to_dict(),
+                            )
+
+                    elif is_maker_candidate and not slot.resting_order and mid_px is not None:
+                        target_bid = round(mid_px - config.DYNAMIC_HALF_SPREAD, 2)
+                        target_bid = max(config.DYNAMIC_MIDBAND_LO, min(config.DYNAMIC_MIDBAND_HI, target_bid))
+                        target_bid = min(target_bid, round(float(q_ask) - 0.01, 2))
+
+                        if target_bid < float(q_ask):
+                            jev_dec = await self.jev.evaluate_dynamic(
+                                asset=asset,
+                                opportunity_type="MAKER_BID",
+                                side=favored_side,
+                                spot=spot,
+                                strike=strike,
+                                realized_twap=realized_twap,
+                                z_score=abs_z,
+                                move_usd=move_usd,
+                                remaining_s=remaining_s,
+                                elapsed_s=elapsed_s,
+                                best_bid=float(q_bid),
+                                best_ask=float(q_ask),
+                                proposed_price=target_bid,
+                                spread=spread,
+                                chop_crosses=chop,
+                                daily_vol=params.daily_vol,
+                            )
+                            if jev_dec.passed:
+                                logger.info(
+                                    f"[{tag}] 📥 JEV_DYNAMIC MAKER ({favored_side} @ {target_bid:.2f} x {jev_dec.size_multiplier:.0%}): {jev_dec.reason}"
+                                )
+                                rebate_rate = slot.engine.calculate_maker_rebate(
+                                    target_bid,
+                                    fee_rate=market.get("fee_rate", config.TAKER_FEE_RATE),
+                                    rebate_share=config.MAKER_REBATE_SHARE,
+                                )
+                                msig = MakerSignal(
+                                    side=favored_side,
+                                    z_score=abs_z,
+                                    signed_z=signed_z_dyn,
+                                    model_prob=mid_px or 0.5,
+                                    target_bid=target_bid,
+                                    best_bid=float(q_bid),
+                                    best_ask=float(q_ask),
+                                    maker_rebate=rebate_rate,
+                                    edge_net=(mid_px - target_bid) + rebate_rate,
+                                    s_req=spot,
+                                    s_0=strike,
+                                    spot=spot,
+                                    realized_twap=realized_twap,
+                                    elapsed_s=elapsed_s,
+                                    remaining_s=remaining_s,
+                                    sigma_twap_usd=sigma_twap_dyn,
+                                    passed_gates=True,
+                                    skip_reason="",
+                                )
+                                await self._place_maker_bid(
+                                    slot,
+                                    market,
+                                    msig,
+                                    strategy_tag="JEV_DYNAMIC_MAKER",
+                                    size_multiplier=jev_dec.size_multiplier,
+                                    jev_decision=jev_dec,
+                                )
+                            else:
+                                journal_write(
+                                    "jev_veto",
+                                    strategy="JEV_DYNAMIC_MAKER",
+                                    asset=asset,
+                                    side=favored_side,
+                                    reason=jev_dec.reason,
+                                    jev=jev_dec.to_dict(),
+                                )
+
+            # Manage resting orders in dynamic mode
+            if slot.resting_order and not slot.position:
+                ro = slot.resting_order
+                ro_token = ro.get("token_id")
+                ro_top = self.book_stream.get_top(ro_token) if ro_token else None
+                cur_bid = (ro_top or {}).get("bid") or 0.0
+                cur_ask = (ro_top or {}).get("ask") or 1.0
+                if ro_token and (ro_top is None or ro_top.get("ask") is None):
+                    bk = self.pub_client.get_order_book(ro_token)
+                    if bk and bk.get("asks"):
+                        cur_ask = float(bk["asks"][0]["price"])
+                    if bk and bk.get("bids"):
+                        cur_bid = float(bk["bids"][0]["price"])
+                elapsed_resting = time.time() - ro.get("placed_at", time.time())
+                is_clob_fill = (cur_ask <= ro["price"])
+                is_paper_fill = (
+                    config.MODE != "live"
+                    and elapsed_resting >= max(1.0, config.MIDBAND_REQUOTE_SECONDS)
+                    and (is_clob_fill if config.MIDBAND_PAPER_REQUIRE_CROSS else True)
+                )
+                mid_now = 0.5 * (float(cur_bid) + float(cur_ask)) if (cur_bid and cur_ask) else None
+                cancel = False
+                if remaining_s < config.DYNAMIC_WINDOW_END_S:
+                    cancel = True
+                if mid_now is not None and not (config.DYNAMIC_MIDBAND_LO <= mid_now <= config.DYNAMIC_MIDBAND_HI):
+                    cancel = True
+                if cancel and not is_paper_fill:
+                    logger.info(f"[{tag}] JEV_DYNAMIC cancel resting @{ro['price']:.2f} (band/time)")
+                    if config.MODE == "live" and ro.get("order_id"):
+                        try:
+                            self.live_client.cancel_order(ro["order_id"])
+                        except Exception as e:
+                            logger.warning(f"[{tag}] Failed to cancel live order {ro['order_id']}: {e}")
+                    slot.resting_order = None
+                elif is_paper_fill or (config.MODE == "live" and is_clob_fill):
+                    slot.position = {
+                        "asset": asset,
+                        "slot": ro["slot"],
+                        "strategy": "JEV_DYNAMIC_MAKER",
+                        "side": ro["side"],
+                        "token_id": ro["token_id"],
+                        "price": ro["price"],
+                        "shares": ro["shares"],
+                        "cost_usd": ro["cost_usd"],
+                        "z_score": ro.get("z_score", 0.0),
+                        "prob": ro.get("prob", ro["price"]),
+                        "fee": 0.0,
+                        "rebate": ro.get("rebate", 0.0),
+                        "order_id": ro.get("order_id"),
+                        "entry_time": ro.get("placed_at", time.time()),
+                        "opened_at": time.time(),
+                        "strike": strike,
+                        "official": False,
+                        "jev": ro.get("jev"),
+                    }
+                    slot.resting_order = None
+                    logger.info(
+                        f"[{tag}] ✅ JEV_DYNAMIC MAKER FILL {ro['side']} @{ro['price']:.3f} x {ro['shares']:.2f}"
+                    )
+
+        elif is_momentum:
             can_trade_now, risk_reason_now = self.risk.can_trade(open_notional=open_notional)
             if not can_trade_now:
                 if not slot.risk_block_logged:
@@ -602,18 +881,54 @@ class TWAPBot:
                     else:
                         can_trade, risk_reason = self.risk.can_trade(open_notional=open_notional)
                         if can_trade:
-                            await self._place_taker_order(
-                                slot, market, signal, best_ask, strategy_tag="H-005_MOMENTUM"
+                            trade_ask_eval = trade_ask if trade_side == prelim_side else best_ask
+                            bb_eval = float(best_bid) if best_bid is not None else None
+                            ba_eval = float(trade_ask_eval) if trade_ask_eval is not None else None
+                            sp_eval = round(ba_eval - bb_eval, 4) if (ba_eval is not None and bb_eval is not None) else 0.0
+                            jev_decision = await self.jev.evaluate_momentum(
+                                asset=asset,
+                                side=signal.side,
+                                spot=spot,
+                                strike=strike,
+                                move_usd=spot - strike,
+                                remaining_s=remaining_s,
+                                elapsed_s=elapsed_s,
+                                best_bid=bb_eval,
+                                best_ask=ba_eval,
+                                spread=sp_eval,
+                                chop_crosses=chop,
+                                daily_vol=params.daily_vol,
                             )
-                            # Only mark done if order actually filled (position populated)
-                            if slot.position and slot_key:
-                                self._slot_done.add(slot_key)
-                                self._save_slot_state(
-                                    slot_ts=slot_start_ts,
-                                    slug=slot_key,
-                                    strike=strike,
+                            if not jev_decision.passed:
+                                logger.warning(f"[{tag}] Momentum trade vetoed by Jev: {jev_decision.reason}")
+                                journal_write(
+                                    "jev_veto",
+                                    strategy="H-005_MOMENTUM",
                                     asset=asset,
+                                    side=signal.side,
+                                    reason=jev_decision.reason,
+                                    jev=jev_decision.to_dict(),
                                 )
+                            else:
+                                if jev_decision.size_multiplier < 1.0:
+                                    logger.info(f"[{tag}] Jev downsized momentum ({jev_decision.size_multiplier:.0%}): {jev_decision.reason}")
+                                else:
+                                    logger.info(f"[{tag}] Jev approved momentum: {jev_decision.reason}")
+                                await self._place_taker_order(
+                                    slot, market, signal, trade_ask_eval,
+                                    strategy_tag="H-005_MOMENTUM",
+                                    size_multiplier=jev_decision.size_multiplier,
+                                    jev_decision=jev_decision,
+                                )
+                                # Only mark done if order actually filled (position populated)
+                                if slot.position and slot_key:
+                                    self._slot_done.add(slot_key)
+                                    self._save_slot_state(
+                                        slot_ts=slot_start_ts,
+                                        slug=slot_key,
+                                        strike=strike,
+                                        asset=asset,
+                                    )
                         else:
                             logger.warning(f"[{tag}] Momentum trade blocked by risk manager: {risk_reason}")
 
@@ -689,8 +1004,46 @@ class TWAPBot:
                         break
                     can_trade, risk_reason = self.risk.can_trade(open_notional=open_notional)
                     if can_trade:
+                        q_bid_f = float(q_bid) if q_bid is not None else None
+                        q_ask_f = float(q_ask) if q_ask is not None else None
+                        spread_f = round(q_ask_f - q_bid_f, 4) if (q_ask_f is not None and q_bid_f is not None) else 0.0
+                        jev_decision = await self.jev.evaluate_maker(
+                            asset=asset,
+                            side=quote_side,
+                            spot=spot,
+                            strike=strike,
+                            realized_twap=realized_twap,
+                            z_score=msig.z_score,
+                            remaining_s=remaining_s,
+                            elapsed_s=elapsed_s,
+                            best_bid=q_bid_f,
+                            best_ask=q_ask_f,
+                            target_bid=msig.target_bid,
+                            spread=spread_f,
+                            chop_crosses=chop,
+                            daily_vol=params.daily_vol,
+                        )
+                        if not jev_decision.passed:
+                            logger.warning(f"[{tag}] Midband maker bid vetoed by Jev: {jev_decision.reason}")
+                            journal_write(
+                                "jev_veto",
+                                strategy="MIDBAND_MAKER",
+                                asset=asset,
+                                side=quote_side,
+                                reason=jev_decision.reason,
+                                jev=jev_decision.to_dict(),
+                            )
+                            break
+                        if jev_decision.size_multiplier < 1.0:
+                            logger.info(f"[{tag}] Jev downsized maker ({jev_decision.size_multiplier:.0%}): {jev_decision.reason}")
+                        else:
+                            logger.info(f"[{tag}] Jev approved maker: {jev_decision.reason}")
                         # Reuse maker placement with strategy tag override via signal side
-                        await self._place_maker_bid(slot, market, msig, strategy_tag="MIDBAND_MAKER")
+                        await self._place_maker_bid(
+                            slot, market, msig, strategy_tag="MIDBAND_MAKER",
+                            size_multiplier=jev_decision.size_multiplier,
+                            jev_decision=jev_decision,
+                        )
                         break
                     else:
                         logger.warning(f"[{tag}] Midband blocked by risk manager: {risk_reason}")
@@ -750,6 +1103,7 @@ class TWAPBot:
                         "opened_at": time.time(),
                         "strike": strike,
                         "official": False,
+                        "jev": ro.get("jev"),
                     }
                     slot.resting_order = None
                     logger.info(
@@ -825,6 +1179,7 @@ class TWAPBot:
                         "rebate": ro["rebate"],
                         "entry_time": time.time(),
                         "order_id": ro["order_id"],
+                        "jev": ro.get("jev"),
                     }
                     logger.info("=" * 60)
                     logger.info(f"✅ [{tag} H-004 MAKER BID FILLED] BUY {ro['side']} @ {ro['price']:.2f}")
@@ -843,7 +1198,7 @@ class TWAPBot:
                     slot.resting_order = None
 
         if slot.position and slot.position.get("strategy") in (
-            "H-005_MOMENTUM", "LATE_MOMENTUM", "MOMENTUM", "H-005"
+            "H-005_MOMENTUM", "LATE_MOMENTUM", "MOMENTUM", "H-005", "JEV_DYNAMIC_MOMENTUM"
         ):
             await self._manage_open_momentum_position(slot, market, remaining_s, tokens)
 
@@ -854,16 +1209,27 @@ class TWAPBot:
                 self._queue_settlement(slot)
 
     async def _place_taker_order(
-        self, slot: CoinSlot, market: dict, signal: TWAPSignal, ask: float, strategy_tag: str = "H-001_SNIPER"
+        self,
+        slot: CoinSlot,
+        market: dict,
+        signal: TWAPSignal,
+        ask: float,
+        strategy_tag: str = "H-001_SNIPER",
+        size_multiplier: float = 1.0,
+        jev_decision: JevDecision | None = None,
     ) -> None:
         """Execute immediate taker sniper order against available ask."""
         token_id = market["tokens"].get(signal.side)
         if not token_id or not ask:
             return
 
-        stake_usd = self.risk.calculate_stake(signal.edge_net, ask, open_notional=self._open_notional())
-        if stake_usd < config.BASE_STAKE_USD:
-            logger.warning(f"[{slot.asset.upper()}] Stake ${stake_usd:.2f} below base; skip")
+        stake_usd = (
+            self.risk.calculate_stake(signal.edge_net, ask, open_notional=self._open_notional())
+            * max(0.1, float(size_multiplier))
+        )
+        min_allowed_stake = min(config.BASE_STAKE_USD, max(1.0, config.BASE_STAKE_USD * float(size_multiplier)))
+        if stake_usd < min_allowed_stake:
+            logger.warning(f"[{slot.asset.upper()}] Stake ${stake_usd:.2f} below allowed minimum (${min_allowed_stake:.2f}); skip")
             return
         shares = max(config.MIN_ORDER_SHARES, round(stake_usd / ask, 2))
         cost_usd = round(shares * ask, 2)
@@ -905,6 +1271,8 @@ class TWAPBot:
         logger.info(f"[{slot.asset.upper()} {strategy_tag} ORDER EXECUTED] BUY {signal.side} @ {ask:.3f}")
         logger.info(f"   Z-Score: {signal.z_score:.2f} | Win Prob: {signal.model_prob:.1%} | Net Edge: {signal.edge_net:+.1%}")
         logger.info(f"   Size: {shares:.1f} shares (${cost_usd:.2f}) | Fee: ${fee_usd:.3f}")
+        if jev_decision:
+            logger.info(f"   Jev Guardian: {jev_decision.reason} (lat: {jev_decision.latency_ms:.0f}ms)")
         logger.info("=" * 60)
 
         order_id = f"{strategy_tag.lower()}_paper_{int(time.time()*1000)}"
@@ -945,6 +1313,7 @@ class TWAPBot:
             order_id=order_id,
             z_score=signal.z_score,
             edge=signal.edge_net,
+            jev=jev_decision.to_dict() if jev_decision else None,
         )
 
         slot.position = {
@@ -962,17 +1331,30 @@ class TWAPBot:
             "rebate": 0.0,
             "entry_time": time.time(),
             "order_id": order_id,
+            "jev": jev_decision.to_dict() if jev_decision else None,
         }
 
-    async def _place_maker_bid(self, slot: CoinSlot, market: dict, signal: MakerSignal, strategy_tag: str = "H-004_MAKER") -> None:
+    async def _place_maker_bid(
+        self,
+        slot: CoinSlot,
+        market: dict,
+        signal: MakerSignal,
+        strategy_tag: str = "H-004_MAKER",
+        size_multiplier: float = 1.0,
+        jev_decision: JevDecision | None = None,
+    ) -> None:
         """Post resting limit bid inside spread as Maker."""
         token_id = market["tokens"].get(signal.side)
         if not token_id or not signal.target_bid:
             return
 
-        stake_usd = self.risk.calculate_stake(signal.edge_net, signal.target_bid, open_notional=self._open_notional())
-        if stake_usd < config.BASE_STAKE_USD:
-            logger.warning(f"[{slot.asset.upper()}] Stake ${stake_usd:.2f} below base; skip maker")
+        stake_usd = (
+            self.risk.calculate_stake(signal.edge_net, signal.target_bid, open_notional=self._open_notional())
+            * max(0.1, float(size_multiplier))
+        )
+        min_allowed_stake = min(config.BASE_STAKE_USD, max(1.0, config.BASE_STAKE_USD * float(size_multiplier)))
+        if stake_usd < min_allowed_stake:
+            logger.warning(f"[{slot.asset.upper()}] Stake ${stake_usd:.2f} below allowed minimum (${min_allowed_stake:.2f}); skip maker")
             return
         shares = max(config.MIN_ORDER_SHARES, round(stake_usd / signal.target_bid, 2))
         cost_usd = round(shares * signal.target_bid, 2)
@@ -982,6 +1364,8 @@ class TWAPBot:
         logger.info(f"📥 [{slot.asset.upper()} H-004 MAKER BID POSTED] RESTING BUY {signal.side} @ {signal.target_bid:.2f}")
         logger.info(f"   Z-Score: {signal.z_score:.2f} | Fair Value: {signal.model_prob:.1%} | Net Edge: {signal.edge_net:+.1%}")
         logger.info(f"   Target Size: {shares:.1f} shares (${cost_usd:.2f}) | Expected Rebate: ${total_rebate:.3f}")
+        if jev_decision:
+            logger.info(f"   Jev Guardian: {jev_decision.reason} (lat: {jev_decision.latency_ms:.0f}ms)")
         logger.info("=" * 60)
 
         order_id = f"maker_paper_{int(time.time()*1000)}"
@@ -1010,6 +1394,7 @@ class TWAPBot:
             "rebate": total_rebate,
             "placed_at": time.time(),
             "order_id": order_id,
+            "jev": jev_decision.to_dict() if jev_decision else None,
         }
 
 
@@ -1377,6 +1762,7 @@ class TWAPBot:
             "settlement_source": resolution.get("source"),
             "official": bool(resolution.get("official")),
             "early_exit": False,
+            "jev": pos.get("jev"),
         }
         journal_write(
             "settlement",
@@ -1390,6 +1776,7 @@ class TWAPBot:
             bankroll=round(self.risk.bankroll, 2),
             settlement_source=resolution.get("source"),
             early_exit=False,
+            jev=pos.get("jev"),
         )
         self._save_trade_record(record)
 

@@ -96,7 +96,8 @@ def test_risk_accounts_for_open_notional():
         risk.bankroll = 50.0
         ok, _ = risk.can_trade(open_notional=0.0)
         assert ok
-        ok2, reason = risk.can_trade(open_notional=46.0)
+        # Free bankroll below BASE_STAKE_USD
+        ok2, reason = risk.can_trade(open_notional=risk.bankroll - config.BASE_STAKE_USD + 1.0)
         assert not ok2
         assert "free bankroll" in reason
         stake = risk.calculate_stake(0.04, 0.80, open_notional=40.0)
@@ -120,8 +121,6 @@ def test_max_concurrent_entries_count():
     assert b._slot_entries_count() >= config.MAX_CONCURRENT_ENTRIES
 
 
-
-
 if __name__ == "__main__":
     test_known_5m_assets()
     test_per_coin_sigma_and_chop_scale_with_spot()
@@ -129,4 +128,5 @@ if __name__ == "__main__":
     test_slot_state_per_asset()
     test_one_position_per_coin_independent()
     test_risk_accounts_for_open_notional()
+    test_max_concurrent_entries_count()
     print("[PASS] test_multi_asset")
