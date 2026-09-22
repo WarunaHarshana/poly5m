@@ -609,10 +609,11 @@ class TWAPBot:
                         and config.DYNAMIC_MOMENTUM_MIN_ASK <= float(q_ask) <= config.DYNAMIC_MOMENTUM_MAX_ASK
                         and remaining_s <= config.MOMENTUM_WINDOW_START_S
                     )
+                    dyn_min_z = max(config.DYNAMIC_MIN_Z, params.midband_min_z * 0.60)
                     is_maker_candidate = (
                         mid_px is not None
                         and config.DYNAMIC_MIDBAND_LO <= mid_px <= config.DYNAMIC_MIDBAND_HI
-                        and abs_z >= config.DYNAMIC_MIN_Z
+                        and abs_z >= dyn_min_z
                     )
 
                     if is_momentum_candidate:
@@ -694,6 +695,8 @@ class TWAPBot:
                         target_bid = round(mid_px - config.DYNAMIC_HALF_SPREAD, 2)
                         target_bid = max(config.DYNAMIC_MIDBAND_LO, min(config.DYNAMIC_MIDBAND_HI, target_bid))
                         target_bid = min(target_bid, round(float(q_ask) - 0.01, 2))
+                        # Never bid > 0.50 on maker (guarantees positive payout asymmetry >= 1.0x)
+                        target_bid = min(0.50, target_bid)
 
                         if target_bid < float(q_ask):
                             logger.info(

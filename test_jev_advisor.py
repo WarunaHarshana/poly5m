@@ -16,8 +16,8 @@ class TestJevAdvisor(unittest.TestCase):
             model="jev-latest",
             enabled=True,
             timeout_s=1.5,
-            max_reversal_noul=0.60,
-            min_conviction_score=1.0,
+            max_reversal_noul=0.35,
+            min_conviction_score=1.50,
             downsize_factor=0.50,
         )
 
@@ -139,12 +139,12 @@ class TestJevAdvisor(unittest.TestCase):
         mock_client_cls.return_value.__aenter__.return_value = mock_instance
 
         mock_res = MagicMock()
-        mock_res.nouls = {"reversal_risk": MagicMock(noul=0.35)}
+        mock_res.nouls = {"reversal_risk": MagicMock(noul=0.28)}
         mock_res.choices = {
-            "regime": MagicMock(choice="mean_reverting_chop"),
-            "action": MagicMock(choice="downsize", confidence=0.60),
+            "regime": MagicMock(choice="clean_trend"),
+            "action": MagicMock(choice="downsize", confidence=0.75),
         }
-        mock_res.scores = {"conviction": MagicMock(score=1.2)}
+        mock_res.scores = {"conviction": MagicMock(score=1.8)}
         mock_instance.system_one = AsyncMock(return_value=mock_res)
 
         decision = asyncio.run(
@@ -170,6 +170,42 @@ class TestJevAdvisor(unittest.TestCase):
         self.assertEqual(decision.action, "downsize")
         self.assertEqual(decision.size_multiplier, 0.50)
         self.assertEqual(self.advisor.total_downsized, 1)
+
+    @patch("jev_advisor.AsyncTypeSafeClient")
+    def test_mocked_veto_chop_regime(self, mock_client_cls):
+        mock_instance = MagicMock()
+        mock_client_cls.return_value.__aenter__.return_value = mock_instance
+
+        mock_res = MagicMock()
+        mock_res.nouls = {"reversal_risk": MagicMock(noul=0.25)}
+        mock_res.choices = {
+            "regime": MagicMock(choice="mean_reverting_chop"),
+            "action": MagicMock(choice="proceed", confidence=0.70),
+        }
+        mock_res.scores = {"conviction": MagicMock(score=2.2)}
+        mock_instance.system_one = AsyncMock(return_value=mock_res)
+
+        decision = asyncio.run(
+            self.advisor.evaluate_maker(
+                asset="xrp",
+                side="UP",
+                spot=1.52,
+                strike=1.52,
+                realized_twap=1.52,
+                z_score=0.5,
+                remaining_s=120.0,
+                elapsed_s=180.0,
+                best_bid=0.45,
+                best_ask=0.49,
+                target_bid=0.47,
+                spread=0.04,
+                chop_crosses=3,
+                daily_vol=0.020,
+            )
+        )
+        self.assertFalse(decision.passed)
+        self.assertIn("mean_reverting_chop", decision.reason)
+        self.assertEqual(self.advisor.total_vetoed, 1)
 
     @patch("jev_advisor.AsyncTypeSafeClient")
     def test_timeout_fallback(self, mock_client_cls):

@@ -321,19 +321,23 @@ class JevAdvisor:
             action_confidence = float(res.choices["action"].confidence)
 
             # Synthesize final decision gating
-            if action_choice == "abstain" or reversal_risk > self.max_reversal_noul:
+            is_toxic_regime = regime in ("mean_reverting_chop", "illiquid_or_spoofed", "exhaustion")
+
+            if (
+                action_choice == "abstain"
+                or reversal_risk > self.max_reversal_noul
+                or is_toxic_regime
+                or conviction_score < self.min_conviction_score
+            ):
                 passed = False
                 size_mult = 0.0
                 reason = (
-                    f"Vetoed by Jev: action={action_choice}, reversal_risk={reversal_risk:.2f} "
-                    f"(max {self.max_reversal_noul:.2f}), regime={regime}"
+                    f"Vetoed by Jev: action={action_choice}, regime={regime}, "
+                    f"reversal={reversal_risk:.2f} (max {self.max_reversal_noul:.2f}), "
+                    f"conviction={conviction_score:.2f} (min {self.min_conviction_score:.2f})"
                 )
                 self.total_vetoed += 1
-            elif (
-                action_choice == "downsize"
-                or conviction_score < self.min_conviction_score
-                or regime in ("mean_reverting_chop", "exhaustion", "illiquid_or_spoofed")
-            ):
+            elif action_choice == "downsize" or reversal_risk > (self.max_reversal_noul * 0.70):
                 passed = True
                 size_mult = self.downsize_factor
                 reason = (
