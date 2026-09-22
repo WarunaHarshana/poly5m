@@ -23,7 +23,9 @@ DEFAULT_5M_ASSETS = ("btc", "eth", "sol", "bnb", "xrp", "doge")
 
 def _parse_asset_list(raw: str) -> list[str]:
     out: list[str] = []
-    for tok in (raw or "").split(","):
+    # Support both comma-separated and space-separated lists
+    normalized = (raw or "").replace(",", " ")
+    for tok in normalized.split():
         a = tok.strip().lower()
         if a in KNOWN_5M_ASSETS and a not in out:
             out.append(a)
