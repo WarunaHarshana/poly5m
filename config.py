@@ -68,7 +68,7 @@ STRATEGY = os.getenv("STRATEGY", "JEV_DYNAMIC").strip().upper()
 DYNAMIC_MIDBAND_LO = float(os.getenv("DYNAMIC_MIDBAND_LO", "0.35"))
 DYNAMIC_MIDBAND_HI = float(os.getenv("DYNAMIC_MIDBAND_HI", "0.65"))
 DYNAMIC_HALF_SPREAD = float(os.getenv("DYNAMIC_HALF_SPREAD", "0.03"))
-DYNAMIC_MIN_Z = float(os.getenv("DYNAMIC_MIN_Z", "0.20"))
+DYNAMIC_MIN_Z = float(os.getenv("DYNAMIC_MIN_Z", "1.00"))
 DYNAMIC_WINDOW_START_S = float(os.getenv("DYNAMIC_WINDOW_START_S", "265.0"))
 DYNAMIC_WINDOW_END_S = float(os.getenv("DYNAMIC_WINDOW_END_S", "30.0"))
 DYNAMIC_MOMENTUM_MIN_MOVE_BPS = float(os.getenv("DYNAMIC_MOMENTUM_MIN_MOVE_BPS", "25.0"))
@@ -204,13 +204,13 @@ _MIN_Z = {
 }
 # Per-coin minimum Z-score for mid-band maker (higher conviction on noisy alts).
 _MIDBAND_MIN_Z = {
-    "btc": 0.50,    # 100% WR so far, solid signal fidelity
-    "eth": 0.65,    # baseline major
-    "sol": 1.00,    # filter weak chop (lost at Z=0.50)
-    "bnb": 0.80,    # mid-tier alt
-    "xrp": 1.20,    # noisy alt, require clear trend
-    "doge": 1.20,   # meme coin, filter weak flips (lost at Z=0.55)
-    "hype": 1.20,
+    "btc": 1.00,    # solid major
+    "eth": 1.00,    # solid major (75% WR on live trades)
+    "sol": 1.25,    # altcoin, filter weak flips
+    "bnb": 1.50,    # altcoin, high noise hurdle
+    "xrp": 1.50,    # altcoin, high noise hurdle
+    "doge": 1.50,   # meme coin, high noise hurdle
+    "hype": 1.50,
 }
 
 
@@ -305,5 +305,5 @@ JEV_ENABLED = os.getenv("JEV_ENABLED", "yes").strip().lower() in ("yes", "y", "t
 JEV_MODEL = os.getenv("JEV_MODEL", "jev-latest").strip()
 JEV_TIMEOUT_S = _fenv("JEV_TIMEOUT_S", 1.2)
 JEV_MAX_REVERSAL_NOUL = _fenv("JEV_MAX_REVERSAL_NOUL", 0.40)
-JEV_MIN_CONVICTION_SCORE = _fenv("JEV_MIN_CONVICTION_SCORE", 1.00)
+JEV_MIN_CONVICTION_SCORE = _fenv("JEV_MIN_CONVICTION_SCORE", 1.20)
 JEV_DOWNSIZE_FACTOR = _fenv("JEV_DOWNSIZE_FACTOR", 0.50)

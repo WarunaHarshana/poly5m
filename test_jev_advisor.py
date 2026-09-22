@@ -237,10 +237,12 @@ class TestJevAdvisor(unittest.TestCase):
             )
         )
 
-        self.assertTrue(decision.passed)
+        self.assertFalse(decision.passed)
         self.assertTrue(decision.fallback_used)
-        self.assertEqual(decision.size_multiplier, 1.0)
+        self.assertEqual(decision.action, "abstain")
+        self.assertEqual(decision.size_multiplier, 0.0)
         self.assertEqual(fast_advisor.total_fallbacks, 1)
+        self.assertEqual(fast_advisor.total_vetoed, 1)
 
     @patch("jev_advisor.AsyncTypeSafeClient")
     def test_mocked_dynamic_maker(self, mock_client_cls):

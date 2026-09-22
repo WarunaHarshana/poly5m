@@ -374,21 +374,21 @@ class JevAdvisor:
             latency = (time.time() - t0) * 1000.0
             self.total_latency_ms += latency
             self.total_fallbacks += 1
-            logger.warning(f"Jev API timed out after {self.timeout_s:.2f}s; falling back to base math.")
+            logger.warning(f"Jev API timed out after {self.timeout_s:.2f}s; abstaining to protect capital.")
             decision = JevDecision(
-                action="proceed",
-                passed=True,
-                size_multiplier=1.0,
-                conviction=1.5,
-                reversal_risk=0.5,
+                action="abstain",
+                passed=False,
+                size_multiplier=0.0,
+                conviction=0.0,
+                reversal_risk=1.0,
                 market_regime="unknown_timeout",
                 confidence=0.0,
-                reason=f"Jev timeout ({self.timeout_s:.1f}s); base math fallback",
+                reason=f"Jev timeout ({self.timeout_s:.1f}s); abstaining",
                 latency_ms=round(latency, 1),
                 fallback_used=True,
                 evaluated_at=time.time(),
             )
-            self.total_approved += 1
+            self.total_vetoed += 1
             self.last_decision = decision
             return decision
 
@@ -396,20 +396,20 @@ class JevAdvisor:
             latency = (time.time() - t0) * 1000.0
             self.total_latency_ms += latency
             self.total_fallbacks += 1
-            logger.warning(f"Jev evaluation failed ({e}); falling back to base math.")
+            logger.warning(f"Jev evaluation failed ({e}); abstaining to protect capital.")
             decision = JevDecision(
-                action="proceed",
-                passed=True,
-                size_multiplier=1.0,
-                conviction=1.5,
-                reversal_risk=0.5,
+                action="abstain",
+                passed=False,
+                size_multiplier=0.0,
+                conviction=0.0,
+                reversal_risk=1.0,
                 market_regime="error_fallback",
                 confidence=0.0,
-                reason=f"Jev error ({e}); base math fallback",
+                reason=f"Jev error ({e}); abstaining",
                 latency_ms=round(latency, 1),
                 fallback_used=True,
                 evaluated_at=time.time(),
             )
-            self.total_approved += 1
+            self.total_vetoed += 1
             self.last_decision = decision
             return decision

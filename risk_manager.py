@@ -60,9 +60,7 @@ class RiskManager:
         """Calculate dollar stake for trade."""
         free = max(0.0, float(self.bankroll) - max(0.0, float(open_notional)))
         stake = config.BASE_STAKE_USD
-        # Modest scale-up with edge
-        if edge > 0.08:
-            stake = min(config.MAX_STAKE_USD, stake * 1.5)
+        # Maintain uniform base stake (Jev advisor manages downsizing to 50% when needed)
         # Ensure bankroll constraint against capital already tied in open positions
         stake = min(stake, free * 0.20, free)
         if stake < config.BASE_STAKE_USD:

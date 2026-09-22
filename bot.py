@@ -617,7 +617,7 @@ class TWAPBot:
                         and config.DYNAMIC_MOMENTUM_MIN_ASK <= float(q_ask) <= config.DYNAMIC_MOMENTUM_MAX_ASK
                         and remaining_s <= config.MOMENTUM_WINDOW_START_S
                     )
-                    dyn_min_z = max(config.DYNAMIC_MIN_Z, params.midband_min_z * 0.60)
+                    dyn_min_z = max(config.DYNAMIC_MIN_Z, params.midband_min_z)
                     is_maker_candidate = (
                         mid_px is not None
                         and config.DYNAMIC_MIDBAND_LO <= mid_px <= config.DYNAMIC_MIDBAND_HI
