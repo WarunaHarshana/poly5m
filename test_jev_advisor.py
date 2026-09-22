@@ -139,7 +139,7 @@ class TestJevAdvisor(unittest.TestCase):
         mock_client_cls.return_value.__aenter__.return_value = mock_instance
 
         mock_res = MagicMock()
-        mock_res.nouls = {"reversal_risk": MagicMock(noul=0.28)}
+        mock_res.nouls = {"reversal_risk": MagicMock(noul=0.20), "fakeout_risk": MagicMock(noul=0.10)}
         mock_res.choices = {
             "regime": MagicMock(choice="clean_trend"),
             "action": MagicMock(choice="downsize", confidence=0.75),
@@ -147,6 +147,7 @@ class TestJevAdvisor(unittest.TestCase):
         mock_res.scores = {"conviction": MagicMock(score=1.8)}
         mock_instance.system_one = AsyncMock(return_value=mock_res)
 
+        # 1. By default, allow_downsizing is False -> downsize is treated as uncertainty veto
         decision = asyncio.run(
             self.advisor.evaluate_maker(
                 asset="eth",
@@ -165,11 +166,82 @@ class TestJevAdvisor(unittest.TestCase):
                 daily_vol=0.0140,
             )
         )
+        self.assertFalse(decision.passed)
+        self.assertEqual(decision.size_multiplier, 0.0)
+        self.assertIn("uncertainty veto", decision.reason)
+        self.assertEqual(self.advisor.total_vetoed, 1)
 
-        self.assertTrue(decision.passed)
-        self.assertEqual(decision.action, "downsize")
-        self.assertEqual(decision.size_multiplier, 0.50)
-        self.assertEqual(self.advisor.total_downsized, 1)
+        # 2. When allow_downsizing is True -> permits half sizing
+        permissive_advisor = JevAdvisor(
+            api_key="test_key",
+            enabled=True,
+            allow_downsizing=True,
+            downsize_factor=0.50,
+            min_conviction_score=1.50,
+            max_reversal_noul=0.35,
+        )
+        dec2 = asyncio.run(
+            permissive_advisor.evaluate_maker(
+                asset="eth",
+                side="DOWN",
+                spot=3100.0,
+                strike=3110.0,
+                realized_twap=3108.0,
+                z_score=0.85,
+                remaining_s=150.0,
+                elapsed_s=150.0,
+                best_bid=0.46,
+                best_ask=0.50,
+                target_bid=0.48,
+                spread=0.04,
+                chop_crosses=2,
+                daily_vol=0.0140,
+            )
+        )
+        self.assertTrue(dec2.passed)
+        self.assertEqual(dec2.size_multiplier, 0.50)
+        self.assertEqual(permissive_advisor.total_downsized, 1)
+
+    @patch("jev_advisor.AsyncTypeSafeClient")
+    def test_mocked_veto_fakeout_trap(self, mock_client_cls):
+        mock_instance = MagicMock()
+        mock_client_cls.return_value.__aenter__.return_value = mock_instance
+
+        mock_res = MagicMock()
+        mock_res.nouls = {
+            "reversal_risk": MagicMock(noul=0.15),
+            "fakeout_risk": MagicMock(noul=0.55),  # > 0.30 threshold
+        }
+        mock_res.choices = {
+            "regime": MagicMock(choice="clean_trend"),
+            "action": MagicMock(choice="proceed", confidence=0.85),
+        }
+        mock_res.scores = {"conviction": MagicMock(score=2.2)}
+        mock_instance.system_one = AsyncMock(return_value=mock_res)
+
+        decision = asyncio.run(
+            self.advisor.evaluate_maker(
+                asset="btc",
+                side="UP",
+                spot=91500.0,
+                strike=91200.0,
+                realized_twap=91350.0,
+                z_score=1.5,
+                remaining_s=120.0,
+                elapsed_s=180.0,
+                best_bid=0.44,
+                best_ask=0.48,
+                target_bid=0.46,
+                spread=0.04,
+                chop_crosses=0,
+                daily_vol=0.0106,
+            )
+        )
+
+        self.assertFalse(decision.passed)
+        self.assertIn("fakeout", decision.reason)
+        self.assertEqual(decision.fakeout_risk, 0.55)
+        self.assertEqual(self.advisor.total_vetoed, 1)
 
     @patch("jev_advisor.AsyncTypeSafeClient")
     def test_mocked_veto_chop_regime(self, mock_client_cls):

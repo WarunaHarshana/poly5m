@@ -36,6 +36,7 @@ class JevDecision:
     reason: str
     latency_ms: float
     fallback_used: bool
+    fakeout_risk: float = 0.0  # Noul (0.0 to 1.0)
     evaluated_at: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
@@ -54,8 +55,10 @@ class JevAdvisor:
         enabled: bool | None = None,
         timeout_s: float | None = None,
         max_reversal_noul: float | None = None,
+        max_fakeout_noul: float | None = None,
         min_conviction_score: float | None = None,
         downsize_factor: float | None = None,
+        allow_downsizing: bool | None = None,
     ):
         self.api_key = (api_key or config.TYPESAFE_API_KEY).strip()
         self.base_url = base_url or config.TYPESAFE_BASE_URL
@@ -65,11 +68,17 @@ class JevAdvisor:
         self.max_reversal_noul = (
             config.JEV_MAX_REVERSAL_NOUL if max_reversal_noul is None else float(max_reversal_noul)
         )
+        self.max_fakeout_noul = (
+            config.JEV_MAX_FAKEOUT_NOUL if max_fakeout_noul is None else float(max_fakeout_noul)
+        )
         self.min_conviction_score = (
             config.JEV_MIN_CONVICTION_SCORE if min_conviction_score is None else float(min_conviction_score)
         )
         self.downsize_factor = (
             config.JEV_DOWNSIZE_FACTOR if downsize_factor is None else float(downsize_factor)
+        )
+        self.allow_downsizing = (
+            config.JEV_ALLOW_DOWNSIZING if allow_downsizing is None else bool(allow_downsizing)
         )
 
         # Telemetry
@@ -264,6 +273,12 @@ class JevAdvisor:
                     f"({strike:.4f}) before expiration, causing the {side_upper} outcome to lose?"
                 )
             ),
+            "fakeout_risk": Noul(
+                instructions=(
+                    f"Is this move away from strike S0 ({strike:.4f}) a low-volume liquidity sweep, "
+                    f"exhaustion wick, or bull/bear trap that is likely to snap back within 2-3 minutes?"
+                )
+            ),
             "regime": Choice(
                 instructions="What best characterizes the current crypto market price action?",
                 criteria={
@@ -315,6 +330,7 @@ class JevAdvisor:
             self.total_latency_ms += latency
 
             reversal_risk = float(res.nouls["reversal_risk"].noul)
+            fakeout_risk = float(res.nouls["fakeout_risk"].noul) if "fakeout_risk" in res.nouls else 0.0
             regime = str(res.choices["regime"].choice)
             conviction_score = float(res.scores["conviction"].score)
             action_choice = str(res.choices["action"].choice)
@@ -322,27 +338,39 @@ class JevAdvisor:
 
             # Synthesize final decision gating
             is_toxic_regime = regime in ("mean_reverting_chop", "illiquid_or_spoofed", "exhaustion")
+            is_downsize_veto = (action_choice == "downsize" and not self.allow_downsizing)
 
             if (
                 action_choice == "abstain"
+                or is_downsize_veto
                 or reversal_risk > self.max_reversal_noul
+                or fakeout_risk > self.max_fakeout_noul
                 or is_toxic_regime
                 or conviction_score < self.min_conviction_score
             ):
                 passed = False
                 size_mult = 0.0
-                reason = (
-                    f"Vetoed by Jev: action={action_choice}, regime={regime}, "
-                    f"reversal={reversal_risk:.2f} (max {self.max_reversal_noul:.2f}), "
-                    f"conviction={conviction_score:.2f} (min {self.min_conviction_score:.2f})"
-                )
+                reasons = []
+                if action_choice == "abstain":
+                    reasons.append("action=abstain")
+                elif is_downsize_veto:
+                    reasons.append("action=downsize(uncertainty veto)")
+                if is_toxic_regime:
+                    reasons.append(f"regime={regime}")
+                if reversal_risk > self.max_reversal_noul:
+                    reasons.append(f"reversal={reversal_risk:.2f} (max {self.max_reversal_noul:.2f})")
+                if fakeout_risk > self.max_fakeout_noul:
+                    reasons.append(f"fakeout={fakeout_risk:.2f} (max {self.max_fakeout_noul:.2f})")
+                if conviction_score < self.min_conviction_score:
+                    reasons.append(f"conviction={conviction_score:.2f} (min {self.min_conviction_score:.2f})")
+                reason = f"Vetoed by Jev: {', '.join(reasons)}"
                 self.total_vetoed += 1
-            elif action_choice == "downsize" or reversal_risk > (self.max_reversal_noul * 0.70):
+            elif action_choice == "downsize" and self.allow_downsizing:
                 passed = True
                 size_mult = self.downsize_factor
                 reason = (
                     f"Downsized by Jev ({self.downsize_factor:.0%}): conviction={conviction_score:.2f}, "
-                    f"reversal={reversal_risk:.2f}, regime={regime}"
+                    f"reversal={reversal_risk:.2f}, fakeout={fakeout_risk:.2f}, regime={regime}"
                 )
                 self.total_downsized += 1
             else:
@@ -350,7 +378,7 @@ class JevAdvisor:
                 size_mult = 1.0
                 reason = (
                     f"Approved by Jev: conviction={conviction_score:.2f}, reversal={reversal_risk:.2f}, "
-                    f"regime={regime}"
+                    f"fakeout={fakeout_risk:.2f}, regime={regime}"
                 )
                 self.total_approved += 1
 
@@ -365,6 +393,7 @@ class JevAdvisor:
                 reason=reason,
                 latency_ms=round(latency, 1),
                 fallback_used=False,
+                fakeout_risk=fakeout_risk,
                 evaluated_at=time.time(),
             )
             self.last_decision = decision

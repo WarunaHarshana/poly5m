@@ -149,7 +149,7 @@ RESOLUTION_TIMEOUT_S = float(os.getenv("RESOLUTION_TIMEOUT_S", "180.0"))
 RESOLUTION_PRICE_MIN = float(os.getenv("RESOLUTION_PRICE_MIN", "0.99"))
 # Cap how many coins can open new positions in a single 5-minute slot.
 # Increased to 3 for JEV_DYNAMIC mode to participate actively across coins.
-MAX_CONCURRENT_ENTRIES = int(os.getenv("MAX_CONCURRENT_ENTRIES", "3"))
+MAX_CONCURRENT_ENTRIES = int(os.getenv("MAX_CONCURRENT_ENTRIES", "1"))
 
 
 def _fenv(name: str, default: float) -> float:
@@ -306,6 +306,8 @@ TYPESAFE_BASE_URL = os.getenv("TYPESAFE_BASE_URL", "").strip() or None
 JEV_ENABLED = os.getenv("JEV_ENABLED", "yes").strip().lower() in ("yes", "y", "true", "1") and bool(TYPESAFE_API_KEY)
 JEV_MODEL = os.getenv("JEV_MODEL", "jev-latest").strip()
 JEV_TIMEOUT_S = _fenv("JEV_TIMEOUT_S", 1.2)
-JEV_MAX_REVERSAL_NOUL = _fenv("JEV_MAX_REVERSAL_NOUL", 0.40)
-JEV_MIN_CONVICTION_SCORE = _fenv("JEV_MIN_CONVICTION_SCORE", 1.20)
+JEV_MAX_REVERSAL_NOUL = _fenv("JEV_MAX_REVERSAL_NOUL", 0.28)
+JEV_MAX_FAKEOUT_NOUL = _fenv("JEV_MAX_FAKEOUT_NOUL", 0.30)
+JEV_MIN_CONVICTION_SCORE = _fenv("JEV_MIN_CONVICTION_SCORE", 1.75)
 JEV_DOWNSIZE_FACTOR = _fenv("JEV_DOWNSIZE_FACTOR", 0.50)
+JEV_ALLOW_DOWNSIZING = os.getenv("JEV_ALLOW_DOWNSIZING", "false").strip().lower() in ("true", "1", "yes")
