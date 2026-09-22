@@ -164,7 +164,35 @@ class TWAPBot:
             logger.warning(f"Failed to save slot state: {e}")
 
     def _check_reset_trade_data(self) -> None:
-        """Archive and reset old trades, journal, slot states, and risk metrics if RESET_TRADE_DATA is set."""
+        """Archive and reset old trades, journal, slot states, or prune historical trades prior to cutoff."""
+        prune_before = os.getenv("PRUNE_TRADES_BEFORE", "").strip()
+        if prune_before and self._trades_log_path.exists():
+            logger.info("=" * 70)
+            logger.info(f"✂️ PRUNE_TRADES_BEFORE={prune_before}: pruning trades prior to cutoff...")
+            ts = int(time.time())
+            archive_path = config.STATE_DIR / f"trades_pre_prune_{ts}.json"
+            try:
+                shutil.copy2(self._trades_log_path, archive_path)
+                logger.info(f"   Archived original trades.json -> {archive_path.name}")
+            except Exception as e:
+                logger.error(f"   Failed to archive trades: {e}")
+
+            trades = load_trades(self._trades_log_path)
+            kept_trades = []
+            for t in trades:
+                t_time = str(t.get("entry_time_utc") or t.get("timestamp") or "")
+                if t_time >= prune_before:
+                    kept_trades.append(t)
+
+            logger.info(f"   Pruned {len(trades) - len(kept_trades)} old trades; kept {len(kept_trades)} post-fix trades.")
+            try:
+                with open(self._trades_log_path, "w", encoding="utf-8") as f:
+                    json.dump(kept_trades, f, indent=2)
+                logger.info(f"   Saved {len(kept_trades)} trades to trades.json")
+            except Exception as e:
+                logger.error(f"   Failed to save pruned trades: {e}")
+            logger.info("=" * 70)
+
         reset_flag = os.getenv("RESET_TRADE_DATA", "false").strip().lower() in ("true", "1", "yes")
         if not reset_flag:
             return
