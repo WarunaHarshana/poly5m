@@ -75,17 +75,16 @@ DYNAMIC_WINDOW_START_S = float(os.getenv("DYNAMIC_WINDOW_START_S", "270.0"))
 DYNAMIC_WINDOW_END_S = float(os.getenv("DYNAMIC_WINDOW_END_S", "60.0"))
 DYNAMIC_MOMENTUM_MIN_MOVE_BPS = float(os.getenv("DYNAMIC_MOMENTUM_MIN_MOVE_BPS", "25.0"))
 DYNAMIC_MOMENTUM_MIN_ASK = float(os.getenv("DYNAMIC_MOMENTUM_MIN_ASK", "0.38"))
-DYNAMIC_MOMENTUM_MAX_ASK = float(os.getenv("DYNAMIC_MOMENTUM_MAX_ASK", "0.90"))
+DYNAMIC_MOMENTUM_MAX_ASK = float(os.getenv("DYNAMIC_MOMENTUM_MAX_ASK", "0.80"))
 DYNAMIC_MAX_BOOK_SPREAD = float(os.getenv("DYNAMIC_MAX_BOOK_SPREAD", "0.05"))
 DYNAMIC_ENTRY_COOLDOWN_S = float(os.getenv("DYNAMIC_ENTRY_COOLDOWN_S", "10.0"))
 
 # --- AVN-MAS Dynamic Price-Time Feasibility Matrix Parameters ---
 # Adaptive scaling with elapsed time t:
 # - t < 30s: Entry prohibited (noise & initial spread formation)
-# - 30s <= t < 90s: Move >= 2.0*sigma (~5.0 bps for BTC), max ask P_max = 0.72
-# - 90s <= t < 150s: Move >= 1.5*sigma (~5.3 bps for BTC), max ask P_max = 0.82
-# - 150s <= t < 210s: Move >= 1.2*sigma (~5.5 bps for BTC), max ask P_max = 0.88
-# - 210s <= t < 240s: Move >= 1.0*sigma (~5.8 bps for BTC), max ask P_max = 0.90
+# - 30s <= t < 90s: Move >= 2.0*sigma (~5.0 bps for BTC), max ask P_max = 0.70
+# - 90s <= t < 150s: Move >= 1.5*sigma (~5.3 bps for BTC), max ask P_max = 0.76
+# - 150s <= t < 240s: Move >= 1.2*sigma (~5.5 bps for BTC), max ask P_max = 0.80
 # - t >= 240s (remaining <= 60s): Prohibit new entries
 # Volatility normalization: sigma(t) = daily_vol * sqrt(t / 86400.0) * spot
 DYNAMIC_MIN_ELAPSED_S = float(os.getenv("DYNAMIC_MIN_ELAPSED_S", "30.0"))
@@ -95,6 +94,11 @@ DYNAMIC_MAX_ELAPSED_S = float(os.getenv("DYNAMIC_MAX_ELAPSED_S", "240.0"))
 TAKE_PROFIT_BID = float(os.getenv("TAKE_PROFIT_BID", "0.95"))
 TAKE_PROFIT_ASK = float(os.getenv("TAKE_PROFIT_ASK", "0.96"))
 STOP_LOSS_SALVAGE_MIN_BID = float(os.getenv("STOP_LOSS_SALVAGE_MIN_BID", "0.25"))
+
+# Urgent Late-Round Capital Salvage (remaining <= 45s)
+STOP_LOSS_URGENT_SALVAGE_MIN_BID = float(os.getenv("STOP_LOSS_URGENT_SALVAGE_MIN_BID", "0.20"))
+STOP_LOSS_URGENT_PERSISTENCE_SECONDS = float(os.getenv("STOP_LOSS_URGENT_PERSISTENCE_SECONDS", "3.0"))
+STOP_LOSS_URGENT_REMAINING_SECONDS = float(os.getenv("STOP_LOSS_URGENT_REMAINING_SECONDS", "45.0"))
 
 # --- Adverse Strike Stop-Loss Protection Filters ---
 # Hysteresis hurdle: Spot must cross strike against position by >= STOP_LOSS_MIN_ADVERSE_SIGMA * sigma(t)
@@ -134,14 +138,13 @@ def compute_dynamic_feasibility(
     sigma_t = vol * ((t / 86400.0) ** 0.5) * s
 
     if t < 90.0:
-        mult, max_ask = 2.0, 0.72
+        mult, max_ask = 2.0, 0.70
     elif t < 150.0:
-        mult, max_ask = 1.5, 0.82
-    elif t < 210.0:
-        mult, max_ask = 1.2, 0.88
-    else:  # 210.0 <= t < 240.0
-        mult, max_ask = 1.0, 0.90
+        mult, max_ask = 1.5, 0.76
+    else:  # 150.0 <= t < 240.0
+        mult, max_ask = 1.2, 0.80
 
+    max_ask = min(max_ask, DYNAMIC_MOMENTUM_MAX_ASK)
     min_move_usd = mult * sigma_t
     return True, min_move_usd, max_ask, sigma_t
 

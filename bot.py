@@ -1695,62 +1695,79 @@ class TWAPBot:
 
             # Spot must breach strike significantly past noise buffer
             is_adverse_move = (adverse_dist >= min_adverse_usd)
-
-            # Dual agreement with realized TWAP
-            require_twap = getattr(config, "STOP_LOSS_REQUIRE_TWAP", True)
-            twap_adverse = True
-            if require_twap:
-                twap_val = realized_twap
-                if twap_val is None and market.get("slot_start_ts"):
-                    twap_val, _ = self.cl_stream.compute_realized_twap(
-                        start_ts=market["slot_start_ts"], end_ts=time.time(), asset=slot.asset
-                    )
-                if twap_val is not None and twap_val > 0:
-                    twap_adverse = (twap_val < strike) if side == "UP" else (twap_val > strike)
-
-            # Catastrophic move override (>= 1.5 sigma_t)
-            is_catastrophic = (adverse_dist >= 1.5 * sigma_t)
-            is_adverse_confirmed = is_adverse_move and (twap_adverse or is_catastrophic)
-
-            salvage_min = float(getattr(config, "STOP_LOSS_SALVAGE_MIN_BID", 0.25))
-            persistence_s = float(getattr(config, "STOP_LOSS_PERSISTENCE_SECONDS", 10.0))
             now_ts = float(now) if now is not None else time.time()
 
-            if is_adverse_confirmed:
-                if pos.get("adverse_start_ts") is None:
-                    pos["adverse_start_ts"] = now_ts
-                adverse_duration = now_ts - float(pos["adverse_start_ts"])
-
-                if adverse_duration >= persistence_s or (is_catastrophic and persistence_s == 0.0):
-                    if best_bid is not None and float(best_bid) >= salvage_min:
-                        logger.warning(
-                            f"[{slot.asset.upper()} ADVERSE STOP-LOSS] Spot {spot:.2f} crossed strike {strike:.2f} against {side} "
-                            f"(adverse_dist={adverse_dist:.2f} >= min={min_adverse_usd:.2f}, "
-                            f"duration={adverse_duration:.1f}s >= {persistence_s:.1f}s, TWAP={realized_twap or 0:.2f}); "
-                            f"salvage bid {float(best_bid):.3f} >= {salvage_min:.2f} — triggering early capital preservation exit"
-                        )
-                        await self._exit_position_early(slot, market, float(best_bid), reason="stop_loss")
-                        return
-                    else:
-                        logger.info(
-                            f"[{slot.asset.upper()} ADVERSE CONFIRMED] Spot {spot:.2f} crossed strike {strike:.2f} against {side} "
-                            f"(dist={adverse_dist:.2f}, dur={adverse_duration:.1f}s), but salvage bid {best_bid} < {salvage_min:.2f} "
-                            f"(holding to preserve option value)"
-                        )
-                else:
-                    logger.info(
-                        f"[{slot.asset.upper()} ADVERSE MONITORING] Spot {spot:.2f} adverse vs strike {strike:.2f} "
-                        f"(dist={adverse_dist:.2f} >= min={min_adverse_usd:.2f}), "
-                        f"duration={adverse_duration:.1f}s < {persistence_s:.1f}s hurdle (filtering momentary noise)"
-                    )
-            else:
-                # Reset adverse persistence timer if spot recovered or is within noise buffer
+            if not is_adverse_move:
+                # Reset adverse persistence timer ONLY if spot genuinely recovered back into the noise buffer
                 if pos.get("adverse_start_ts") is not None:
                     logger.info(
                         f"[{slot.asset.upper()} ADVERSE RESET] Spot {spot:.2f} recovered towards strike {strike:.2f} "
                         f"(dist={adverse_dist:.2f} < min={min_adverse_usd:.2f}) — resetting stop-loss persistence timer"
                     )
                     pos["adverse_start_ts"] = None
+            else:
+                # Spot is adversely across strike beyond noise hurdle: track/continue persistence timer
+                if pos.get("adverse_start_ts") is None:
+                    pos["adverse_start_ts"] = now_ts
+                adverse_duration = now_ts - float(pos["adverse_start_ts"])
+
+                # Dual agreement with realized TWAP (only enforced in early/mid round; in late round, spot governs expiry)
+                require_twap = getattr(config, "STOP_LOSS_REQUIRE_TWAP", True)
+                twap_adverse = True
+                if require_twap and (elapsed_s is not None and elapsed_s < 180.0 and remaining_s > 120.0):
+                    twap_val = realized_twap
+                    if twap_val is None and market.get("slot_start_ts"):
+                        twap_val, _ = self.cl_stream.compute_realized_twap(
+                            start_ts=market["slot_start_ts"], end_ts=time.time(), asset=slot.asset
+                        )
+                    if twap_val is not None and twap_val > 0:
+                        twap_adverse = (twap_val < strike) if side == "UP" else (twap_val > strike)
+
+                # Catastrophic move override (>= 1.5 sigma_t)
+                is_catastrophic = (adverse_dist >= 1.5 * sigma_t)
+                is_adverse_confirmed = (twap_adverse or is_catastrophic)
+
+                # Urgent salvage check in final seconds of round
+                urgent_remaining = float(getattr(config, "STOP_LOSS_URGENT_REMAINING_SECONDS", 45.0))
+                is_urgent = (remaining_s <= urgent_remaining)
+
+                if is_urgent:
+                    salvage_min = float(getattr(config, "STOP_LOSS_URGENT_SALVAGE_MIN_BID", 0.20))
+                    persistence_s = float(getattr(config, "STOP_LOSS_URGENT_PERSISTENCE_SECONDS", 3.0))
+                else:
+                    salvage_min = float(getattr(config, "STOP_LOSS_SALVAGE_MIN_BID", 0.25))
+                    persistence_s = float(getattr(config, "STOP_LOSS_PERSISTENCE_SECONDS", 10.0))
+
+                if is_adverse_confirmed:
+                    if adverse_duration >= persistence_s or (is_catastrophic and persistence_s == 0.0):
+                        if best_bid is not None and float(best_bid) >= salvage_min:
+                            exit_reason = "urgent_stop_loss" if is_urgent else "stop_loss"
+                            logger.warning(
+                                f"[{slot.asset.upper()} {'URGENT ' if is_urgent else ''}ADVERSE STOP-LOSS] Spot {spot:.2f} crossed strike {strike:.2f} against {side} "
+                                f"(adverse_dist={adverse_dist:.2f} >= min={min_adverse_usd:.2f}, "
+                                f"duration={adverse_duration:.1f}s >= {persistence_s:.1f}s, remaining={remaining_s:.1f}s, TWAP={realized_twap or 0:.2f}); "
+                                f"salvage bid {float(best_bid):.3f} >= {salvage_min:.2f} — triggering early capital preservation exit"
+                            )
+                            await self._exit_position_early(slot, market, float(best_bid), reason=exit_reason)
+                            return
+                        else:
+                            logger.info(
+                                f"[{slot.asset.upper()} ADVERSE CONFIRMED] Spot {spot:.2f} crossed strike {strike:.2f} against {side} "
+                                f"(dist={adverse_dist:.2f}, dur={adverse_duration:.1f}s), but salvage bid {best_bid} < {salvage_min:.2f} "
+                                f"(holding to preserve option value)"
+                            )
+                    else:
+                        logger.info(
+                            f"[{slot.asset.upper()} ADVERSE MONITORING] Spot {spot:.2f} adverse vs strike {strike:.2f} "
+                            f"(dist={adverse_dist:.2f} >= min={min_adverse_usd:.2f}), "
+                            f"duration={adverse_duration:.1f}s < {persistence_s:.1f}s hurdle (filtering momentary noise)"
+                        )
+                else:
+                    logger.info(
+                        f"[{slot.asset.upper()} ADVERSE UNCONFIRMED] Spot {spot:.2f} adverse vs strike {strike:.2f} "
+                        f"(dist={adverse_dist:.2f} >= min={min_adverse_usd:.2f}), but TWAP has not confirmed and not catastrophic "
+                        f"(dur={adverse_duration:.1f}s, continuing to monitor)"
+                    )
 
         # 3) Legacy H-005 Stop-loss vs entry (mid only when spread is sane) - applies only to legacy H-005
         is_legacy_h005 = pos.get("strategy") in ("H-005_MOMENTUM", "H-005", "LATE_MOMENTUM", "MOMENTUM")

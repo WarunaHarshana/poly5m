@@ -270,38 +270,38 @@ class TestDynamicSimulation(unittest.IsolatedAsyncioTestCase):
         allowed, min_move, max_ask, _ = config.compute_dynamic_feasibility(29.9, spot, daily_vol)
         self.assertFalse(allowed)
 
-        # Tier 1: 30s <= t < 90s: mult=2.0, max_ask=0.72
+        # Tier 1: 30s <= t < 90s: mult=2.0, max_ask=0.70
         allowed, min_move, max_ask, sigma_t = config.compute_dynamic_feasibility(30.0, spot, daily_vol)
         self.assertTrue(allowed)
-        self.assertEqual(max_ask, 0.72)
+        self.assertEqual(max_ask, 0.70)
         expected_sigma_30 = daily_vol * ((30.0 / 86400.0) ** 0.5) * spot
         self.assertAlmostEqual(sigma_t, expected_sigma_30, places=4)
         self.assertAlmostEqual(min_move, 2.0 * expected_sigma_30, places=4)
 
         allowed, min_move, max_ask, _ = config.compute_dynamic_feasibility(89.9, spot, daily_vol)
         self.assertTrue(allowed)
-        self.assertEqual(max_ask, 0.72)
+        self.assertEqual(max_ask, 0.70)
 
-        # Tier 2: 90s <= t < 150s: mult=1.5, max_ask=0.82
+        # Tier 2: 90s <= t < 150s: mult=1.5, max_ask=0.76
         allowed, min_move, max_ask, sigma_t = config.compute_dynamic_feasibility(90.0, spot, daily_vol)
         self.assertTrue(allowed)
-        self.assertEqual(max_ask, 0.82)
+        self.assertEqual(max_ask, 0.76)
         expected_sigma_90 = daily_vol * ((90.0 / 86400.0) ** 0.5) * spot
         self.assertAlmostEqual(min_move, 1.5 * expected_sigma_90, places=4)
 
-        # Tier 3: 150s <= t < 210s: mult=1.2, max_ask=0.88
+        # Tier 3: 150s <= t < 240s: mult=1.2, max_ask=0.80
         allowed, min_move, max_ask, sigma_t = config.compute_dynamic_feasibility(150.0, spot, daily_vol)
         self.assertTrue(allowed)
-        self.assertEqual(max_ask, 0.88)
+        self.assertEqual(max_ask, 0.80)
         expected_sigma_150 = daily_vol * ((150.0 / 86400.0) ** 0.5) * spot
         self.assertAlmostEqual(min_move, 1.2 * expected_sigma_150, places=4)
 
-        # Tier 4: 210s <= t < 240s: mult=1.0, max_ask=0.90
+        # Tier 3 (continued at 210s): mult=1.2, max_ask=0.80
         allowed, min_move, max_ask, sigma_t = config.compute_dynamic_feasibility(210.0, spot, daily_vol)
         self.assertTrue(allowed)
-        self.assertEqual(max_ask, 0.90)
+        self.assertEqual(max_ask, 0.80)
         expected_sigma_210 = daily_vol * ((210.0 / 86400.0) ** 0.5) * spot
-        self.assertAlmostEqual(min_move, 1.0 * expected_sigma_210, places=4)
+        self.assertAlmostEqual(min_move, 1.2 * expected_sigma_210, places=4)
 
         # Boundary: t >= 240s prohibited
         allowed, min_move, max_ask, _ = config.compute_dynamic_feasibility(240.0, spot, daily_vol)
@@ -1555,6 +1555,173 @@ class TestDynamicSimulation(unittest.IsolatedAsyncioTestCase):
         finally:
             config.TRAILING_PROFIT_ENABLED = old_trailing
             config.TRAILING_BREAKEVEN_ENABLED = old_breakeven
+
+
+    async def test_dynamic_feasibility_caps_at_80_cents(self):
+        """Verify that dynamic feasibility never allows ask > 0.80 across any time tier."""
+        spot = 90000.0
+        daily_vol = 0.0106
+        for t in [30.0, 60.0, 89.9, 90.0, 120.0, 149.9, 150.0, 180.0, 210.0, 239.9]:
+            allowed, _, max_ask, _ = config.compute_dynamic_feasibility(t, spot, daily_vol)
+            self.assertTrue(allowed)
+            self.assertLessEqual(max_ask, 0.80)
+            self.assertLessEqual(max_ask, config.DYNAMIC_MOMENTUM_MAX_ASK)
+
+    async def test_stop_loss_triggers_when_spot_adverse_even_if_twap_lags(self):
+        """In late round (t >= 180s, remaining <= 120s), spot governs expiry so stop-loss fires even if TWAP lags."""
+        asset = "btc"
+        now = time.time()
+        slot_start = now - 240.0  # t=240s elapsed, 60s remaining
+
+        market = {
+            "slug": "btc-usd-5m-test-twap-lag-bypass",
+            "slot_start_ts": slot_start,
+            "start_time": slot_start,
+            "end_ts": slot_start + 300.0,
+            "end_time": slot_start + 300.0,
+            "strike_price": 90000.0,
+            "tokens": {"UP": "tok_up_btc", "DOWN": "tok_down_btc"},
+            "fee_rate": 0.0,
+        }
+
+        slot = self.bot.slots[asset]
+        slot.market = market
+        slot.strike = 90000.0
+        slot.position = {
+            "strategy": "JEV_DYNAMIC_MOMENTUM",
+            "side": "UP",
+            "token_id": "tok_up_btc",
+            "price": 0.75,
+            "shares": 10.0,
+            "cost_usd": 7.50,
+            "strike": 90000.0,
+        }
+
+        # Spot was up early, so TWAP is lagging high (~90100 > strike 90000)
+        self.bot.cl_stream._record(slot_start, 90000.0, asset=asset)
+        self.bot.cl_stream._record(slot_start + 60.0, 90150.0, asset=asset)
+        self.bot.cl_stream._record(slot_start + 180.0, 90150.0, asset=asset)
+        # Spot crashes to 89920 at t=240s (-80 below strike)
+        self.bot.cl_stream._record(now, 89920.0, asset=asset)
+        self.bot.book_stream._apply_update("tok_up_btc", bid=0.30, ask=0.34, bid_sz=500, ask_sz=500)
+
+        # Tick 1: Starts adverse timer
+        await self.bot._tick_asset(slot, now)
+        self.assertIsNotNone(slot.position)
+        self.assertIsNotNone(slot.position.get("adverse_start_ts"))
+
+        # Tick 2: 11 seconds later, spot is still down at 89910. Stop loss must fire despite high TWAP!
+        now2 = now + 11.0
+        self.bot.cl_stream._record(now2, 89910.0, asset=asset)
+        await self.bot._tick_asset(slot, now2)
+
+        self.assertIsNone(slot.position)
+        self.assertIn(market["slug"], self.bot._slot_done)
+
+    async def test_stop_loss_timer_does_not_reset_on_minor_bounce_below_strike(self):
+        """Minor bounces while spot is still deep in adverse territory must NOT reset the persistence timer."""
+        asset = "btc"
+        now = time.time()
+        slot_start = now - 240.0
+
+        market = {
+            "slug": "btc-usd-5m-test-bounce-retention",
+            "slot_start_ts": slot_start,
+            "start_time": slot_start,
+            "end_ts": slot_start + 300.0,
+            "end_time": slot_start + 300.0,
+            "strike_price": 90000.0,
+            "tokens": {"UP": "tok_up_btc", "DOWN": "tok_down_btc"},
+            "fee_rate": 0.0,
+        }
+
+        slot = self.bot.slots[asset]
+        slot.market = market
+        slot.strike = 90000.0
+        slot.position = {
+            "strategy": "JEV_DYNAMIC_MOMENTUM",
+            "side": "UP",
+            "token_id": "tok_up_btc",
+            "price": 0.75,
+            "shares": 10.0,
+            "cost_usd": 7.50,
+            "strike": 90000.0,
+        }
+
+        # Spot crashes to 89925 (-75 below strike)
+        self.bot.cl_stream._record(now, 89925.0, asset=asset)
+        self.bot.book_stream._apply_update("tok_up_btc", bid=0.30, ask=0.34, bid_sz=500, ask_sz=500)
+
+        # Tick 1: Timer starts
+        await self.bot._tick_asset(slot, now)
+        start_ts = slot.position.get("adverse_start_ts")
+        self.assertIsNotNone(start_ts)
+
+        # Tick 2: 5s later, spot bounces slightly to 89940 (-60 below strike). Still adverse!
+        now2 = now + 5.0
+        self.bot.cl_stream._record(now2, 89940.0, asset=asset)
+        await self.bot._tick_asset(slot, now2)
+
+        # Timer must NOT have been wiped to None!
+        self.assertIsNotNone(slot.position)
+        self.assertEqual(slot.position.get("adverse_start_ts"), start_ts)
+
+        # Tick 3: 11s from start, spot is 89935. Timer has completed >= 10s -> early exit triggers!
+        now3 = now + 11.0
+        self.bot.cl_stream._record(now3, 89935.0, asset=asset)
+        await self.bot._tick_asset(slot, now3)
+
+        self.assertIsNone(slot.position)
+        self.assertIn(market["slug"], self.bot._slot_done)
+
+    async def test_late_round_urgent_salvage_in_final_45s(self):
+        """In final 45s, adverse spot triggers urgent salvage exit after only 3s if salvage bid >= 0.20."""
+        asset = "btc"
+        now = time.time()
+        slot_start = now - 260.0  # 260s elapsed, 40s remaining (<= 45s)
+
+        market = {
+            "slug": "btc-usd-5m-test-urgent-salvage",
+            "slot_start_ts": slot_start,
+            "start_time": slot_start,
+            "end_ts": slot_start + 300.0,
+            "end_time": slot_start + 300.0,
+            "strike_price": 90000.0,
+            "tokens": {"UP": "tok_up_btc", "DOWN": "tok_down_btc"},
+            "fee_rate": 0.0,
+        }
+
+        slot = self.bot.slots[asset]
+        slot.market = market
+        slot.strike = 90000.0
+        slot.position = {
+            "strategy": "JEV_DYNAMIC_MOMENTUM",
+            "side": "UP",
+            "token_id": "tok_up_btc",
+            "price": 0.75,
+            "shares": 10.0,
+            "cost_usd": 7.50,
+            "strike": 90000.0,
+        }
+
+        # Spot is adverse at 89910 (-90 below strike)
+        self.bot.cl_stream._record(now, 89910.0, asset=asset)
+        # Bid is 0.22 (below regular 0.25 salvage min, but >= 0.20 urgent salvage min!)
+        self.bot.book_stream._apply_update("tok_up_btc", bid=0.22, ask=0.26, bid_sz=500, ask_sz=500)
+
+        # Tick 1: Starts adverse timer
+        await self.bot._tick_asset(slot, now)
+        self.assertIsNotNone(slot.position)
+        self.assertIsNotNone(slot.position.get("adverse_start_ts"))
+
+        # Tick 2: 3.5s later (>= 3.0s urgent persistence hurdle) -> triggers urgent salvage!
+        now2 = now + 3.5
+        self.bot.cl_stream._record(now2, 89910.0, asset=asset)
+        await self.bot._tick_asset(slot, now2)
+
+        # Successfully salvages capital instead of taking total loss
+        self.assertIsNone(slot.position)
+        self.assertIn(market["slug"], self.bot._slot_done)
 
 
 if __name__ == "__main__":
