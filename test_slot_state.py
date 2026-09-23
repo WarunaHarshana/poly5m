@@ -90,3 +90,26 @@ def test_reset_trade_data(monkeypatch):
     assert b.risk.consecutive_losses == 0
     assert b.risk.trades_today == 0
 
+
+def test_restored_strike_slug_validation():
+    bot = TWAPBot()
+    saved = {
+        "slot_ts": 1790184000,
+        "assets": {
+            "eth": {
+                "slug": "eth-updown-5m-1790184000",
+                "strike": 2661.1,
+                "slot_ts": 1790184000,
+            }
+        }
+    }
+
+    # Stale slug should be rejected
+    res_stale = bot._restored_strike(saved, "eth", "eth-updown-5m-1790184300", 1790184300)
+    assert res_stale is None, "Should reject strike when current slug does not match saved slug"
+
+    # Matching slug and slot_ts should be restored
+    res_valid = bot._restored_strike(saved, "eth", "eth-updown-5m-1790184000", 1790184000)
+    assert res_valid == 2661.1, "Should restore strike when current slug matches saved slug"
+
+

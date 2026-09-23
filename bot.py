@@ -172,6 +172,8 @@ class TWAPBot:
         entry = dict(assets_map.get(coin) or {})
         if slug:
             entry["slug"] = slug
+        if slot_ts is not None:
+            entry["slot_ts"] = int(slot_ts)
         if strike is not None:
             entry["strike"] = float(strike)
         elif entry.get("strike") is None:
@@ -226,12 +228,14 @@ class TWAPBot:
                 logger.error(f"   Failed to save pruned trades: {e}")
             logger.info("=" * 70)
 
-        reset_flag = os.getenv("RESET_TRADE_DATA", "false").strip().lower() in ("true", "1", "yes")
-        if not reset_flag:
+        reset_marker = config.STATE_DIR / ".clean_reset_done_v2"
+        env_reset = os.getenv("RESET_TRADE_DATA", "false").strip().lower() in ("true", "1", "yes")
+        should_reset = env_reset or not reset_marker.exists()
+        if not should_reset:
             return
 
         logger.info("=" * 70)
-        logger.info("🧹 RESET_TRADE_DATA=true: archiving and resetting historical trades...")
+        logger.info("🧹 Clean reset: archiving and resetting historical trades...")
         ts = int(time.time())
 
         # 1. Archive & reset trades.json
@@ -279,6 +283,10 @@ class TWAPBot:
         self.risk.trades_today = 0
         self.risk.save_state()
         logger.info(f"   Risk state reset to STARTING_BANKROLL (${config.STARTING_BANKROLL:.2f})")
+        try:
+            reset_marker.touch()
+        except Exception:
+            pass
         logger.info("=" * 70)
 
     def _reconcile_paper_blotter(self) -> None:
@@ -327,7 +335,22 @@ class TWAPBot:
         entry = assets_map.get(asset) or {}
         if not entry and asset == "btc":
             if saved.get("slug") == slug or int(saved.get("slot_ts") or 0) == int(slot_ts):
-                entry = {"strike": saved.get("strike")}
+                entry = {"strike": saved.get("strike"), "slug": saved.get("slug"), "slot_ts": saved.get("slot_ts")}
+
+        # Critical guard: Stored strike MUST belong to the exact same slot slug and slot_ts!
+        entry_slug = entry.get("slug")
+        entry_ts = entry.get("slot_ts") or saved.get("slot_ts")
+        if slug and entry_slug and entry_slug != slug:
+            logger.warning(
+                f"[{asset.upper()}] Stored strike slug '{entry_slug}' != current slug '{slug}'; rejecting stale strike."
+            )
+            return None
+        if slot_ts and entry_ts and int(entry_ts) != int(slot_ts):
+            logger.warning(
+                f"[{asset.upper()}] Stored strike slot_ts {entry_ts} != current slot_ts {slot_ts}; rejecting stale strike."
+            )
+            return None
+
         raw = entry.get("strike")
         try:
             val = float(raw)
