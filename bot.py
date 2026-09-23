@@ -60,6 +60,39 @@ def _engine_for(params: config.AssetParams) -> TWAPEngine:
     )
 
 
+def _extract_slot_start_ts(market: dict | None = None, slot_str: str | None = None) -> float | None:
+    """Extract 5-minute round start Unix timestamp from market or slug."""
+    if isinstance(market, dict):
+        st = market.get("slot_start_ts") or market.get("start_time")
+        if st is not None:
+            try:
+                return float(st)
+            except Exception:
+                pass
+        slug = market.get("slug")
+        if slug and isinstance(slug, str) and "-" in slug:
+            try:
+                return float(slug.rsplit("-", 1)[-1])
+            except Exception:
+                pass
+    if slot_str and isinstance(slot_str, str) and "-" in slot_str:
+        try:
+            return float(slot_str.rsplit("-", 1)[-1])
+        except Exception:
+            pass
+    return None
+
+
+def _format_window_time(elapsed_s: float | None) -> str | None:
+    """Format elapsed seconds within the 5m round into human-readable window timing."""
+    if elapsed_s is None:
+        return None
+    el = max(0.0, min(300.0, float(elapsed_s)))
+    m = int(el) // 60
+    s = int(el) % 60
+    return f"t={int(el)}s ({m:02d}:{s:02d})"
+
+
 @dataclass
 class CoinSlot:
     """Per-coin state for one 5-minute window."""
@@ -904,12 +937,16 @@ class TWAPBot:
                             logger.warning(f"[{tag}] Failed to cancel live order {ro['order_id']}: {e}")
                     slot.resting_order = None
                 elif is_paper_fill or (config.MODE == "live" and is_clob_fill):
+                    st_ts = _extract_slot_start_ts(market, ro.get("slot"))
+                    now_fill = time.time()
+                    el_s = max(0.0, min(300.0, round(now_fill - st_ts, 1))) if st_ts else None
                     slot.position = {
                         "asset": asset,
                         "slot": ro["slot"],
                         "strategy": "JEV_DYNAMIC_MAKER",
                         "side": ro["side"],
                         "token_id": ro["token_id"],
+                        "opp_token_id": (market.get("tokens") or {}).get("DOWN" if ro["side"] == "UP" else "UP"),
                         "price": ro["price"],
                         "shares": ro["shares"],
                         "cost_usd": ro["cost_usd"],
@@ -918,7 +955,11 @@ class TWAPBot:
                         "fee": 0.0,
                         "rebate": ro.get("rebate", 0.0),
                         "order_id": ro.get("order_id"),
-                        "entry_time": ro.get("placed_at", time.time()),
+                        "slot_start_ts": st_ts,
+                        "entry_time": now_fill,
+                        "entry_time_utc": datetime.now(timezone.utc).isoformat(),
+                        "entry_elapsed_s": el_s,
+                        "entry_window_time": _format_window_time(el_s),
                         "opened_at": time.time(),
                         "strike": strike,
                         "official": False,
@@ -1231,12 +1272,16 @@ class TWAPBot:
                             logger.warning(f"[{tag}] Failed to cancel live order {ro['order_id']}: {e}")
                     slot.resting_order = None
                 elif is_paper_fill or (config.MODE == "live" and is_clob_fill):
+                    st_ts = _extract_slot_start_ts(market, ro.get("slot"))
+                    now_fill = time.time()
+                    el_s = max(0.0, min(300.0, round(now_fill - st_ts, 1))) if st_ts else None
                     slot.position = {
                         "asset": asset,
                         "slot": ro["slot"],
                         "strategy": "MIDBAND_MAKER",
                         "side": ro["side"],
                         "token_id": ro["token_id"],
+                        "opp_token_id": (market.get("tokens") or {}).get("DOWN" if ro["side"] == "UP" else "UP"),
                         "price": ro["price"],
                         "shares": ro["shares"],
                         "cost_usd": ro["cost_usd"],
@@ -1245,7 +1290,11 @@ class TWAPBot:
                         "fee": 0.0,
                         "rebate": ro.get("rebate", 0.0),
                         "order_id": ro.get("order_id"),
-                        "entry_time": ro.get("placed_at", time.time()),
+                        "slot_start_ts": st_ts,
+                        "entry_time": now_fill,
+                        "entry_time_utc": datetime.now(timezone.utc).isoformat(),
+                        "entry_elapsed_s": el_s,
+                        "entry_window_time": _format_window_time(el_s),
                         "opened_at": time.time(),
                         "strike": strike,
                         "official": False,
@@ -1310,12 +1359,16 @@ class TWAPBot:
                 )
 
                 if is_paper_fill or (config.MODE == "live" and is_clob_fill):
+                    st_ts = _extract_slot_start_ts(market, ro.get("slot"))
+                    now_fill = time.time()
+                    el_s = max(0.0, min(300.0, round(now_fill - st_ts, 1))) if st_ts else None
                     slot.position = {
                         "asset": asset,
                         "slot": ro["slot"],
                         "strategy": strategy_tag,
                         "side": ro["side"],
                         "token_id": ro["token_id"],
+                        "opp_token_id": (market.get("tokens") or {}).get("DOWN" if ro["side"] == "UP" else "UP"),
                         "price": ro["price"],
                         "shares": ro["shares"],
                         "cost_usd": ro["cost_usd"],
@@ -1323,7 +1376,11 @@ class TWAPBot:
                         "prob": ro["prob"],
                         "fee": 0.0,
                         "rebate": ro["rebate"],
-                        "entry_time": time.time(),
+                        "slot_start_ts": st_ts,
+                        "entry_time": now_fill,
+                        "entry_time_utc": datetime.now(timezone.utc).isoformat(),
+                        "entry_elapsed_s": el_s,
+                        "entry_window_time": _format_window_time(el_s),
                         "order_id": ro["order_id"],
                         "jev": ro.get("jev"),
                     }
@@ -1458,6 +1515,13 @@ class TWAPBot:
                 logger.error(f"Live taker order placement failed: {e}")
                 return
 
+        st_ts = _extract_slot_start_ts(market)
+        now_fill = time.time()
+        el_s = max(0.0, min(300.0, round(now_fill - st_ts, 1))) if st_ts else None
+        entry_window_time = _format_window_time(el_s)
+        entry_time_utc = datetime.now(timezone.utc).isoformat()
+        total_cost = round(cost_usd + fee_usd, 4)
+
         journal_write(
             "paper_fill" if is_paper else "fill",
             strategy=strategy_tag,
@@ -1465,11 +1529,16 @@ class TWAPBot:
             price=ask,
             shares=shares,
             cost_usd=cost_usd,
+            fee=fee_usd,
+            total_cost=total_cost,
             slot=market.get("slug"),
             asset=slot.asset,
             order_id=order_id,
             z_score=signal.z_score,
             edge=signal.edge_net,
+            entry_time_utc=entry_time_utc,
+            entry_elapsed_s=el_s,
+            entry_window_time=entry_window_time,
             jev=jev_decision.to_dict() if jev_decision else None,
         )
 
@@ -1479,15 +1548,21 @@ class TWAPBot:
             "strategy": strategy_tag,
             "side": signal.side,
             "token_id": token_id,
+            "opp_token_id": (market.get("tokens") or {}).get("DOWN" if signal.side == "UP" else "UP"),
             "price": ask,
             "shares": shares,
             "cost_usd": cost_usd,
+            "fee": fee_usd,
+            "total_cost": total_cost,
             "strike": slot.strike or signal.s_0,
             "z_score": signal.z_score,
             "prob": signal.model_prob,
-            "fee": fee_usd,
             "rebate": 0.0,
-            "entry_time": time.time(),
+            "slot_start_ts": st_ts,
+            "entry_time": now_fill,
+            "entry_time_utc": entry_time_utc,
+            "entry_elapsed_s": el_s,
+            "entry_window_time": entry_window_time,
             "order_id": order_id,
             "jev": jev_decision.to_dict() if jev_decision else None,
         }
@@ -1576,7 +1651,7 @@ class TWAPBot:
         side = pos["side"]
         opp_pos_side = "DOWN" if side == "UP" else "UP"
         token_id = pos.get("token_id") or tokens.get(side)
-        opp_token_id = tokens.get(opp_pos_side)
+        opp_token_id = tokens.get(opp_pos_side) or pos.get("opp_token_id")
         best_bid = None
         best_ask = None
         if token_id:
@@ -1740,6 +1815,14 @@ class TWAPBot:
 
                 if is_adverse_confirmed:
                     if adverse_duration >= persistence_s or (is_catastrophic and persistence_s == 0.0):
+                        if (best_bid is None or float(best_bid) < salvage_min) and opp_token_id:
+                            bk_opp = self.pub_client.get_order_book(opp_token_id)
+                            _, opp_ask = extract_best_bid_ask(bk_opp)
+                            if opp_ask is not None and 0.0 < opp_ask < 1.0:
+                                implied = round(1.0 - opp_ask, 4)
+                                if best_bid is None or implied > float(best_bid):
+                                    best_bid = implied
+
                         if best_bid is not None and float(best_bid) >= salvage_min:
                             exit_reason = "urgent_stop_loss" if is_urgent else "stop_loss"
                             logger.warning(
@@ -1974,8 +2057,29 @@ class TWAPBot:
         )
         logger.info("=" * 60)
 
+        now_ts = time.time()
+        slot_start_ts = _extract_slot_start_ts(market, pos.get("slot")) or pos.get("slot_start_ts")
+        exit_elapsed_s = max(0.0, min(300.0, round(now_ts - float(slot_start_ts), 1))) if slot_start_ts else None
+        exit_window_time = _format_window_time(exit_elapsed_s)
+        exit_time_utc = datetime.now(timezone.utc).isoformat()
+
+        entry_time_utc = pos.get("entry_time_utc") or (
+            datetime.fromtimestamp(pos["entry_time"], tz=timezone.utc).isoformat()
+            if pos.get("entry_time") else None
+        )
+        entry_elapsed_s = pos.get("entry_elapsed_s")
+        entry_window_time = pos.get("entry_window_time")
+        if entry_elapsed_s is None and slot_start_ts and pos.get("entry_time"):
+            try:
+                entry_elapsed_s = max(0.0, min(300.0, round(float(pos["entry_time"]) - float(slot_start_ts), 1)))
+                entry_window_time = _format_window_time(entry_elapsed_s)
+            except Exception:
+                pass
+
+        total_cost = round(cost + fee + exit_fee, 4)
+
         record = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": exit_time_utc,
             "asset": slot.asset,
             "slot": market["slug"],
             "strategy": pos.get("strategy", "H-005_MOMENTUM"),
@@ -1983,10 +2087,17 @@ class TWAPBot:
             "price": pos["price"],
             "exit_price": exit_price,
             "exit_reason": reason,
+            "entry_time_utc": entry_time_utc,
+            "exit_time_utc": exit_time_utc,
+            "entry_elapsed_s": entry_elapsed_s,
+            "entry_window_time": entry_window_time,
+            "exit_elapsed_s": exit_elapsed_s,
+            "exit_window_time": exit_window_time,
             "shares": shares,
             "cost_usd": cost,
             "fee": fee,
             "exit_fee": round(exit_fee, 4),
+            "total_cost": total_cost,
             "rebate": rebate,
             "hedge_placed": bool(pos.get("hedge_placed")),
             "hedge_side": pos.get("hedge_side"),
@@ -2008,10 +2119,23 @@ class TWAPBot:
             asset=slot.asset,
             strategy=record.get("strategy"),
             side=record.get("side"),
+            outcome=f"EARLY_EXIT_{reason}",
             won=record.get("won"),
             pnl=record.get("pnl"),
             bankroll=record.get("bankroll"),
+            settlement_source=record.get("settlement_source"),
             early_exit=True,
+            exit_price=exit_price,
+            exit_reason=reason,
+            entry_time_utc=entry_time_utc,
+            exit_time_utc=exit_time_utc,
+            entry_elapsed_s=entry_elapsed_s,
+            entry_window_time=entry_window_time,
+            exit_elapsed_s=exit_elapsed_s,
+            exit_window_time=exit_window_time,
+            fee=round(fee + exit_fee, 4),
+            total_cost=total_cost,
+            jev=pos.get("jev"),
         )
         self._save_trade_record(record)
 
@@ -2130,16 +2254,48 @@ class TWAPBot:
         logger.info(f"   Trade PnL: ${pnl:+.2f} | New Bankroll: ${self.risk.bankroll:.2f}")
         logger.info("=" * 60)
 
+        exit_price = 1.0 if won else 0.0
+        exit_reason = "settlement_won" if won else "settlement_lost"
+        exit_time_utc = datetime.now(timezone.utc).isoformat()
+        exit_elapsed_s = 300.0
+        exit_window_time = "t=300s (05:00 - expiry)"
+
+        slot_start_ts = _extract_slot_start_ts(market, pos.get("slot")) or pos.get("slot_start_ts")
+        entry_time_utc = pos.get("entry_time_utc") or (
+            datetime.fromtimestamp(pos["entry_time"], tz=timezone.utc).isoformat()
+            if pos.get("entry_time") else None
+        )
+        entry_elapsed_s = pos.get("entry_elapsed_s")
+        entry_window_time = pos.get("entry_window_time")
+        if entry_elapsed_s is None and slot_start_ts and pos.get("entry_time"):
+            try:
+                entry_elapsed_s = max(0.0, min(300.0, round(float(pos["entry_time"]) - float(slot_start_ts), 1)))
+                entry_window_time = _format_window_time(entry_elapsed_s)
+            except Exception:
+                pass
+
+        cost_usd = float(pos.get("cost_usd") or 0.0)
+        total_cost = round(cost_usd + float(fee), 4)
+
         record = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": exit_time_utc,
             "asset": asset,
             "slot": market.get("slug"),
             "strategy": strategy_name,
             "side": pos.get("side"),
             "price": pos.get("price"),
+            "exit_price": exit_price,
+            "exit_reason": exit_reason,
+            "entry_time_utc": entry_time_utc,
+            "exit_time_utc": exit_time_utc,
+            "entry_elapsed_s": entry_elapsed_s,
+            "entry_window_time": entry_window_time,
+            "exit_elapsed_s": exit_elapsed_s,
+            "exit_window_time": exit_window_time,
             "shares": pos.get("shares"),
-            "cost_usd": pos.get("cost_usd"),
+            "cost_usd": cost_usd,
             "fee": fee,
+            "total_cost": total_cost,
             "rebate": rebate,
             "z_score": pos.get("z_score"),
             "strike": strike,
@@ -2165,6 +2321,16 @@ class TWAPBot:
             bankroll=round(self.risk.bankroll, 2),
             settlement_source=resolution.get("source"),
             early_exit=False,
+            exit_price=exit_price,
+            exit_reason=exit_reason,
+            entry_time_utc=entry_time_utc,
+            exit_time_utc=exit_time_utc,
+            entry_elapsed_s=entry_elapsed_s,
+            entry_window_time=entry_window_time,
+            exit_elapsed_s=exit_elapsed_s,
+            exit_window_time=exit_window_time,
+            fee=fee,
+            total_cost=total_cost,
             jev=pos.get("jev"),
         )
         self._save_trade_record(record)

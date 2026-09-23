@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, MagicMock
 import config
 from bot import TWAPBot
 from jev_advisor import JevDecision
+from http_api import load_trades
 
 
 class TestDynamicSimulation(unittest.IsolatedAsyncioTestCase):
@@ -161,31 +162,31 @@ class TestDynamicSimulation(unittest.IsolatedAsyncioTestCase):
 
     async def test_dynamic_veto_flow(self):
         """Simulate dynamic candidate vetoed by Jev guardian."""
-        asset = "doge"
+        asset = "btc"
         now = time.time()
         slot_start = now - 180.0
 
         market = {
-            "slug": "doge-usd-5m-test-dynamic-veto",
+            "slug": "btc-usd-5m-test-dynamic-veto",
             "slot_start_ts": slot_start,
             "start_time": slot_start,
             "end_ts": slot_start + 300.0,
             "end_time": slot_start + 300.0,
-            "strike_price": 0.250,
-            "tokens": {"UP": "tok_up_doge", "DOWN": "tok_down_doge"},
+            "strike_price": 85000.0,
+            "tokens": {"UP": "tok_up_btc", "DOWN": "tok_down_btc"},
             "fee_rate": 0.0,
         }
 
         slot = self.bot.slots[asset]
         slot.market = market
-        slot.strike = 0.250
+        slot.strike = 85000.0
 
-        self.bot.cl_stream._record(slot_start, 0.250, asset=asset)
-        self.bot.cl_stream._record(slot_start + 60.0, 0.255, asset=asset)
-        self.bot.cl_stream._record(slot_start + 120.0, 0.248, asset=asset)
-        self.bot.cl_stream._record(now, 0.256, asset=asset)
+        self.bot.cl_stream._record(slot_start, 85000.0, asset=asset)
+        self.bot.cl_stream._record(slot_start + 60.0, 85050.0, asset=asset)
+        self.bot.cl_stream._record(slot_start + 120.0, 84980.0, asset=asset)
+        self.bot.cl_stream._record(now, 85060.0, asset=asset)
 
-        self.bot.book_stream._apply_update("tok_up_doge", bid=0.68, ask=0.72, bid_sz=500, ask_sz=500)
+        self.bot.book_stream._apply_update("tok_up_btc", bid=0.68, ask=0.72, bid_sz=500, ask_sz=500)
 
         # Mock Jev decision: Abstain / Veto
         mock_jev_decision = JevDecision(
@@ -1722,6 +1723,104 @@ class TestDynamicSimulation(unittest.IsolatedAsyncioTestCase):
         # Successfully salvages capital instead of taking total loss
         self.assertIsNone(slot.position)
         self.assertIn(market["slug"], self.bot._slot_done)
+
+    async def test_window_timing_and_exit_records(self):
+        """Verify entry_window_time, exit_window_time, exit_price, exit_reason and fees in records."""
+        asset = "btc"
+        now = time.time()
+        slot_start = now - 250.0
+
+        market = {
+            "slug": "btc-usd-5m-test-timing-audit",
+            "slot_start_ts": slot_start,
+            "start_time": slot_start,
+            "end_ts": slot_start + 300.0,
+            "end_time": slot_start + 300.0,
+            "strike_price": 90000.0,
+            "tokens": {"UP": "tok_up_btc", "DOWN": "tok_down_btc"},
+            "fee_rate": 0.05,
+        }
+
+        slot = self.bot.slots[asset]
+        slot.market = market
+        slot.strike = 90000.0
+        slot.position = {
+            "strategy": "JEV_DYNAMIC_MOMENTUM",
+            "side": "UP",
+            "token_id": "tok_up_btc",
+            "opp_token_id": "tok_down_btc",
+            "price": 0.65,
+            "shares": 5.0,
+            "cost_usd": 3.25,
+            "fee": 0.08,
+            "total_cost": 3.33,
+            "strike": 90000.0,
+            "slot_start_ts": slot_start,
+            "entry_time": slot_start + 42.0,
+            "entry_elapsed_s": 42.0,
+            "entry_window_time": "t=42s (00:42)",
+        }
+
+        # 1) Trigger early exit (Take-Profit @ 0.96)
+        self.bot.book_stream._apply_update("tok_up_btc", bid=0.96, ask=0.98, bid_sz=500, ask_sz=500)
+        await self.bot._manage_open_momentum_position(
+            slot, market, remaining_s=50.0, tokens=market["tokens"],
+            spot=90100.0, strike=90000.0, elapsed_s=250.0, now=now,
+        )
+
+        self.assertIsNone(slot.position)
+        # Check trades recorded
+        loaded_trades = load_trades(self.bot._trades_log_path)
+        self.assertTrue(len(loaded_trades) > 0)
+        tp_trade = loaded_trades[-1]
+        self.assertEqual(tp_trade["exit_price"], 0.96)
+        self.assertEqual(tp_trade["exit_reason"], "take_profit")
+        self.assertEqual(tp_trade["entry_elapsed_s"], 42.0)
+        self.assertEqual(tp_trade["entry_window_time"], "t=42s (00:42)")
+        self.assertIsNotNone(tp_trade.get("exit_elapsed_s"))
+        self.assertIsNotNone(tp_trade.get("exit_window_time"))
+        self.assertEqual(tp_trade["cost_usd"], 3.25)
+        self.assertEqual(tp_trade["fee"], 0.08)
+        self.assertAlmostEqual(tp_trade["total_cost"], 3.25 + 0.08 + tp_trade.get("exit_fee", 0.0), places=3)
+
+        # 2) Test settlement record (loss settlement)
+        loss_item = {
+            "asset": "btc",
+            "market": market,
+            "strike": 90000.0,
+            "position": {
+                "strategy": "JEV_DYNAMIC_MOMENTUM",
+                "side": "UP",
+                "token_id": "tok_up_btc",
+                "price": 0.65,
+                "shares": 5.0,
+                "cost_usd": 3.25,
+                "fee": 0.08,
+                "slot_start_ts": slot_start,
+                "entry_time": slot_start + 30.0,
+                "entry_elapsed_s": 30.0,
+                "entry_window_time": "t=30s (00:30)",
+            },
+        }
+        loss_res = {
+            "side": "DOWN",
+            "source": "polymarket_outcome_prices",
+            "official": True,
+            "price_to_beat": 90000.0,
+            "final_price": 89900.0,
+        }
+        self.bot._settle_filled(loss_item, loss_res)
+
+        loaded_trades2 = load_trades(self.bot._trades_log_path)
+        settle_trade = loaded_trades2[-1]
+        self.assertEqual(settle_trade["won"], False)
+        self.assertEqual(settle_trade["exit_price"], 0.0)
+        self.assertEqual(settle_trade["exit_reason"], "settlement_lost")
+        self.assertEqual(settle_trade["entry_window_time"], "t=30s (00:30)")
+        self.assertEqual(settle_trade["exit_window_time"], "t=300s (05:00 - expiry)")
+        self.assertEqual(settle_trade["fee"], 0.08)
+        self.assertEqual(settle_trade["total_cost"], 3.33)
+        self.assertAlmostEqual(settle_trade["pnl"], -3.33, places=2)
 
 
 if __name__ == "__main__":
