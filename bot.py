@@ -1581,6 +1581,19 @@ class TWAPBot:
         entry = float(pos["price"])
 
         # Track peak market bid & activate dynamic trailing profit stop
+        fee_rate = float(
+            market.get("fee_rate")
+            if market.get("fee_rate") is not None
+            else getattr(config, "TAKER_FEE_RATE", 0.07)
+        )
+        # Round-trip taker fee (entry + exit legs): approx 2 * fee_rate * p * (1 - p)
+        round_trip_fee = 2.0 * fee_rate * entry * (1.0 - entry)
+        min_breakeven = round(entry + round_trip_fee, 4)
+        min_peak = max(
+            float(getattr(config, "TRAILING_PROFIT_MIN_PEAK", 0.78)),
+            round(min_breakeven + 0.01, 4),
+        )
+
         if best_bid is not None:
             peak_bid = max(float(pos.get("peak_bid", entry)), float(best_bid))
             pos["peak_bid"] = peak_bid
@@ -1588,7 +1601,6 @@ class TWAPBot:
                 getattr(config, "TRAILING_PROFIT_ENABLED", True)
                 and getattr(config, "TRAILING_BREAKEVEN_ENABLED", True)
             )
-            min_peak = getattr(config, "TRAILING_PROFIT_MIN_PEAK", 0.78)
             if trailing_enabled and peak_bid >= min_peak:
                 pos["trailing_active"] = True
                 pos["breakeven_active"] = True
@@ -1629,22 +1641,14 @@ class TWAPBot:
             getattr(config, "TRAILING_PROFIT_ENABLED", True)
             and getattr(config, "TRAILING_BREAKEVEN_ENABLED", True)
         )
-        min_peak = getattr(config, "TRAILING_PROFIT_MIN_PEAK", 0.78)
         peak_bid = float(pos.get("peak_bid", entry))
         if trailing_enabled and (pos.get("trailing_active") or pos.get("breakeven_active") or peak_bid >= min_peak) and best_bid is not None:
-            fee_rate = float(
-                market.get("fee_rate")
-                if market.get("fee_rate") is not None
-                else getattr(config, "TAKER_FEE_RATE", 0.07)
-            )
-            # Round-trip taker fee (entry + exit legs): approx 2 * fee_rate * p * (1 - p)
-            round_trip_fee = 2.0 * fee_rate * entry * (1.0 - entry)
             trail_distance = getattr(config, "TRAILING_PROFIT_DISTANCE", 0.08)
             stop_price = round(peak_bid - trail_distance, 4)
-            min_breakeven = round(entry + round_trip_fee, 4)
             if min_breakeven < peak_bid:
                 stop_price = max(stop_price, min_breakeven)
             floor = round(entry - 0.05, 4)
+            stop_price = max(stop_price, floor)
             if float(best_bid) <= stop_price and float(best_bid) >= floor:
                 reason = f"trailing_profit (peak: {peak_bid:.2f}, exit: {float(best_bid):.2f}, entry: {entry:.2f})"
                 logger.warning(

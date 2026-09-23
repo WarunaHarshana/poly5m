@@ -645,6 +645,133 @@ class TestDynamicSimulation(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(slot.position)
         self.assertIn(market["slug"], self.bot._slot_done)
 
+    async def test_dynamic_trailing_profit_high_entry_price(self):
+        """For positions entered at high prices (e.g. 0.80), trailing profit only arms above breakeven+fees and does not deadlock."""
+        asset = "btc"
+        now = time.time()
+        slot_start = now - 180.0
+
+        market = {
+            "slug": "btc-usd-5m-test-tp-high-entry",
+            "slot_start_ts": slot_start,
+            "start_time": slot_start,
+            "end_ts": slot_start + 300.0,
+            "end_time": slot_start + 300.0,
+            "strike_price": 90000.0,
+            "tokens": {"UP": "tok_up_btc", "DOWN": "tok_down_btc"},
+            "fee_rate": 0.07,
+        }
+
+        slot = self.bot.slots[asset]
+        slot.market = market
+        slot.strike = 90000.0
+
+        # Entry 0.80: round_trip_fee = 2 * 0.07 * 0.80 * 0.20 = 0.0224
+        # min_breakeven = 0.8224. min_peak = max(0.78, 0.8324) = 0.8324.
+        slot.position = {
+            "asset": asset,
+            "slot": market["slug"],
+            "strategy": "JEV_DYNAMIC_MOMENTUM",
+            "side": "UP",
+            "token_id": "tok_up_btc",
+            "price": 0.80,
+            "shares": 10.0,
+            "cost_usd": 8.00,
+            "fee": 0.112,
+            "strike": 90000.0,
+        }
+
+        self.bot.cl_stream._record(now, 90500.0, asset=asset)
+        # Bid reaches 0.81 (< min_peak 0.8324): should NOT arm trailing profit
+        self.bot.book_stream._apply_update("tok_up_btc", bid=0.81, ask=0.83, bid_sz=500, ask_sz=500)
+        await self.bot._tick_asset(slot, now)
+        self.assertIsNotNone(slot.position)
+        self.assertFalse(slot.position.get("trailing_active", False))
+
+        # Drops to 0.76: does not exit because trailing stop was not armed
+        now2 = now + 1.0
+        self.bot.cl_stream._record(now2, 90480.0, asset=asset)
+        self.bot.book_stream._apply_update("tok_up_btc", bid=0.76, ask=0.78, bid_sz=500, ask_sz=500)
+        await self.bot._tick_asset(slot, now2)
+        self.assertIsNotNone(slot.position)
+
+        # Surges to 0.86 (>= min_peak 0.8324): arms trailing profit
+        now3 = now + 2.0
+        self.bot.cl_stream._record(now3, 90550.0, asset=asset)
+        self.bot.book_stream._apply_update("tok_up_btc", bid=0.86, ask=0.88, bid_sz=500, ask_sz=500)
+        await self.bot._tick_asset(slot, now3)
+        self.assertIsNotNone(slot.position)
+        self.assertTrue(slot.position.get("trailing_active"))
+
+        # Peak is 0.86: stop_price = max(0.86 - 0.08, 0.8224) = 0.8224
+        # Bid 0.84 (> 0.8224): should hold
+        now4 = now + 3.0
+        self.bot.cl_stream._record(now4, 90530.0, asset=asset)
+        self.bot.book_stream._apply_update("tok_up_btc", bid=0.84, ask=0.86, bid_sz=500, ask_sz=500)
+        await self.bot._tick_asset(slot, now4)
+        self.assertIsNotNone(slot.position)
+
+        # Bid pulls back to 0.82 (<= stop_price 0.8224 and >= floor 0.75): triggers exit to protect breakeven
+        now5 = now + 4.0
+        self.bot.cl_stream._record(now5, 90500.0, asset=asset)
+        self.bot.book_stream._apply_update("tok_up_btc", bid=0.82, ask=0.84, bid_sz=500, ask_sz=500)
+        await self.bot._tick_asset(slot, now5)
+        self.assertIsNone(slot.position)
+        self.assertIn(market["slug"], self.bot._slot_done)
+
+    async def test_dynamic_trailing_profit_disabled_by_config(self):
+        """When TRAILING_PROFIT_ENABLED is False, position does not trigger trailing profit exit."""
+        asset = "btc"
+        now = time.time()
+        slot_start = now - 180.0
+
+        market = {
+            "slug": "btc-usd-5m-test-tp-disabled-config",
+            "slot_start_ts": slot_start,
+            "start_time": slot_start,
+            "end_ts": slot_start + 300.0,
+            "end_time": slot_start + 300.0,
+            "strike_price": 90000.0,
+            "tokens": {"UP": "tok_up_btc", "DOWN": "tok_down_btc"},
+            "fee_rate": 0.0,
+        }
+
+        slot = self.bot.slots[asset]
+        slot.market = market
+        slot.strike = 90000.0
+
+        slot.position = {
+            "asset": asset,
+            "slot": market["slug"],
+            "strategy": "JEV_DYNAMIC_MOMENTUM",
+            "side": "UP",
+            "token_id": "tok_up_btc",
+            "price": 0.60,
+            "shares": 10.0,
+            "cost_usd": 6.00,
+            "strike": 90000.0,
+        }
+
+        old_setting = config.TRAILING_PROFIT_ENABLED
+        try:
+            config.TRAILING_PROFIT_ENABLED = False
+            self.bot.cl_stream._record(now, 90500.0, asset=asset)
+            self.bot.book_stream._apply_update("tok_up_btc", bid=0.80, ask=0.82, bid_sz=500, ask_sz=500)
+            await self.bot._tick_asset(slot, now)
+
+            self.assertIsNotNone(slot.position)
+            self.assertFalse(slot.position.get("trailing_active", False))
+
+            # Pullback to 0.72 should NOT trigger exit when feature is disabled
+            now2 = now + 1.0
+            self.bot.cl_stream._record(now2, 90450.0, asset=asset)
+            self.bot.book_stream._apply_update("tok_up_btc", bid=0.72, ask=0.74, bid_sz=500, ask_sz=500)
+            await self.bot._tick_asset(slot, now2)
+
+            self.assertIsNotNone(slot.position)
+        finally:
+            config.TRAILING_PROFIT_ENABLED = old_setting
+
     async def test_trailing_breakeven_exit_fires_cleanly(self):
         """When a position reaches 0.88 and pulls back to 0.61 (entry 0.60), trailing breakeven exit fires cleanly."""
         asset = "btc"
