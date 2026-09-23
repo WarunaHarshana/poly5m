@@ -22,9 +22,13 @@ class TestDynamicSimulation(unittest.IsolatedAsyncioTestCase):
         self.old_strat = config.STRATEGY
         self.old_mom_min_ask = config.DYNAMIC_MOMENTUM_MIN_ASK
         self.old_mom_max_ask = config.DYNAMIC_MOMENTUM_MAX_ASK
+        self.old_trailing_profit_enabled = config.TRAILING_PROFIT_ENABLED
+        self.old_trailing_breakeven_enabled = config.TRAILING_BREAKEVEN_ENABLED
 
         config.MODE = "paper_live"
         config.STRATEGY = "JEV_DYNAMIC"
+        config.TRAILING_PROFIT_ENABLED = True
+        config.TRAILING_BREAKEVEN_ENABLED = True
 
         self.bot = TWAPBot()
         self.bot.risk.state_dir = self.temp_dir
@@ -37,6 +41,8 @@ class TestDynamicSimulation(unittest.IsolatedAsyncioTestCase):
         config.STRATEGY = self.old_strat
         config.DYNAMIC_MOMENTUM_MIN_ASK = self.old_mom_min_ask
         config.DYNAMIC_MOMENTUM_MAX_ASK = self.old_mom_max_ask
+        config.TRAILING_PROFIT_ENABLED = self.old_trailing_profit_enabled
+        config.TRAILING_BREAKEVEN_ENABLED = self.old_trailing_breakeven_enabled
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     async def test_dynamic_momentum_taker_flow(self):
@@ -1198,7 +1204,15 @@ class TestDynamicSimulation(unittest.IsolatedAsyncioTestCase):
         # Salvage bid is 0.30 >= 0.25
         self.bot.book_stream._apply_update("tok_up_btc", bid=0.30, ask=0.34, bid_sz=500, ask_sz=500)
 
+        # Tick 1: Adverse condition detected, monitoring started (filters momentary wicks)
         await self.bot._tick_asset(slot, now)
+        self.assertIsNotNone(slot.position)
+        self.assertIsNotNone(slot.position.get("adverse_start_ts"))
+
+        # Tick 2: Sustained past 10s persistence threshold -> confirms genuine reversal and triggers exit
+        now2 = now + 11.0
+        self.bot.cl_stream._record(now2, 89890.0, asset=asset)
+        await self.bot._tick_asset(slot, now2)
 
         # Capital preservation exit triggered
         self.assertIsNone(slot.position)
@@ -1368,7 +1382,14 @@ class TestDynamicSimulation(unittest.IsolatedAsyncioTestCase):
         # Salvage bid is 0.30 >= 0.25
         self.bot.book_stream._apply_update("tok_up_btc", bid=0.30, ask=0.34, bid_sz=500, ask_sz=500)
 
+        # Tick 1: Starts monitoring
         await self.bot._tick_asset(slot, now)
+        self.assertIsNotNone(slot.position)
+
+        # Tick 2: Sustained past 10s persistence hurdle -> triggers exit
+        now2 = now + 11.0
+        self.bot.cl_stream._record(now2, 89890.0, asset=asset)
+        await self.bot._tick_asset(slot, now2)
 
         # Stop-loss triggered via preserved strike
         self.assertIsNone(slot.position)
@@ -1418,6 +1439,124 @@ class TestDynamicSimulation(unittest.IsolatedAsyncioTestCase):
         finally:
             config.STRATEGY = old_strat
 
+    async def test_adverse_stop_loss_ignores_momentary_wick_and_resets(self):
+        """A momentary wick below strike does NOT trigger stop-loss, and adverse timer resets when spot recovers."""
+        asset = "btc"
+        now = time.time()
+        slot_start = now - 180.0
+
+        market = {
+            "slug": "btc-usd-5m-test-wick-filtering",
+            "slot_start_ts": slot_start,
+            "start_time": slot_start,
+            "end_ts": slot_start + 300.0,
+            "end_time": slot_start + 300.0,
+            "strike_price": 90000.0,
+            "tokens": {"UP": "tok_up_btc", "DOWN": "tok_down_btc"},
+            "fee_rate": 0.0,
+        }
+
+        slot = self.bot.slots[asset]
+        slot.market = market
+        slot.strike = 90000.0
+
+        slot.position = {
+            "asset": asset,
+            "slot": market["slug"],
+            "strategy": "JEV_DYNAMIC_MOMENTUM",
+            "side": "UP",
+            "token_id": "tok_up_btc",
+            "price": 0.72,
+            "shares": 10.0,
+            "cost_usd": 7.20,
+            "strike": 90000.0,
+        }
+
+        # Spot momentarily dips to 89900 (< 90000)
+        self.bot.cl_stream._record(now, 89900.0, asset=asset)
+        self.bot.book_stream._apply_update("tok_up_btc", bid=0.30, ask=0.34, bid_sz=500, ask_sz=500)
+
+        # Tick 1: Adverse condition detected, monitoring started (position NOT dumped)
+        await self.bot._tick_asset(slot, now)
+        self.assertIsNotNone(slot.position)
+        self.assertIsNotNone(slot.position.get("adverse_start_ts"))
+
+        # Spot recovers above strike to 90050 at now + 3s (before 10s persistence hurdle)
+        now2 = now + 3.0
+        self.bot.cl_stream._record(now2, 90050.0, asset=asset)
+        self.bot.book_stream._apply_update("tok_up_btc", bid=0.65, ask=0.69, bid_sz=500, ask_sz=500)
+        await self.bot._tick_asset(slot, now2)
+
+        # Position is STILL retained and timer has reset to None!
+        self.assertIsNotNone(slot.position)
+        self.assertIsNone(slot.position.get("adverse_start_ts"))
+
+    async def test_trailing_profit_disabled_by_default_lets_trade_reach_tp(self):
+        """When trailing profit is disabled (production default), pullback from 0.88 to 0.77 does NOT exit, allowing trade to hit 0.96 Take-Profit."""
+        asset = "btc"
+        now = time.time()
+        slot_start = now - 180.0
+
+        market = {
+            "slug": "btc-usd-5m-test-tp-reach-win",
+            "slot_start_ts": slot_start,
+            "start_time": slot_start,
+            "end_ts": slot_start + 300.0,
+            "end_time": slot_start + 300.0,
+            "strike_price": 90000.0,
+            "tokens": {"UP": "tok_up_btc", "DOWN": "tok_down_btc"},
+            "fee_rate": 0.0,
+        }
+
+        slot = self.bot.slots[asset]
+        slot.market = market
+        slot.strike = 90000.0
+
+        slot.position = {
+            "asset": asset,
+            "slot": market["slug"],
+            "strategy": "JEV_DYNAMIC_MOMENTUM",
+            "side": "UP",
+            "token_id": "tok_up_btc",
+            "price": 0.78,
+            "shares": 10.0,
+            "cost_usd": 7.80,
+            "strike": 90000.0,
+        }
+
+        old_trailing = config.TRAILING_PROFIT_ENABLED
+        old_breakeven = config.TRAILING_BREAKEVEN_ENABLED
+        try:
+            config.TRAILING_PROFIT_ENABLED = False
+            config.TRAILING_BREAKEVEN_ENABLED = False
+
+            # Peak reaches 0.88
+            self.bot.cl_stream._record(now, 90300.0, asset=asset)
+            self.bot.book_stream._apply_update("tok_up_btc", bid=0.88, ask=0.90, bid_sz=500, ask_sz=500)
+            await self.bot._tick_asset(slot, now)
+            self.assertIsNotNone(slot.position)
+
+            # Bid pulls back to 0.77 (8c below peak, 1c below entry): with trailing stop disabled, trade is NOT choked
+            now2 = now + 5.0
+            self.bot.cl_stream._record(now2, 90200.0, asset=asset)
+            self.bot.book_stream._apply_update("tok_up_btc", bid=0.77, ask=0.80, bid_sz=500, ask_sz=500)
+            await self.bot._tick_asset(slot, now2)
+            self.assertIsNotNone(slot.position)
+
+            # Price surges towards expiry, best_bid reaches 0.96 -> Take-Profit triggers cleanly!
+            now3 = now + 20.0
+            self.bot.cl_stream._record(now3, 90500.0, asset=asset)
+            self.bot.book_stream._apply_update("tok_up_btc", bid=0.96, ask=0.97, bid_sz=500, ask_sz=500)
+            await self.bot._tick_asset(slot, now3)
+
+            # Successfully exited at Take-Profit 0.96
+            self.assertIsNone(slot.position)
+            self.assertIn(market["slug"], self.bot._slot_done)
+        finally:
+            config.TRAILING_PROFIT_ENABLED = old_trailing
+            config.TRAILING_BREAKEVEN_ENABLED = old_breakeven
+
 
 if __name__ == "__main__":
     unittest.main()
+

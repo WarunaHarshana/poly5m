@@ -96,8 +96,17 @@ TAKE_PROFIT_BID = float(os.getenv("TAKE_PROFIT_BID", "0.95"))
 TAKE_PROFIT_ASK = float(os.getenv("TAKE_PROFIT_ASK", "0.96"))
 STOP_LOSS_SALVAGE_MIN_BID = float(os.getenv("STOP_LOSS_SALVAGE_MIN_BID", "0.25"))
 
+# --- Adverse Strike Stop-Loss Protection Filters ---
+# Hysteresis hurdle: Spot must cross strike against position by >= STOP_LOSS_MIN_ADVERSE_SIGMA * sigma(t)
+STOP_LOSS_MIN_ADVERSE_SIGMA = float(os.getenv("STOP_LOSS_MIN_ADVERSE_SIGMA", "0.50"))
+# Persistence hurdle: Adverse cross must hold continuously for >= 10s to filter momentary wicks
+STOP_LOSS_PERSISTENCE_SECONDS = float(os.getenv("STOP_LOSS_PERSISTENCE_SECONDS", "10.0"))
+# Dual agreement: Realized TWAP must also cross strike against position
+STOP_LOSS_REQUIRE_TWAP = os.getenv("STOP_LOSS_REQUIRE_TWAP", "yes").strip().lower() in ("yes", "y", "true", "1")
+
 # --- Dynamic Trailing Profit Stop Parameters ---
-TRAILING_PROFIT_ENABLED = os.getenv("TRAILING_PROFIT_ENABLED", os.getenv("TRAILING_BREAKEVEN_ENABLED", "yes")).strip().lower() in ("yes", "y", "true", "1")
+# Defaulted to 'no' (disabled) based on live audit: 8¢ trail choked winning trades during normal CLOB spreads
+TRAILING_PROFIT_ENABLED = os.getenv("TRAILING_PROFIT_ENABLED", os.getenv("TRAILING_BREAKEVEN_ENABLED", "no")).strip().lower() in ("yes", "y", "true", "1")
 TRAILING_PROFIT_DISTANCE = float(os.getenv("TRAILING_PROFIT_DISTANCE", "0.08"))
 TRAILING_PROFIT_MIN_PEAK = float(os.getenv("TRAILING_PROFIT_MIN_PEAK", "0.78"))
 

@@ -1352,7 +1352,12 @@ class TWAPBot:
             or "DYNAMIC" in str(slot.position.get("strategy", ""))
             or "AVN" in str(slot.position.get("strategy", ""))
         ):
-            await self._manage_open_momentum_position(slot, market, remaining_s, tokens)
+            await self._manage_open_momentum_position(
+                slot, market, remaining_s, tokens,
+                spot=spot, strike=strike,
+                realized_twap=realized_twap, elapsed_s=elapsed_s,
+                now=now,
+            )
 
         if remaining_s <= 0.0:
             if slot.resting_order:
@@ -1552,9 +1557,18 @@ class TWAPBot:
 
 
     async def _manage_open_momentum_position(
-        self, slot: CoinSlot, market: dict, remaining_s: float, tokens: dict
+        self,
+        slot: CoinSlot,
+        market: dict,
+        remaining_s: float,
+        tokens: dict,
+        spot: float | None = None,
+        strike: float | None = None,
+        realized_twap: float | None = None,
+        elapsed_s: float | None = None,
+        now: float | None = None,
     ) -> None:
-        """Stop-loss, exit-before-close, and optional micro-hedge for H-005 positions."""
+        """Stop-loss, exit-before-close, and optional micro-hedge for open positions."""
         pos = slot.position
         if not pos:
             return
@@ -1580,7 +1594,7 @@ class TWAPBot:
 
         entry = float(pos["price"])
 
-        # Track peak market bid & activate dynamic trailing profit stop
+        # Track peak market bid & activate dynamic trailing profit stop if enabled
         fee_rate = float(
             market.get("fee_rate")
             if market.get("fee_rate") is not None
@@ -1594,14 +1608,15 @@ class TWAPBot:
             round(min_breakeven + 0.01, 4),
         )
 
-        if best_bid is not None:
+        trailing_enabled = (
+            getattr(config, "TRAILING_PROFIT_ENABLED", False)
+            and getattr(config, "TRAILING_BREAKEVEN_ENABLED", False)
+        )
+
+        if best_bid is not None and trailing_enabled:
             peak_bid = max(float(pos.get("peak_bid", entry)), float(best_bid))
             pos["peak_bid"] = peak_bid
-            trailing_enabled = (
-                getattr(config, "TRAILING_PROFIT_ENABLED", True)
-                and getattr(config, "TRAILING_BREAKEVEN_ENABLED", True)
-            )
-            if trailing_enabled and peak_bid >= min_peak:
+            if peak_bid >= min_peak:
                 pos["trailing_active"] = True
                 pos["breakeven_active"] = True
 
@@ -1614,6 +1629,7 @@ class TWAPBot:
             else:
                 # Wide/absurd book — do not stop-loss on thin bid alone
                 mark = None
+
         # 1) "Free-Ride" Take-Profit Limit Exit:
         # If current market best bid reaches >= 0.95 (or TAKE_PROFIT_ASK = 0.96), trigger early take-profit exit.
         # CRITICAL: We only exit if best_bid >= tp_target and best_bid > entry to guarantee locking in >= +15¢ profit.
@@ -1632,14 +1648,11 @@ class TWAPBot:
             return
 
         # 2) Dynamic Trailing Profit Stop (Target 3):
-        # Once peak_bid >= TRAILING_PROFIT_MIN_PEAK (e.g. 0.78), compute dynamic trailing stop:
-        # stop_price = round(peak_bid - TRAILING_PROFIT_DISTANCE, 4) (default 8¢ trailing distance)
-        # Ensure stop_price >= entry + round_trip_fee so it also guarantees breakeven+fees if activated.
-        # If best_bid <= stop_price and best_bid >= entry - 0.05:
-        # Trigger early exit with reason f"trailing_profit (peak: {peak_bid:.2f}, exit: {best_bid:.2f}, entry: {entry:.2f})"
+        # Optional: only active when TRAILING_PROFIT_ENABLED is explicitly enabled.
+        # If enabled and peak_bid >= TRAILING_PROFIT_MIN_PEAK, trails peak bid by TRAILING_PROFIT_DISTANCE.
         trailing_enabled = (
-            getattr(config, "TRAILING_PROFIT_ENABLED", True)
-            and getattr(config, "TRAILING_BREAKEVEN_ENABLED", True)
+            getattr(config, "TRAILING_PROFIT_ENABLED", False)
+            and getattr(config, "TRAILING_BREAKEVEN_ENABLED", False)
         )
         peak_bid = float(pos.get("peak_bid", entry))
         if trailing_enabled and (pos.get("trailing_active") or pos.get("breakeven_active") or peak_bid >= min_peak) and best_bid is not None:
@@ -1659,27 +1672,85 @@ class TWAPBot:
                 await self._exit_position_early(slot, market, float(best_bid), reason=reason)
                 return
 
-        # 3) Adverse Stop-Loss:
-        # If spot crosses strike S0 against position (S_t < S0 for UP, or S_t > S0 for DOWN),
-        # trigger early exit if salvage bid >= 0.25 to preserve capital.
-        spot = self.cl_stream.price(slot.asset)
-        strike = slot.strike or pos.get("strike")
+        # 3) Adverse Stop-Loss with Hysteresis Buffer, TWAP Coherence & Persistence Filter:
+        # A momentary 1-tick dip across strike must NOT trigger an instantaneous fire sale.
+        # Live audit proved 1-tick stop-outs caused -$5.78 in profit leaks on winning trades.
+        if spot is None:
+            spot = self.cl_stream.price(slot.asset)
+        if strike is None:
+            strike = slot.strike or pos.get("strike")
+        if elapsed_s is None:
+            elapsed_s = max(0.0, 300.0 - remaining_s)
+
         if spot is not None and strike is not None and spot > 0 and strike > 0:
-            adverse_cross = (side == "UP" and spot < strike) or (side == "DOWN" and spot > strike)
-            salvage_min = getattr(config, "STOP_LOSS_SALVAGE_MIN_BID", 0.25)
-            if adverse_cross:
-                if best_bid is not None and float(best_bid) >= salvage_min:
-                    logger.warning(
-                        f"[{slot.asset.upper()} ADVERSE STOP-LOSS] Spot {spot:.2f} crossed strike {strike:.2f} against {side}; "
-                        f"salvage bid {float(best_bid):.3f} >= {salvage_min:.2f} — triggering early capital preservation exit"
+            adverse_dist = (strike - spot) if side == "UP" else (spot - strike)
+
+            # Volatility-normalized distance hurdle
+            params = slot.params
+            daily_vol = getattr(params, "daily_vol", 0.035) if params else 0.035
+            t_eff = max(float(elapsed_s), 30.0)
+            sigma_t = daily_vol * ((t_eff / 86400.0) ** 0.5) * spot
+            min_adverse_mult = float(getattr(config, "STOP_LOSS_MIN_ADVERSE_SIGMA", 0.50))
+            min_adverse_usd = min_adverse_mult * sigma_t
+
+            # Spot must breach strike significantly past noise buffer
+            is_adverse_move = (adverse_dist >= min_adverse_usd)
+
+            # Dual agreement with realized TWAP
+            require_twap = getattr(config, "STOP_LOSS_REQUIRE_TWAP", True)
+            twap_adverse = True
+            if require_twap:
+                twap_val = realized_twap
+                if twap_val is None and market.get("slot_start_ts"):
+                    twap_val, _ = self.cl_stream.compute_realized_twap(
+                        start_ts=market["slot_start_ts"], end_ts=time.time(), asset=slot.asset
                     )
-                    await self._exit_position_early(slot, market, float(best_bid), reason="stop_loss")
-                    return
+                if twap_val is not None and twap_val > 0:
+                    twap_adverse = (twap_val < strike) if side == "UP" else (twap_val > strike)
+
+            # Catastrophic move override (>= 1.5 sigma_t)
+            is_catastrophic = (adverse_dist >= 1.5 * sigma_t)
+            is_adverse_confirmed = is_adverse_move and (twap_adverse or is_catastrophic)
+
+            salvage_min = float(getattr(config, "STOP_LOSS_SALVAGE_MIN_BID", 0.25))
+            persistence_s = float(getattr(config, "STOP_LOSS_PERSISTENCE_SECONDS", 10.0))
+            now_ts = float(now) if now is not None else time.time()
+
+            if is_adverse_confirmed:
+                if pos.get("adverse_start_ts") is None:
+                    pos["adverse_start_ts"] = now_ts
+                adverse_duration = now_ts - float(pos["adverse_start_ts"])
+
+                if adverse_duration >= persistence_s or (is_catastrophic and persistence_s == 0.0):
+                    if best_bid is not None and float(best_bid) >= salvage_min:
+                        logger.warning(
+                            f"[{slot.asset.upper()} ADVERSE STOP-LOSS] Spot {spot:.2f} crossed strike {strike:.2f} against {side} "
+                            f"(adverse_dist={adverse_dist:.2f} >= min={min_adverse_usd:.2f}, "
+                            f"duration={adverse_duration:.1f}s >= {persistence_s:.1f}s, TWAP={realized_twap or 0:.2f}); "
+                            f"salvage bid {float(best_bid):.3f} >= {salvage_min:.2f} — triggering early capital preservation exit"
+                        )
+                        await self._exit_position_early(slot, market, float(best_bid), reason="stop_loss")
+                        return
+                    else:
+                        logger.info(
+                            f"[{slot.asset.upper()} ADVERSE CONFIRMED] Spot {spot:.2f} crossed strike {strike:.2f} against {side} "
+                            f"(dist={adverse_dist:.2f}, dur={adverse_duration:.1f}s), but salvage bid {best_bid} < {salvage_min:.2f} "
+                            f"(holding to preserve option value)"
+                        )
                 else:
                     logger.info(
-                        f"[{slot.asset.upper()} ADVERSE CROSS] Spot {spot:.2f} crossed strike {strike:.2f} against {side}, "
-                        f"salvage bid {best_bid} < {salvage_min:.2f} (holding to preserve option value)"
+                        f"[{slot.asset.upper()} ADVERSE MONITORING] Spot {spot:.2f} adverse vs strike {strike:.2f} "
+                        f"(dist={adverse_dist:.2f} >= min={min_adverse_usd:.2f}), "
+                        f"duration={adverse_duration:.1f}s < {persistence_s:.1f}s hurdle (filtering momentary noise)"
                     )
+            else:
+                # Reset adverse persistence timer if spot recovered or is within noise buffer
+                if pos.get("adverse_start_ts") is not None:
+                    logger.info(
+                        f"[{slot.asset.upper()} ADVERSE RESET] Spot {spot:.2f} recovered towards strike {strike:.2f} "
+                        f"(dist={adverse_dist:.2f} < min={min_adverse_usd:.2f}) — resetting stop-loss persistence timer"
+                    )
+                    pos["adverse_start_ts"] = None
 
         # 3) Legacy H-005 Stop-loss vs entry (mid only when spread is sane) - applies only to legacy H-005
         is_legacy_h005 = pos.get("strategy") in ("H-005_MOMENTUM", "H-005", "LATE_MOMENTUM", "MOMENTUM")
