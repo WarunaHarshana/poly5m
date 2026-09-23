@@ -1822,6 +1822,110 @@ class TestDynamicSimulation(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(settle_trade["total_cost"], 3.33)
         self.assertAlmostEqual(settle_trade["pnl"], -3.33, places=2)
 
+    async def test_anti_settlement_zero_hurdle_urgent_salvage(self):
+        """Verify that within 45s, a small adverse move (e.g. $5 on BTC) triggers urgent salvage at low bids (e.g. 0.12)."""
+        asset = "btc"
+        now = time.time()
+        slot_start = now - 265.0  # 35s remaining
+        market = {
+            "slug": "btc-usd-5m-anti-settle-test-urgent",
+            "slot_start_ts": slot_start,
+            "start_time": slot_start,
+            "end_ts": slot_start + 300.0,
+            "end_time": slot_start + 300.0,
+            "strike_price": 90000.0,
+            "tokens": {"UP": "tok_up_btc", "DOWN": "tok_down_btc"},
+            "fee_rate": 0.0,
+        }
+        slot = self.bot.slots[asset]
+        slot.market = market
+        slot.strike = 90000.0
+        slot.position = {
+            "strategy": "JEV_DYNAMIC_MOMENTUM",
+            "side": "UP",
+            "token_id": "tok_up_btc",
+            "opp_token_id": "tok_down_btc",
+            "price": 0.65,
+            "shares": 5.0,
+            "cost_usd": 3.25,
+            "fee": 0.08,
+            "strike": 90000.0,
+            "slot_start_ts": slot_start,
+            "entry_time": slot_start + 30.0,
+            "entry_elapsed_s": 30.0,
+            "entry_window_time": "t=30s (00:30)",
+            "adverse_start_ts": now - 4.0,  # sustained for 4s >= urgent persistence (3s)
+        }
+
+        # Spot is only $5 below strike (89,995 vs 90,000). Standard 0.50-sigma hurdle would be ~$80.
+        # But remaining_s = 35s <= 45s, so zero-hurdle applies (min_adverse_usd = 0.0)!
+        # Book bid is 0.12 (below old 0.20 floor, but above new 0.05 urgent salvage floor).
+        self.bot.book_stream._apply_update("tok_up_btc", bid=0.12, ask=0.16, bid_sz=500, ask_sz=500)
+        await self.bot._manage_open_momentum_position(
+            slot, market, remaining_s=35.0, tokens=market["tokens"],
+            spot=89995.0, strike=90000.0, elapsed_s=265.0, now=now,
+        )
+
+        self.assertIsNone(slot.position, "Position should have been cleanly salvaged")
+        loaded = load_trades(self.bot._trades_log_path)
+        trade = loaded[-1]
+        self.assertEqual(trade["exit_reason"], "urgent_stop_loss")
+        self.assertEqual(trade["exit_price"], 0.12)
+        self.assertAlmostEqual(trade["pnl"], (5.0 * 0.12) - 3.25 - 0.08, places=2)
+
+    async def test_anti_settlement_hard_flatten_panic_salvage(self):
+        """Verify that within 20s, adverse move immediately flattens with 0 persistence even at 0.04 implied bid."""
+        asset = "btc"
+        now = time.time()
+        slot_start = now - 285.0  # 15s remaining
+        market = {
+            "slug": "btc-usd-5m-anti-settle-test-hard-flatten",
+            "slot_start_ts": slot_start,
+            "start_time": slot_start,
+            "end_ts": slot_start + 300.0,
+            "end_time": slot_start + 300.0,
+            "strike_price": 90000.0,
+            "tokens": {"UP": "tok_up_btc", "DOWN": "tok_down_btc"},
+            "fee_rate": 0.0,
+        }
+        slot = self.bot.slots[asset]
+        slot.market = market
+        slot.strike = 90000.0
+        slot.position = {
+            "strategy": "JEV_DYNAMIC_MOMENTUM",
+            "side": "UP",
+            "token_id": "tok_up_btc",
+            "opp_token_id": "tok_down_btc",
+            "price": 0.65,
+            "shares": 5.0,
+            "cost_usd": 3.25,
+            "fee": 0.08,
+            "strike": 90000.0,
+            "slot_start_ts": slot_start,
+            "entry_time": slot_start + 30.0,
+            "entry_elapsed_s": 30.0,
+            "entry_window_time": "t=30s (00:30)",
+            # adverse_start_ts is None! Reversal just happened this very millisecond
+        }
+
+        # Spot reversed to 89,990.
+        # Direct bid on UP is None (market makers pulled bids).
+        # Opposite DOWN token ask is 0.96 -> implied bid on UP is 1.0 - 0.96 = 0.04!
+        # With 15s remaining <= 20s (hard flatten), persistence is 0s and salvage min is 0.02.
+        self.bot.book_stream._apply_update("tok_up_btc", bid=None, ask=None, bid_sz=0, ask_sz=0)
+        self.bot.book_stream._apply_update("tok_down_btc", bid=0.94, ask=0.96, bid_sz=500, ask_sz=500)
+
+        await self.bot._manage_open_momentum_position(
+            slot, market, remaining_s=15.0, tokens=market["tokens"],
+            spot=89990.0, strike=90000.0, elapsed_s=285.0, now=now,
+        )
+
+        self.assertIsNone(slot.position, "Position should have been immediately flattened before expiry")
+        loaded = load_trades(self.bot._trades_log_path)
+        trade = loaded[-1]
+        self.assertEqual(trade["exit_reason"], "hard_flatten_expiry")
+        self.assertEqual(trade["exit_price"], 0.04)
+
 
 if __name__ == "__main__":
     unittest.main()

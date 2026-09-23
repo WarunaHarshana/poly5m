@@ -1766,10 +1766,18 @@ class TWAPBot:
             t_eff = max(float(elapsed_s), 30.0)
             sigma_t = daily_vol * ((t_eff / 86400.0) ** 0.5) * spot
             min_adverse_mult = float(getattr(config, "STOP_LOSS_MIN_ADVERSE_SIGMA", 0.50))
-            min_adverse_usd = min_adverse_mult * sigma_t
 
-            # Spot must breach strike significantly past noise buffer
-            is_adverse_move = (adverse_dist >= min_adverse_usd)
+            # Anti-Settlement-Loss Zero Hurdle:
+            # If remaining_s <= STOP_LOSS_ZERO_HURDLE_REMAINING_S (<= 45s), noise hurdle drops to 0.0!
+            # With <= 45s left, ANY spot crossing strike against us will resolve to 0.00 at expiry.
+            zero_hurdle_s = float(getattr(config, "STOP_LOSS_ZERO_HURDLE_REMAINING_S", 45.0))
+            if remaining_s <= zero_hurdle_s:
+                min_adverse_usd = 0.0
+            else:
+                min_adverse_usd = min_adverse_mult * sigma_t
+
+            # Spot must breach strike beyond noise buffer (or simply cross strike if min_adverse_usd == 0)
+            is_adverse_move = (adverse_dist > min_adverse_usd if min_adverse_usd == 0.0 else adverse_dist >= min_adverse_usd)
             now_ts = float(now) if now is not None else time.time()
 
             if not is_adverse_move:
@@ -1786,10 +1794,18 @@ class TWAPBot:
                     pos["adverse_start_ts"] = now_ts
                 adverse_duration = now_ts - float(pos["adverse_start_ts"])
 
-                # Dual agreement with realized TWAP (only enforced in early/mid round; in late round, spot governs expiry)
+                # Urgent and Hard-Flatten tiers
+                urgent_remaining = float(getattr(config, "STOP_LOSS_URGENT_REMAINING_SECONDS", 45.0))
+                hard_flatten_remaining = float(getattr(config, "STOP_LOSS_HARD_FLATTEN_REMAINING_S", 20.0))
+                is_hard_flatten = (remaining_s <= hard_flatten_remaining)
+                is_urgent = (remaining_s <= urgent_remaining)
+
+                # Dual agreement with realized TWAP:
+                # Enforced only in early/mid round (remaining_s > 45s).
+                # In urgent and hard-flatten windows, spot directly governs binary expiry resolution.
                 require_twap = getattr(config, "STOP_LOSS_REQUIRE_TWAP", True)
                 twap_adverse = True
-                if require_twap and (elapsed_s is not None and elapsed_s < 180.0 and remaining_s > 120.0):
+                if not is_urgent and require_twap and (elapsed_s is not None and elapsed_s < 180.0 and remaining_s > 120.0):
                     twap_val = realized_twap
                     if twap_val is None and market.get("slot_start_ts"):
                         twap_val, _ = self.cl_stream.compute_realized_twap(
@@ -1800,14 +1816,13 @@ class TWAPBot:
 
                 # Catastrophic move override (>= 1.5 sigma_t)
                 is_catastrophic = (adverse_dist >= 1.5 * sigma_t)
-                is_adverse_confirmed = (twap_adverse or is_catastrophic)
+                is_adverse_confirmed = (is_urgent or twap_adverse or is_catastrophic)
 
-                # Urgent salvage check in final seconds of round
-                urgent_remaining = float(getattr(config, "STOP_LOSS_URGENT_REMAINING_SECONDS", 45.0))
-                is_urgent = (remaining_s <= urgent_remaining)
-
-                if is_urgent:
-                    salvage_min = float(getattr(config, "STOP_LOSS_URGENT_SALVAGE_MIN_BID", 0.20))
+                if is_hard_flatten:
+                    salvage_min = float(getattr(config, "STOP_LOSS_PANIC_SALVAGE_MIN_BID", 0.02))
+                    persistence_s = 0.0
+                elif is_urgent:
+                    salvage_min = float(getattr(config, "STOP_LOSS_URGENT_SALVAGE_MIN_BID", 0.05))
                     persistence_s = float(getattr(config, "STOP_LOSS_URGENT_PERSISTENCE_SECONDS", 3.0))
                 else:
                     salvage_min = float(getattr(config, "STOP_LOSS_SALVAGE_MIN_BID", 0.25))
@@ -1816,17 +1831,28 @@ class TWAPBot:
                 if is_adverse_confirmed:
                     if adverse_duration >= persistence_s or (is_catastrophic and persistence_s == 0.0):
                         if (best_bid is None or float(best_bid) < salvage_min) and opp_token_id:
-                            bk_opp = self.pub_client.get_order_book(opp_token_id)
-                            _, opp_ask = extract_best_bid_ask(bk_opp)
+                            # 1) Try realtime orderbook stream first (zero latency)
+                            opp_top = self.book_stream.get_top(opp_token_id) if hasattr(self, "book_stream") else None
+                            opp_ask = opp_top.get("ask") if opp_top else None
+                            # 2) Fallback to REST orderbook if cache missing
+                            if opp_ask is None:
+                                bk_opp = self.pub_client.get_order_book(opp_token_id)
+                                _, opp_ask = extract_best_bid_ask(bk_opp)
                             if opp_ask is not None and 0.0 < opp_ask < 1.0:
                                 implied = round(1.0 - opp_ask, 4)
                                 if best_bid is None or implied > float(best_bid):
                                     best_bid = implied
 
                         if best_bid is not None and float(best_bid) >= salvage_min:
-                            exit_reason = "urgent_stop_loss" if is_urgent else "stop_loss"
+                            if is_hard_flatten:
+                                exit_reason = "hard_flatten_expiry"
+                            elif is_urgent:
+                                exit_reason = "urgent_stop_loss"
+                            else:
+                                exit_reason = "stop_loss"
+
                             logger.warning(
-                                f"[{slot.asset.upper()} {'URGENT ' if is_urgent else ''}ADVERSE STOP-LOSS] Spot {spot:.2f} crossed strike {strike:.2f} against {side} "
+                                f"[{slot.asset.upper()} {exit_reason.upper()}] Spot {spot:.2f} crossed strike {strike:.2f} against {side} "
                                 f"(adverse_dist={adverse_dist:.2f} >= min={min_adverse_usd:.2f}, "
                                 f"duration={adverse_duration:.1f}s >= {persistence_s:.1f}s, remaining={remaining_s:.1f}s, TWAP={realized_twap or 0:.2f}); "
                                 f"salvage bid {float(best_bid):.3f} >= {salvage_min:.2f} — triggering early capital preservation exit"
@@ -1836,8 +1862,8 @@ class TWAPBot:
                         else:
                             logger.info(
                                 f"[{slot.asset.upper()} ADVERSE CONFIRMED] Spot {spot:.2f} crossed strike {strike:.2f} against {side} "
-                                f"(dist={adverse_dist:.2f}, dur={adverse_duration:.1f}s), but salvage bid {best_bid} < {salvage_min:.2f} "
-                                f"(holding to preserve option value)"
+                                f"(dist={adverse_dist:.2f}, dur={adverse_duration:.1f}s, remaining={remaining_s:.1f}s), "
+                                f"salvage bid {best_bid} < {salvage_min:.2f} (orderbook illiquid, waiting for fillable quote)"
                             )
                     else:
                         logger.info(

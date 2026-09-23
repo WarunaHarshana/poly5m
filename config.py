@@ -96,9 +96,16 @@ TAKE_PROFIT_ASK = float(os.getenv("TAKE_PROFIT_ASK", "0.96"))
 STOP_LOSS_SALVAGE_MIN_BID = float(os.getenv("STOP_LOSS_SALVAGE_MIN_BID", "0.25"))
 
 # Urgent Late-Round Capital Salvage (remaining <= 45s)
-STOP_LOSS_URGENT_SALVAGE_MIN_BID = float(os.getenv("STOP_LOSS_URGENT_SALVAGE_MIN_BID", "0.20"))
+STOP_LOSS_URGENT_SALVAGE_MIN_BID = float(os.getenv("STOP_LOSS_URGENT_SALVAGE_MIN_BID", "0.05"))
+STOP_LOSS_PANIC_SALVAGE_MIN_BID = float(os.getenv("STOP_LOSS_PANIC_SALVAGE_MIN_BID", "0.02"))
 STOP_LOSS_URGENT_PERSISTENCE_SECONDS = float(os.getenv("STOP_LOSS_URGENT_PERSISTENCE_SECONDS", "3.0"))
 STOP_LOSS_URGENT_REMAINING_SECONDS = float(os.getenv("STOP_LOSS_URGENT_REMAINING_SECONDS", "45.0"))
+
+# Anti-Settlement-Loss Zero Hurdle & Hard Expiry Flatten:
+# If remaining <= 45s, noise hurdle drops to 0 (any adverse move across strike is actionable)
+STOP_LOSS_ZERO_HURDLE_REMAINING_S = float(os.getenv("STOP_LOSS_ZERO_HURDLE_REMAINING_S", "45.0"))
+# If remaining <= 20s, persistence drops to 0 (immediate panic flatten before 0.00 expiry)
+STOP_LOSS_HARD_FLATTEN_REMAINING_S = float(os.getenv("STOP_LOSS_HARD_FLATTEN_REMAINING_S", "20.0"))
 
 # --- Adverse Strike Stop-Loss Protection Filters ---
 # Hysteresis hurdle: Spot must cross strike against position by >= STOP_LOSS_MIN_ADVERSE_SIGMA * sigma(t)
