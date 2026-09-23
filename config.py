@@ -96,6 +96,11 @@ TAKE_PROFIT_BID = float(os.getenv("TAKE_PROFIT_BID", "0.95"))
 TAKE_PROFIT_ASK = float(os.getenv("TAKE_PROFIT_ASK", "0.96"))
 STOP_LOSS_SALVAGE_MIN_BID = float(os.getenv("STOP_LOSS_SALVAGE_MIN_BID", "0.25"))
 
+# --- Trailing Breakeven Stop-Loss Parameters ---
+TRAILING_BREAKEVEN_ENABLED = os.getenv("TRAILING_BREAKEVEN_ENABLED", "yes").strip().lower() in ("yes", "y", "true", "1")
+TRAILING_BREAKEVEN_TRIGGER = float(os.getenv("TRAILING_BREAKEVEN_TRIGGER", "0.85"))
+TRAILING_BREAKEVEN_BUFFER = float(os.getenv("TRAILING_BREAKEVEN_BUFFER", "0.02"))
+
 
 def compute_dynamic_feasibility(
     elapsed_s: float, spot: float, daily_vol: float

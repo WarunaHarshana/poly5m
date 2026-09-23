@@ -1579,6 +1579,14 @@ class TWAPBot:
                     best_ask = r_ask
 
         entry = float(pos["price"])
+
+        # Track peak market bid & activate trailing breakeven
+        if best_bid is not None:
+            peak_bid = max(float(pos.get("peak_bid", entry)), float(best_bid))
+            pos["peak_bid"] = peak_bid
+            if config.TRAILING_BREAKEVEN_ENABLED and peak_bid >= config.TRAILING_BREAKEVEN_TRIGGER:
+                pos["breakeven_active"] = True
+
         # Mark carefully: raw best bid on thin CLOB books is often garbage (e.g. 0.28 vs 0.87 ask).
         mark = None
         if best_bid is not None and best_ask is not None:
@@ -1605,7 +1613,22 @@ class TWAPBot:
             await self._exit_position_early(slot, market, exit_px, reason="take_profit")
             return
 
-        # 2) Adverse Stop-Loss:
+        # 2) Trailing Breakeven Stop-Loss:
+        # If position surged to >= TRAILING_BREAKEVEN_TRIGGER (e.g. 0.85) but failed to reach take-profit
+        # and starts collapsing back towards entry, exit at or near breakeven to protect capital.
+        if pos.get("breakeven_active") and best_bid is not None:
+            peak_bid = float(pos.get("peak_bid", entry))
+            be_buffer = getattr(config, "TRAILING_BREAKEVEN_BUFFER", 0.02)
+            if float(best_bid) <= entry + be_buffer and float(best_bid) >= entry - 0.05:
+                reason = f"trailing_breakeven (peak: {peak_bid:.2f}, exit: {float(best_bid):.2f}, entry: {entry:.2f})"
+                logger.warning(
+                    f"[{slot.asset.upper()} TRAILING BREAKEVEN] Peak {peak_bid:.2f} >= {config.TRAILING_BREAKEVEN_TRIGGER:.2f}, "
+                    f"pulled back to {float(best_bid):.2f} <= entry {entry:.2f} + buffer {be_buffer:.2f} — triggering early breakeven exit"
+                )
+                await self._exit_position_early(slot, market, float(best_bid), reason=reason)
+                return
+
+        # 3) Adverse Stop-Loss:
         # If spot crosses strike S0 against position (S_t < S0 for UP, or S_t > S0 for DOWN),
         # trigger early exit if salvage bid >= 0.25 to preserve capital.
         spot = self.cl_stream.price(slot.asset)
@@ -1718,8 +1741,9 @@ class TWAPBot:
     async def _exit_position_early(self, slot: CoinSlot, market: dict, exit_price: float, reason: str) -> None:
         """Flatten main (+ optional hedge) before TWAP settlement; paper marks at exit_price."""
         pos = slot.position
-        if not pos:
+        if not pos or pos.get("exiting"):
             return
+        pos["exiting"] = True
 
         shares = float(pos["shares"])
         cost = float(pos["cost_usd"])
@@ -1727,16 +1751,37 @@ class TWAPBot:
         rebate = float(pos.get("rebate", 0.0))
         exit_price = float(exit_price)
 
+        # Cancel any resting maker orders on this slot to prevent orphan fills
+        if slot.resting_order:
+            ro = slot.resting_order
+            if config.MODE == "live" and self.live_client and ro.get("order_id"):
+                try:
+                    self.live_client.cancel_order(ro["order_id"])
+                except Exception as e:
+                    logger.error(f"Error cancelling resting order during early exit: {e}")
+            slot.resting_order = None
+
         # Paper / live flatten of main
         if config.MODE == "live" and self.live_client:
             try:
+                # Realistic limit price allowing for 2¢ slippage during relayer latency
+                min_price = max(0.10, round(exit_price - 0.02, 2)) if exit_price >= 0.12 else max(0.01, round(exit_price - 0.02, 2))
                 resp = self.live_client.place_order(
-                    pos["token_id"], "SELL", max(0.01, exit_price), shares, order_type="FOK"
+                    pos["token_id"], "SELL", min_price, shares, order_type="FOK"
                 )
                 if not resp or not resp.get("filled"):
+                    filled_shares = float(resp.get("shares", 0.0)) if resp else 0.0
+                    if filled_shares > 0 and filled_shares < shares:
+                        logger.warning(f"Live early exit SELL partially filled: {filled_shares}/{shares} shares ({reason})")
+                        pos["shares"] = round(shares - filled_shares, 2)
+                        pos["cost_usd"] = round(pos["cost_usd"] * (pos["shares"] / shares), 2)
+                        pos["exiting"] = False
+                        return  # keep slot.position alive with remaining shares for next tick
+                    pos["exiting"] = False
                     logger.error(f"Live early exit SELL not filled ({reason}), retaining position for retry")
                     return  # keep slot.position alive so bot retries next tick
             except Exception as e:
+                pos["exiting"] = False
                 logger.error(f"Live early exit sell failed ({reason}): {e} — retaining position for retry")
                 return  # keep slot.position alive so bot retries next tick
 

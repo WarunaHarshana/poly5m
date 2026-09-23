@@ -468,6 +468,211 @@ class TestDynamicSimulation(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(slot.position)
         self.assertIn(market["slug"], self.bot._slot_done)
 
+    async def test_trailing_breakeven_exit_fires_cleanly(self):
+        """When a position reaches 0.88 and pulls back to 0.61 (entry 0.60), trailing breakeven exit fires cleanly."""
+        asset = "btc"
+        now = time.time()
+        slot_start = now - 180.0
+
+        market = {
+            "slug": "btc-usd-5m-test-trailing-breakeven-exit",
+            "slot_start_ts": slot_start,
+            "start_time": slot_start,
+            "end_ts": slot_start + 300.0,
+            "end_time": slot_start + 300.0,
+            "strike_price": 90000.0,
+            "tokens": {"UP": "tok_up_btc", "DOWN": "tok_down_btc"},
+            "fee_rate": 0.0,
+        }
+
+        slot = self.bot.slots[asset]
+        slot.market = market
+        slot.strike = 90000.0
+
+        # Simulate existing open position bought at 0.60
+        slot.position = {
+            "asset": asset,
+            "slot": market["slug"],
+            "strategy": "JEV_DYNAMIC_MOMENTUM",
+            "side": "UP",
+            "token_id": "tok_up_btc",
+            "price": 0.60,
+            "shares": 10.0,
+            "cost_usd": 6.00,
+            "strike": 90000.0,
+        }
+
+        self.bot.cl_stream._record(now, 90500.0, asset=asset)
+
+        # 1. Market best bid surges to 0.88 (>= 0.85 trigger, but < 0.95 TP target)
+        self.bot.book_stream._apply_update("tok_up_btc", bid=0.88, ask=0.90, bid_sz=500, ask_sz=500)
+        await self.bot._tick_asset(slot, now)
+
+        # Position should still be active, with peak_bid=0.88 and breakeven_active=True
+        self.assertIsNotNone(slot.position)
+        self.assertEqual(slot.position.get("peak_bid"), 0.88)
+        self.assertTrue(slot.position.get("breakeven_active"))
+
+        # 2. Market pulls back to 0.61 (<= entry 0.60 + buffer 0.02, >= entry - 0.05)
+        now_pullback = now + 1.0
+        self.bot.cl_stream._record(now_pullback, 90450.0, asset=asset)
+        self.bot.book_stream._apply_update("tok_up_btc", bid=0.61, ask=0.63, bid_sz=500, ask_sz=500)
+        await self.bot._tick_asset(slot, now_pullback)
+
+        # Position should now be cleanly closed via trailing breakeven exit
+        self.assertIsNone(slot.position)
+        self.assertIn(market["slug"], self.bot._slot_done)
+
+    async def test_trailing_breakeven_does_not_fire_without_reaching_trigger(self):
+        """Position reaching only 0.75 (< 0.85 trigger) does NOT activate breakeven stop-loss on pullback."""
+        asset = "btc"
+        now = time.time()
+        slot_start = now - 180.0
+
+        market = {
+            "slug": "btc-usd-5m-test-no-trigger",
+            "slot_start_ts": slot_start,
+            "start_time": slot_start,
+            "end_ts": slot_start + 300.0,
+            "end_time": slot_start + 300.0,
+            "strike_price": 90000.0,
+            "tokens": {"UP": "tok_up_btc", "DOWN": "tok_down_btc"},
+            "fee_rate": 0.0,
+        }
+
+        slot = self.bot.slots[asset]
+        slot.market = market
+        slot.strike = 90000.0
+
+        slot.position = {
+            "asset": asset,
+            "slot": market["slug"],
+            "strategy": "JEV_DYNAMIC_MOMENTUM",
+            "side": "UP",
+            "token_id": "tok_up_btc",
+            "price": 0.60,
+            "shares": 10.0,
+            "cost_usd": 6.00,
+            "strike": 90000.0,
+        }
+
+        self.bot.cl_stream._record(now, 90200.0, asset=asset)
+        # Bid reaches 0.75 (< 0.85)
+        self.bot.book_stream._apply_update("tok_up_btc", bid=0.75, ask=0.77, bid_sz=500, ask_sz=500)
+        await self.bot._tick_asset(slot, now)
+
+        self.assertIsNotNone(slot.position)
+        self.assertFalse(slot.position.get("breakeven_active", False))
+
+        # Pullback to 0.61 should NOT trigger breakeven exit
+        now2 = now + 1.0
+        self.bot.cl_stream._record(now2, 90150.0, asset=asset)
+        self.bot.book_stream._apply_update("tok_up_btc", bid=0.61, ask=0.63, bid_sz=500, ask_sz=500)
+        await self.bot._tick_asset(slot, now2)
+
+        self.assertIsNotNone(slot.position)
+
+    async def test_trailing_breakeven_does_not_fire_when_disabled(self):
+        """When TRAILING_BREAKEVEN_ENABLED is False, position does not trigger breakeven exit."""
+        asset = "btc"
+        now = time.time()
+        slot_start = now - 180.0
+
+        market = {
+            "slug": "btc-usd-5m-test-disabled",
+            "slot_start_ts": slot_start,
+            "start_time": slot_start,
+            "end_ts": slot_start + 300.0,
+            "end_time": slot_start + 300.0,
+            "strike_price": 90000.0,
+            "tokens": {"UP": "tok_up_btc", "DOWN": "tok_down_btc"},
+            "fee_rate": 0.0,
+        }
+
+        slot = self.bot.slots[asset]
+        slot.market = market
+        slot.strike = 90000.0
+
+        slot.position = {
+            "asset": asset,
+            "slot": market["slug"],
+            "strategy": "JEV_DYNAMIC_MOMENTUM",
+            "side": "UP",
+            "token_id": "tok_up_btc",
+            "price": 0.60,
+            "shares": 10.0,
+            "cost_usd": 6.00,
+            "strike": 90000.0,
+        }
+
+        old_setting = config.TRAILING_BREAKEVEN_ENABLED
+        try:
+            config.TRAILING_BREAKEVEN_ENABLED = False
+            self.bot.cl_stream._record(now, 90500.0, asset=asset)
+            self.bot.book_stream._apply_update("tok_up_btc", bid=0.88, ask=0.90, bid_sz=500, ask_sz=500)
+            await self.bot._tick_asset(slot, now)
+
+            self.assertIsNotNone(slot.position)
+            self.assertFalse(slot.position.get("breakeven_active", False))
+
+            now2 = now + 1.0
+            self.bot.cl_stream._record(now2, 90450.0, asset=asset)
+            self.bot.book_stream._apply_update("tok_up_btc", bid=0.61, ask=0.63, bid_sz=500, ask_sz=500)
+            await self.bot._tick_asset(slot, now2)
+
+            self.assertIsNotNone(slot.position)
+        finally:
+            config.TRAILING_BREAKEVEN_ENABLED = old_setting
+
+    async def test_trailing_breakeven_does_not_fire_when_bid_gaps_below_floor(self):
+        """When bid gaps below entry - 0.05, trailing breakeven does not trigger (preserves option value)."""
+        asset = "btc"
+        now = time.time()
+        slot_start = now - 180.0
+
+        market = {
+            "slug": "btc-usd-5m-test-gap-below-floor",
+            "slot_start_ts": slot_start,
+            "start_time": slot_start,
+            "end_ts": slot_start + 300.0,
+            "end_time": slot_start + 300.0,
+            "strike_price": 90000.0,
+            "tokens": {"UP": "tok_up_btc", "DOWN": "tok_down_btc"},
+            "fee_rate": 0.0,
+        }
+
+        slot = self.bot.slots[asset]
+        slot.market = market
+        slot.strike = 90000.0
+
+        slot.position = {
+            "asset": asset,
+            "slot": market["slug"],
+            "strategy": "JEV_DYNAMIC_MOMENTUM",
+            "side": "UP",
+            "token_id": "tok_up_btc",
+            "price": 0.60,
+            "shares": 10.0,
+            "cost_usd": 6.00,
+            "strike": 90000.0,
+        }
+
+        # 1. Bid reaches 0.88 -> activates breakeven
+        self.bot.cl_stream._record(now, 90500.0, asset=asset)
+        self.bot.book_stream._apply_update("tok_up_btc", bid=0.88, ask=0.90, bid_sz=500, ask_sz=500)
+        await self.bot._tick_asset(slot, now)
+
+        self.assertTrue(slot.position.get("breakeven_active"))
+
+        # 2. Bid gaps down to 0.50 (< entry 0.60 - 0.05 = 0.55), but spot is still above strike (90100 > 90000)
+        now2 = now + 1.0
+        self.bot.cl_stream._record(now2, 90100.0, asset=asset)
+        self.bot.book_stream._apply_update("tok_up_btc", bid=0.50, ask=0.55, bid_sz=500, ask_sz=500)
+        await self.bot._tick_asset(slot, now2)
+
+        # Position should still be retained (option value preserved)
+        self.assertIsNotNone(slot.position)
+
     async def test_adverse_stop_loss_exit_on_salvageable_bid(self):
         """Trigger early stop-loss exit when spot crosses strike adversely and salvage bid >= 0.25."""
         asset = "btc"
