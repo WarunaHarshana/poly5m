@@ -50,6 +50,7 @@ class ChainlinkRTDSStream:
         self._task: asyncio.Task | None = None
         self._ready_event = threading.Event()
         self._last_tick_time: dict[str, float] = {a: 0.0 for a in self.assets}
+        self._backup_prices: dict[str, tuple[float, float]] = {}  # asset -> (price, ts)
         self._stream_clock_offset: float = 0.0  # (stream_ts - local_ts)
 
     def start(self) -> None:
@@ -80,13 +81,67 @@ class ChainlinkRTDSStream:
         a = str(asset or self.asset).lower()
         return a if a in self._history else self.asset
 
+    def _fetch_backup_spot(self, asset: str) -> float | None:
+        """Fallback to Binance or Coinbase REST if Chainlink tick is stale."""
+        now = time.time()
+        cached = self._backup_prices.get(asset)
+        if cached and (now - cached[1]) < 1.0:
+            return cached[0]
+
+        import urllib.request
+        sym = {"btc": "BTCUSDT", "eth": "ETHUSDT", "sol": "SOLUSDT", "bnb": "BNBUSDT"}.get(asset.lower())
+        if sym:
+            try:
+                req = urllib.request.Request(
+                    f"https://api.binance.com/api/v3/ticker/price?symbol={sym}",
+                    headers={"User-Agent": "poly5m"},
+                )
+                with urllib.request.urlopen(req, timeout=1.2) as res:
+                    data = json.loads(res.read().decode())
+                    p = float(data["price"])
+                    if p > 0:
+                        self._backup_prices[asset] = (p, now)
+                        return p
+            except Exception:
+                pass
+
+        cb_sym = {"btc": "BTC-USD", "eth": "ETH-USD", "sol": "SOL-USD", "bnb": "BNB-USD"}.get(asset.lower())
+        if cb_sym:
+            try:
+                req = urllib.request.Request(
+                    f"https://api.coinbase.com/v2/prices/{cb_sym}/spot",
+                    headers={"User-Agent": "poly5m"},
+                )
+                with urllib.request.urlopen(req, timeout=1.2) as res:
+                    data = json.loads(res.read().decode())
+                    p = float(data["data"]["amount"])
+                    if p > 0:
+                        self._backup_prices[asset] = (p, now)
+                        return p
+            except Exception:
+                pass
+        return None
+
     def price(self, asset: str | None = None) -> float:
         a = self._asset_or_default(asset)
+        last_p = 0.0
+        last_t = 0.0
         with self._lock:
             hist = self._history.get(a)
-            if not hist:
-                return 0.0
-            return hist[-1][1]
+            if hist:
+                last_p = hist[-1][1]
+            last_t = self._last_tick_time.get(a, 0.0)
+
+        # If fresh, return primary Chainlink price immediately
+        if last_p > 0 and (time.time() - last_t) <= config.MAX_ORACLE_STALE_S:
+            return last_p
+
+        # If stale or missing, query fast backup REST
+        backup_p = self._fetch_backup_spot(a)
+        if backup_p and backup_p > 0:
+            return backup_p
+
+        return last_p
 
     def clock_offset_s(self) -> float:
         return self._stream_clock_offset
@@ -251,9 +306,9 @@ class ChainlinkRTDSStream:
                     logger.info("[ChainlinkRTDS] Connected and subscribed to tick feed")
                     while not self._stop:
                         try:
-                            raw = await asyncio.wait_for(ws.recv(), timeout=6.0)
+                            raw = await asyncio.wait_for(ws.recv(), timeout=25.0)
                         except asyncio.TimeoutError:
-                            logger.warning("[ChainlinkRTDS] Heartbeat timeout (>6s no message), reconnecting stream...")
+                            logger.warning("[ChainlinkRTDS] Inactivity timeout (>25s no message), reconnecting stream...")
                             self.mark_stale("rtds_silence")
                             break
                         if not raw or not raw.strip() or raw in ("PONG", "pong"):
@@ -360,16 +415,20 @@ class PolymarketBookStream:
             bid_size = b.get("bid_size", 0) if b else 0
             ask_size = b.get("ask_size", 0) if b else 0
 
-            # Complementary inference
+            # Complementary inference: use opposite book to infer or improve quotes
             if b_opp:
                 opp_bid = b_opp.get("bid")
                 opp_ask = b_opp.get("ask")
-                if ask is None and opp_bid is not None and 0.0 < opp_bid < 1.0:
-                    ask = round(1.0 - opp_bid, 4)
-                    ask_size = b_opp.get("bid_size", 0)
-                if bid is None and opp_ask is not None and 0.0 < opp_ask < 1.0:
-                    bid = round(1.0 - opp_ask, 4)
-                    bid_size = b_opp.get("ask_size", 0)
+                if opp_bid is not None and 0.0 < opp_bid < 1.0:
+                    implied_ask = round(1.0 - opp_bid, 4)
+                    if ask is None or implied_ask < ask:
+                        ask = implied_ask
+                        ask_size = b_opp.get("bid_size", 0)
+                if opp_ask is not None and 0.0 < opp_ask < 1.0:
+                    implied_bid = round(1.0 - opp_ask, 4)
+                    if bid is None or implied_bid > bid:
+                        bid = implied_bid
+                        bid_size = b_opp.get("ask_size", 0)
 
             spread = round(ask - bid, 4) if (ask is not None and bid is not None) else None
             return {

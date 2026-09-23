@@ -568,6 +568,41 @@ class TWAPBot:
         remaining_s = max(0.0, end_ts - now)
         elapsed_s = max(0.0, now - slot_start_ts)
 
+        tokens = market.get("tokens") or {}
+
+        # ---------------------------------------------------------------------
+        # 1. PRIORITY POSITION MANAGEMENT: NEVER SKIP OPEN POSITIONS!
+        # Even during transient oracle staleness or WebSocket reconnections,
+        # open positions with real capital at risk MUST be managed every second.
+        # ---------------------------------------------------------------------
+        if slot.position:
+            spot_pos = self.cl_stream.price(asset)
+            strike_pos = slot.strike or (float(slot.position["strike"]) if slot.position.get("strike") else None)
+            twap_pos = None
+            if slot_start_ts:
+                twap_pos, _ = self.cl_stream.compute_realized_twap(start_ts=slot_start_ts, end_ts=now, asset=asset)
+
+            await self._manage_open_momentum_position(
+                slot, market, remaining_s, tokens,
+                spot=spot_pos, strike=strike_pos,
+                realized_twap=twap_pos, elapsed_s=elapsed_s,
+                now=now,
+            )
+
+            if remaining_s <= 0.0:
+                if slot.resting_order:
+                    slot.resting_order = None
+                if slot.position:
+                    self._queue_settlement(slot)
+                return
+
+            # If position remains open, do not evaluate new entries on this coin
+            if slot.position:
+                return
+
+        # ---------------------------------------------------------------------
+        # 2. NEW ENTRY GATES: REQUIRE ACTIVE & FRESH ORACLE TICKS
+        # ---------------------------------------------------------------------
         if not self.cl_stream.ready_for(asset):
             return
         if self.cl_stream.is_stale(max_age_s=config.MAX_ORACLE_STALE_S, asset=asset):
@@ -1811,6 +1846,29 @@ class TWAPBot:
                         f"(dist={adverse_dist:.2f} < min={min_adverse_usd:.2f}) — resetting stop-loss persistence timer"
                     )
                     pos["adverse_start_ts"] = None
+
+                # Fail-safe orderbook collapse defense:
+                # If spot appears favorable or inside noise buffer, but Polymarket orderbook quotes have
+                # collapsed into the final 35 seconds (market bid <= 0.22 and <= 45% of entry),
+                # the market makers/arbitrageurs are pricing an expiry loss. Do NOT hold to 0.00!
+                if remaining_s <= 35.0:
+                    salvage_candidate = float(best_bid) if best_bid is not None else 0.0
+                    if salvage_candidate < 0.05 and opp_token_id:
+                        opp_top = self.book_stream.get_top(opp_token_id) if hasattr(self, "book_stream") else None
+                        opp_ask = opp_top.get("ask") if opp_top else None
+                        if opp_ask is None:
+                            bk_opp = self.pub_client.get_order_book(opp_token_id)
+                            _, opp_ask = extract_best_bid_ask(bk_opp)
+                        if opp_ask is not None and 0.0 < opp_ask < 1.0:
+                            salvage_candidate = max(salvage_candidate, round(1.0 - opp_ask, 4))
+
+                    if 0.02 <= salvage_candidate <= 0.22 and salvage_candidate <= (entry * 0.45):
+                        logger.warning(
+                            f"[{slot.asset.upper()} FAILSAFE CRASH FLATTEN] remaining={remaining_s:.1f}s <= 35s, "
+                            f"market bid {salvage_candidate:.3f} <= 0.22 (entry={entry:.3f}) — emergency salvage exit to prevent 0.00 expiry loss"
+                        )
+                        await self._exit_position_early(slot, market, salvage_candidate, reason="failsafe_orderbook_flatten")
+                        return
             else:
                 # Spot is adversely across strike beyond noise hurdle: track/continue persistence timer
                 if pos.get("adverse_start_ts") is None:
@@ -1900,6 +1958,26 @@ class TWAPBot:
                         f"(dist={adverse_dist:.2f} >= min={min_adverse_usd:.2f}), but TWAP has not confirmed and not catastrophic "
                         f"(dur={adverse_duration:.1f}s, continuing to monitor)"
                     )
+        else:
+            # Spot or strike is missing/ungrounded.
+            # If in final 35s and orderbook has collapsed, flatten as fail-safe!
+            if remaining_s <= 35.0:
+                salvage_candidate = float(best_bid) if best_bid is not None else 0.0
+                if salvage_candidate < 0.05 and opp_token_id:
+                    opp_top = self.book_stream.get_top(opp_token_id) if hasattr(self, "book_stream") else None
+                    opp_ask = opp_top.get("ask") if opp_top else None
+                    if opp_ask is None:
+                        bk_opp = self.pub_client.get_order_book(opp_token_id)
+                        _, opp_ask = extract_best_bid_ask(bk_opp)
+                    if opp_ask is not None and 0.0 < opp_ask < 1.0:
+                        salvage_candidate = max(salvage_candidate, round(1.0 - opp_ask, 4))
+                if 0.02 <= salvage_candidate <= 0.22 and salvage_candidate <= (entry * 0.45):
+                    logger.warning(
+                        f"[{slot.asset.upper()} FAILSAFE CRASH FLATTEN] remaining={remaining_s:.1f}s <= 35s (no spot), "
+                        f"market bid {salvage_candidate:.3f} <= 0.22 (entry={entry:.3f}) — emergency salvage exit to prevent 0.00 expiry loss"
+                    )
+                    await self._exit_position_early(slot, market, salvage_candidate, reason="failsafe_orderbook_flatten")
+                    return
 
         # 3) Legacy H-005 Stop-loss vs entry (mid only when spread is sane) - applies only to legacy H-005
         is_legacy_h005 = pos.get("strategy") in ("H-005_MOMENTUM", "H-005", "LATE_MOMENTUM", "MOMENTUM")

@@ -1926,6 +1926,103 @@ class TestDynamicSimulation(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(trade["exit_reason"], "hard_flatten_expiry")
         self.assertEqual(trade["exit_price"], 0.04)
 
+    async def test_tick_asset_manages_position_even_when_oracle_stale(self):
+        """Verify that _tick_asset executes position management even if Chainlink is marked stale."""
+        asset = "btc"
+        now = time.time()
+        slot_start = now - 280.0
+        market = {
+            "slug": "btc-usd-5m-stale-feed-test",
+            "slot_start_ts": slot_start,
+            "start_time": slot_start,
+            "end_ts": slot_start + 300.0,
+            "end_time": slot_start + 300.0,
+            "strike_price": 90000.0,
+            "tokens": {"UP": "tok_up_btc", "DOWN": "tok_down_btc"},
+            "fee_rate": 0.0,
+        }
+        slot = self.bot.slots[asset]
+        slot.market = market
+        slot.strike = 90000.0
+        slot.position = {
+            "strategy": "JEV_DYNAMIC_MOMENTUM",
+            "side": "UP",
+            "token_id": "tok_up_btc",
+            "opp_token_id": "tok_down_btc",
+            "price": 0.60,
+            "shares": 5.0,
+            "cost_usd": 3.00,
+            "fee": 0.08,
+            "strike": 90000.0,
+            "slot_start_ts": slot_start,
+            "entry_time": slot_start + 30.0,
+            "entry_elapsed_s": 30.0,
+            "entry_window_time": "t=30s (00:30)",
+        }
+
+        # Mock cl_stream: is_stale returns True!
+        self.bot.cl_stream.is_stale = lambda max_age_s=None, asset=None: True
+        # Orderbook bid reaches take-profit target 0.96
+        self.bot.book_stream._apply_update("tok_up_btc", bid=0.96, ask=0.97, bid_sz=500, ask_sz=500)
+
+        # Call _tick_asset: must NOT return early or skip the position!
+        await self.bot._tick_asset(slot, now)
+
+        self.assertIsNone(slot.position, "Position should have been managed and exited at take-profit despite stale feed")
+        loaded = load_trades(self.bot._trades_log_path)
+        trade = loaded[-1]
+        self.assertEqual(trade["exit_reason"], "take_profit")
+        self.assertEqual(trade["exit_price"], 0.96)
+
+    async def test_failsafe_orderbook_flatten_when_spot_flat_and_book_crashes(self):
+        """Verify that within 35s, if orderbook dumps to <= 0.22 even when spot is not adverse, failsafe exits."""
+        asset = "btc"
+        now = time.time()
+        slot_start = now - 275.0  # 25s remaining
+        market = {
+            "slug": "btc-usd-5m-failsafe-test",
+            "slot_start_ts": slot_start,
+            "start_time": slot_start,
+            "end_ts": slot_start + 300.0,
+            "end_time": slot_start + 300.0,
+            "strike_price": 90000.0,
+            "tokens": {"UP": "tok_up_btc", "DOWN": "tok_down_btc"},
+            "fee_rate": 0.0,
+        }
+        slot = self.bot.slots[asset]
+        slot.market = market
+        slot.strike = 90000.0
+        slot.position = {
+            "strategy": "JEV_DYNAMIC_MOMENTUM",
+            "side": "UP",
+            "token_id": "tok_up_btc",
+            "opp_token_id": "tok_down_btc",
+            "price": 0.60,
+            "shares": 5.0,
+            "cost_usd": 3.00,
+            "fee": 0.08,
+            "strike": 90000.0,
+            "slot_start_ts": slot_start,
+            "entry_time": slot_start + 30.0,
+            "entry_elapsed_s": 30.0,
+            "entry_window_time": "t=30s (00:30)",
+        }
+
+        # Spot is 90,005.0 (+5 above strike, technically not adverse so adverse stop loss doesn't fire).
+        # But orderbook for UP token has collapsed to 0.12 (market knows it's dumping).
+        self.bot.book_stream._apply_update("tok_up_btc", bid=0.12, ask=0.15, bid_sz=500, ask_sz=500)
+
+        await self.bot._manage_open_momentum_position(
+            slot, market, remaining_s=25.0, tokens=market["tokens"],
+            spot=90005.0, strike=90000.0, elapsed_s=275.0, now=now,
+        )
+
+        self.assertIsNone(slot.position, "Position should have been flattened by failsafe orderbook collapse exit")
+        loaded = load_trades(self.bot._trades_log_path)
+        trade = loaded[-1]
+        self.assertEqual(trade["exit_reason"], "failsafe_orderbook_flatten")
+        self.assertEqual(trade["exit_price"], 0.12)
+
 
 if __name__ == "__main__":
     unittest.main()
