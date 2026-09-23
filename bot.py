@@ -1616,14 +1616,24 @@ class TWAPBot:
         # 2) Trailing Breakeven Stop-Loss:
         # If position surged to >= TRAILING_BREAKEVEN_TRIGGER (e.g. 0.85) but failed to reach take-profit
         # and starts collapsing back towards entry, exit at or near breakeven to protect capital.
-        if pos.get("breakeven_active") and best_bid is not None:
+        if config.TRAILING_BREAKEVEN_ENABLED and pos.get("breakeven_active") and best_bid is not None:
             peak_bid = float(pos.get("peak_bid", entry))
-            be_buffer = getattr(config, "TRAILING_BREAKEVEN_BUFFER", 0.02)
-            if float(best_bid) <= entry + be_buffer and float(best_bid) >= entry - 0.05:
+            fee_rate = float(
+                market.get("fee_rate")
+                if market.get("fee_rate") is not None
+                else getattr(config, "TAKER_FEE_RATE", 0.07)
+            )
+            # Round-trip taker fee (entry + exit legs): approx 2 * fee_rate * p * (1 - p)
+            round_trip_fee = 2.0 * fee_rate * entry * (1.0 - entry)
+            cfg_buffer = getattr(config, "TRAILING_BREAKEVEN_BUFFER", 0.01)
+            # Fee-aware buffer: covers round-trip taker fees plus configured safety cushion
+            be_buffer = round(round_trip_fee + cfg_buffer, 4)
+            floor = round(entry - 0.05, 4)
+            if float(best_bid) <= entry + be_buffer and float(best_bid) >= floor:
                 reason = f"trailing_breakeven (peak: {peak_bid:.2f}, exit: {float(best_bid):.2f}, entry: {entry:.2f})"
                 logger.warning(
                     f"[{slot.asset.upper()} TRAILING BREAKEVEN] Peak {peak_bid:.2f} >= {config.TRAILING_BREAKEVEN_TRIGGER:.2f}, "
-                    f"pulled back to {float(best_bid):.2f} <= entry {entry:.2f} + buffer {be_buffer:.2f} — triggering early breakeven exit"
+                    f"pulled back to {float(best_bid):.2f} <= entry {entry:.2f} + buffer {be_buffer:.2f} (fees: {round_trip_fee:.3f}) — triggering early breakeven exit"
                 )
                 await self._exit_position_early(slot, market, float(best_bid), reason=reason)
                 return
@@ -1766,20 +1776,41 @@ class TWAPBot:
             try:
                 # Realistic limit price allowing for 2¢ slippage during relayer latency
                 min_price = max(0.10, round(exit_price - 0.02, 2)) if exit_price >= 0.12 else max(0.01, round(exit_price - 0.02, 2))
+                # Use FAK (Fill-And-Kill / IOC) to sweep book liquidity without all-or-nothing rejection
                 resp = self.live_client.place_order(
-                    pos["token_id"], "SELL", min_price, shares, order_type="FOK"
+                    pos["token_id"], "SELL", min_price, shares, order_type="FAK"
                 )
-                if not resp or not resp.get("filled"):
-                    filled_shares = float(resp.get("shares", 0.0)) if resp else 0.0
-                    if filled_shares > 0 and filled_shares < shares:
-                        logger.warning(f"Live early exit SELL partially filled: {filled_shares}/{shares} shares ({reason})")
-                        pos["shares"] = round(shares - filled_shares, 2)
-                        pos["cost_usd"] = round(pos["cost_usd"] * (pos["shares"] / shares), 2)
-                        pos["exiting"] = False
-                        return  # keep slot.position alive with remaining shares for next tick
+                if not resp or not resp.get("success"):
+                    pos["exiting"] = False
+                    logger.error(f"Live early exit SELL failed ({reason}), retaining position for retry")
+                    return
+
+                filled_shares = float(resp.get("shares", 0.0))
+                if not resp.get("filled") or filled_shares <= 0:
                     pos["exiting"] = False
                     logger.error(f"Live early exit SELL not filled ({reason}), retaining position for retry")
-                    return  # keep slot.position alive so bot retries next tick
+                    return
+
+                if filled_shares < shares - 1e-4:
+                    logger.warning(
+                        f"Live early exit SELL partially filled: {filled_shares:.2f}/{shares:.2f} shares ({reason})"
+                    )
+                    fee_rate = float(
+                        market.get("fee_rate")
+                        if market.get("fee_rate") is not None
+                        else getattr(config, "TAKER_FEE_RATE", 0.07)
+                    )
+                    exit_fee = fee_rate * exit_price * (1.0 - exit_price) * filled_shares
+                    filled_cost = round(cost * (filled_shares / shares), 2)
+                    entry_fee_portion = round(fee * (filled_shares / shares), 4)
+                    partial_pnl = (filled_shares * exit_price) - filled_cost - entry_fee_portion - exit_fee
+                    self.risk.record_trade_result(partial_pnl)
+
+                    pos["shares"] = round(shares - filled_shares, 2)
+                    pos["cost_usd"] = round(cost - filled_cost, 2)
+                    pos["fee"] = round(fee - entry_fee_portion, 4)
+                    pos["exiting"] = False
+                    return  # keep remaining shares in slot.position for retry on next tick
             except Exception as e:
                 pos["exiting"] = False
                 logger.error(f"Live early exit sell failed ({reason}): {e} — retaining position for retry")
@@ -1797,8 +1828,13 @@ class TWAPBot:
                 asset=slot.asset,
             )
 
-
-        main_pnl = (shares * exit_price) - cost - fee + rebate
+        fee_rate = float(
+            market.get("fee_rate")
+            if market.get("fee_rate") is not None
+            else getattr(config, "TAKER_FEE_RATE", 0.07)
+        )
+        exit_fee = fee_rate * exit_price * (1.0 - exit_price) * shares if (config.MODE == "live" or fee > 0) else 0.0
+        main_pnl = (shares * exit_price) - cost - fee - exit_fee + rebate
 
         hedge_pnl = 0.0
         if pos.get("hedge_placed"):
@@ -1841,6 +1877,7 @@ class TWAPBot:
             "shares": shares,
             "cost_usd": cost,
             "fee": fee,
+            "exit_fee": round(exit_fee, 4),
             "rebate": rebate,
             "hedge_placed": bool(pos.get("hedge_placed")),
             "hedge_side": pos.get("hedge_side"),

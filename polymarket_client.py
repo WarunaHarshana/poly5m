@@ -352,7 +352,15 @@ class PolymarketLiveClient:
             size=round(size, 2),
             side=side.upper(),
         )
-        ot = OrderType.GTC if order_type.upper() == "GTC" else OrderType.FOK
+        ot_str = str(order_type).upper()
+        if ot_str == "GTC":
+            ot = OrderType.GTC
+        elif ot_str == "FAK":
+            ot = OrderType.FAK
+        elif ot_str == "GTD":
+            ot = OrderType.GTD
+        else:
+            ot = OrderType.FOK
 
         def _submit():
             signed_order = self.client.create_order(order_args)

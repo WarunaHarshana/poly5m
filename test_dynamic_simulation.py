@@ -8,7 +8,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import config
 from bot import TWAPBot
@@ -672,6 +672,188 @@ class TestDynamicSimulation(unittest.IsolatedAsyncioTestCase):
 
         # Position should still be retained (option value preserved)
         self.assertIsNotNone(slot.position)
+
+    async def test_trailing_breakeven_fee_aware_exit(self):
+        """Trailing breakeven dynamically accounts for round-trip Polymarket taker fees (0.07*P*(1-P))."""
+        asset = "btc"
+        now = time.time()
+        slot_start = now - 180.0
+
+        market = {
+            "slug": "btc-usd-5m-test-fee-aware",
+            "slot_start_ts": slot_start,
+            "start_time": slot_start,
+            "end_ts": slot_start + 300.0,
+            "end_time": slot_start + 300.0,
+            "strike_price": 90000.0,
+            "tokens": {"UP": "tok_up_btc", "DOWN": "tok_down_btc"},
+            "fee_rate": 0.07,  # Standard Polymarket crypto taker fee rate
+        }
+
+        slot = self.bot.slots[asset]
+        slot.market = market
+        slot.strike = 90000.0
+
+        slot.position = {
+            "asset": asset,
+            "slot": market["slug"],
+            "strategy": "JEV_DYNAMIC_MOMENTUM",
+            "side": "UP",
+            "token_id": "tok_up_btc",
+            "price": 0.60,
+            "shares": 10.0,
+            "cost_usd": 6.00,
+            "fee": 0.168,  # Entry fee = 10 * 0.07 * 0.60 * 0.40 = 0.168
+            "strike": 90000.0,
+        }
+
+        # 1. Surge to 0.88 -> activates breakeven
+        self.bot.cl_stream._record(now, 90500.0, asset=asset)
+        self.bot.book_stream._apply_update("tok_up_btc", bid=0.88, ask=0.90, bid_sz=500, ask_sz=500)
+        await self.bot._tick_asset(slot, now)
+
+        self.assertTrue(slot.position.get("breakeven_active"))
+
+        # With entry=0.60 and fee_rate=0.07:
+        # round_trip_fee = 2 * 0.07 * 0.60 * 0.40 = 0.0336
+        # buffer = 0.0336 + 0.01 = 0.0436 -> trigger price = 0.6436
+        # Pullback to 0.64 (<= 0.6436) MUST trigger early exit to preserve net capital after fees
+        now2 = now + 1.0
+        self.bot.cl_stream._record(now2, 90450.0, asset=asset)
+        self.bot.book_stream._apply_update("tok_up_btc", bid=0.64, ask=0.66, bid_sz=500, ask_sz=500)
+        await self.bot._tick_asset(slot, now2)
+
+        self.assertIsNone(slot.position)
+        self.assertIn(market["slug"], self.bot._slot_done)
+
+    async def test_trailing_breakeven_live_partial_fill_handling(self):
+        """In live mode, partial fills update position state without dropping remaining shares."""
+        asset = "btc"
+        now = time.time()
+        slot_start = now - 180.0
+
+        market = {
+            "slug": "btc-usd-5m-test-partial-fill",
+            "slot_start_ts": slot_start,
+            "start_time": slot_start,
+            "end_ts": slot_start + 300.0,
+            "end_time": slot_start + 300.0,
+            "strike_price": 90000.0,
+            "tokens": {"UP": "tok_up_btc", "DOWN": "tok_down_btc"},
+            "fee_rate": 0.0,
+        }
+
+        slot = self.bot.slots[asset]
+        slot.market = market
+        slot.strike = 90000.0
+
+        slot.position = {
+            "asset": asset,
+            "slot": market["slug"],
+            "strategy": "JEV_DYNAMIC_MOMENTUM",
+            "side": "UP",
+            "token_id": "tok_up_btc",
+            "price": 0.60,
+            "shares": 10.0,
+            "cost_usd": 6.00,
+            "fee": 0.0,
+            "strike": 90000.0,
+        }
+
+        # Mock live client with partial fill on first attempt (4.0 filled out of 10.0)
+        mock_live = MagicMock()
+        mock_live.place_order.side_effect = [
+            {"success": True, "filled": True, "shares": 4.0, "status": "matched", "order_id": "ord_partial_1"},
+            {"success": True, "filled": True, "shares": 6.0, "status": "matched", "order_id": "ord_full_2"},
+        ]
+        self.bot.live_client = mock_live
+        old_mode = config.MODE
+        config.MODE = "live"
+
+        try:
+            # 1. Activate breakeven at 0.88
+            self.bot.cl_stream._record(now, 90500.0, asset=asset)
+            self.bot.book_stream._apply_update("tok_up_btc", bid=0.88, ask=0.90, bid_sz=500, ask_sz=500)
+            await self.bot._tick_asset(slot, now)
+            self.assertTrue(slot.position.get("breakeven_active"))
+
+            # 2. Pullback to 0.61 triggers exit, but book only fills 4 shares
+            now2 = now + 1.0
+            self.bot.cl_stream._record(now2, 90450.0, asset=asset)
+            self.bot.book_stream._apply_update("tok_up_btc", bid=0.61, ask=0.63, bid_sz=500, ask_sz=500)
+            await self.bot._tick_asset(slot, now2)
+
+            # Position MUST NOT be None: 6 shares remain!
+            self.assertIsNotNone(slot.position)
+            self.assertEqual(slot.position["shares"], 6.0)
+            self.assertEqual(slot.position["cost_usd"], 3.60)
+            self.assertFalse(slot.position.get("exiting", False))
+
+            # 3. Next tick exits remaining 6 shares
+            now3 = now2 + 1.0
+            self.bot.cl_stream._record(now3, 90450.0, asset=asset)
+            await self.bot._tick_asset(slot, now3)
+
+            # Now position is fully closed
+            self.assertIsNone(slot.position)
+            self.assertIn(market["slug"], self.bot._slot_done)
+        finally:
+            config.MODE = old_mode
+            self.bot.live_client = None
+
+    async def test_trailing_breakeven_runtime_disabled_after_activation(self):
+        """Disabling TRAILING_BREAKEVEN_ENABLED at runtime prevents breakeven exit even if previously activated."""
+        asset = "btc"
+        now = time.time()
+        slot_start = now - 180.0
+
+        market = {
+            "slug": "btc-usd-5m-test-runtime-disable",
+            "slot_start_ts": slot_start,
+            "start_time": slot_start,
+            "end_ts": slot_start + 300.0,
+            "end_time": slot_start + 300.0,
+            "strike_price": 90000.0,
+            "tokens": {"UP": "tok_up_btc", "DOWN": "tok_down_btc"},
+            "fee_rate": 0.0,
+        }
+
+        slot = self.bot.slots[asset]
+        slot.market = market
+        slot.strike = 90000.0
+
+        slot.position = {
+            "asset": asset,
+            "slot": market["slug"],
+            "strategy": "JEV_DYNAMIC_MOMENTUM",
+            "side": "UP",
+            "token_id": "tok_up_btc",
+            "price": 0.60,
+            "shares": 10.0,
+            "cost_usd": 6.00,
+            "strike": 90000.0,
+        }
+
+        # 1. Activate breakeven at 0.88
+        self.bot.cl_stream._record(now, 90500.0, asset=asset)
+        self.bot.book_stream._apply_update("tok_up_btc", bid=0.88, ask=0.90, bid_sz=500, ask_sz=500)
+        await self.bot._tick_asset(slot, now)
+        self.assertTrue(slot.position.get("breakeven_active"))
+
+        # 2. Disable TRAILING_BREAKEVEN_ENABLED at runtime
+        old_setting = config.TRAILING_BREAKEVEN_ENABLED
+        try:
+            config.TRAILING_BREAKEVEN_ENABLED = False
+
+            # Pullback to 0.61 should NOT trigger exit when feature is disabled
+            now2 = now + 1.0
+            self.bot.cl_stream._record(now2, 90450.0, asset=asset)
+            self.bot.book_stream._apply_update("tok_up_btc", bid=0.61, ask=0.63, bid_sz=500, ask_sz=500)
+            await self.bot._tick_asset(slot, now2)
+
+            self.assertIsNotNone(slot.position)
+        finally:
+            config.TRAILING_BREAKEVEN_ENABLED = old_setting
 
     async def test_adverse_stop_loss_exit_on_salvageable_bid(self):
         """Trigger early stop-loss exit when spot crosses strike adversely and salvage bid >= 0.25."""
