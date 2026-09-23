@@ -453,6 +453,103 @@ class TestJevAdvisor(unittest.TestCase):
         self.assertEqual(decision.size_multiplier, 1.0)
         self.assertEqual(self.advisor.total_approved, 1)
 
+    @patch("jev_advisor.AsyncTypeSafeClient")
+    def test_avn_mas_reversal_threshold(self, mock_client_cls):
+        """AVN-MAS threshold: reversal <= 0.32 allowed, > 0.32 vetoed."""
+        advisor = JevAdvisor(
+            api_key="test_key", enabled=True,
+            max_reversal_noul=0.32, max_fakeout_noul=0.35, min_conviction_score=1.50
+        )
+        mock_instance = MagicMock()
+        mock_client_cls.return_value.__aenter__.return_value = mock_instance
+
+        # Case 1: Reversal = 0.31 (<= 0.32) -> Passes
+        mock_res_pass = MagicMock()
+        mock_res_pass.nouls = {"reversal_risk": MagicMock(noul=0.31), "fakeout_risk": MagicMock(noul=0.25)}
+        mock_res_pass.choices = {"regime": MagicMock(choice="clean_trend"), "action": MagicMock(choice="proceed", confidence=0.9)}
+        mock_res_pass.scores = {"conviction": MagicMock(score=2.2)}
+        mock_instance.system_one = AsyncMock(return_value=mock_res_pass)
+
+        dec_pass = asyncio.run(
+            advisor.evaluate_dynamic(
+                asset="btc", opportunity_type="MOMENTUM_TAKER", side="UP", spot=90500.0, strike=90000.0,
+                realized_twap=90200.0, z_score=1.5, move_usd=500.0, remaining_s=120.0, elapsed_s=180.0,
+                best_bid=0.70, best_ask=0.74, proposed_price=0.74, spread=0.04, chop_crosses=0, daily_vol=0.0106
+            )
+        )
+        self.assertTrue(dec_pass.passed)
+
+        # Case 2: Reversal = 0.33 (> 0.32) -> Vetoed
+        mock_res_fail = MagicMock()
+        mock_res_fail.nouls = {"reversal_risk": MagicMock(noul=0.33), "fakeout_risk": MagicMock(noul=0.25)}
+        mock_res_fail.choices = {"regime": MagicMock(choice="clean_trend"), "action": MagicMock(choice="proceed", confidence=0.9)}
+        mock_res_fail.scores = {"conviction": MagicMock(score=2.2)}
+        mock_instance.system_one = AsyncMock(return_value=mock_res_fail)
+
+        dec_fail = asyncio.run(
+            advisor.evaluate_dynamic(
+                asset="btc", opportunity_type="MOMENTUM_TAKER", side="UP", spot=90500.0, strike=90000.0,
+                realized_twap=90200.0, z_score=1.5, move_usd=500.0, remaining_s=120.0, elapsed_s=180.0,
+                best_bid=0.70, best_ask=0.74, proposed_price=0.74, spread=0.04, chop_crosses=0, daily_vol=0.0106
+            )
+        )
+        self.assertFalse(dec_fail.passed)
+        self.assertIn("reversal=0.33", dec_fail.reason)
+
+    @patch("jev_advisor.AsyncTypeSafeClient")
+    def test_avn_mas_fakeout_threshold(self, mock_client_cls):
+        """AVN-MAS threshold: fakeout <= 0.35 allowed, > 0.35 vetoed."""
+        advisor = JevAdvisor(
+            api_key="test_key", enabled=True,
+            max_reversal_noul=0.32, max_fakeout_noul=0.35, min_conviction_score=1.50
+        )
+        mock_instance = MagicMock()
+        mock_client_cls.return_value.__aenter__.return_value = mock_instance
+
+        # Case: Fakeout = 0.36 (> 0.35) -> Vetoed
+        mock_res = MagicMock()
+        mock_res.nouls = {"reversal_risk": MagicMock(noul=0.20), "fakeout_risk": MagicMock(noul=0.36)}
+        mock_res.choices = {"regime": MagicMock(choice="clean_trend"), "action": MagicMock(choice="proceed", confidence=0.9)}
+        mock_res.scores = {"conviction": MagicMock(score=2.2)}
+        mock_instance.system_one = AsyncMock(return_value=mock_res)
+
+        dec = asyncio.run(
+            advisor.evaluate_dynamic(
+                asset="btc", opportunity_type="MOMENTUM_TAKER", side="UP", spot=90500.0, strike=90000.0,
+                realized_twap=90200.0, z_score=1.5, move_usd=500.0, remaining_s=120.0, elapsed_s=180.0,
+                best_bid=0.70, best_ask=0.74, proposed_price=0.74, spread=0.04, chop_crosses=0, daily_vol=0.0106
+            )
+        )
+        self.assertFalse(dec.passed)
+        self.assertIn("fakeout=0.36", dec.reason)
+
+    @patch("jev_advisor.AsyncTypeSafeClient")
+    def test_avn_mas_regime_clean_trend_required(self, mock_client_cls):
+        """AVN-MAS requirement: only regime == clean_trend is approved."""
+        advisor = JevAdvisor(
+            api_key="test_key", enabled=True,
+            max_reversal_noul=0.32, max_fakeout_noul=0.35, min_conviction_score=1.50
+        )
+        mock_instance = MagicMock()
+        mock_client_cls.return_value.__aenter__.return_value = mock_instance
+
+        for non_clean in ("mean_reverting_chop", "illiquid_or_spoofed", "exhaustion", "random_walk"):
+            mock_res = MagicMock()
+            mock_res.nouls = {"reversal_risk": MagicMock(noul=0.10), "fakeout_risk": MagicMock(noul=0.10)}
+            mock_res.choices = {"regime": MagicMock(choice=non_clean), "action": MagicMock(choice="proceed", confidence=0.9)}
+            mock_res.scores = {"conviction": MagicMock(score=2.8)}
+            mock_instance.system_one = AsyncMock(return_value=mock_res)
+
+            dec = asyncio.run(
+                advisor.evaluate_dynamic(
+                    asset="btc", opportunity_type="MOMENTUM_TAKER", side="UP", spot=90500.0, strike=90000.0,
+                    realized_twap=90200.0, z_score=1.5, move_usd=500.0, remaining_s=120.0, elapsed_s=180.0,
+                    best_bid=0.70, best_ask=0.74, proposed_price=0.74, spread=0.04, chop_crosses=0, daily_vol=0.0106
+                )
+            )
+            self.assertFalse(dec.passed, f"Regime {non_clean} should be vetoed")
+            self.assertIn(f"regime={non_clean}", dec.reason)
+
 
 class TestJevLiveIntegration(unittest.TestCase):
     def test_live_api_if_key_available(self):

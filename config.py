@@ -71,13 +71,61 @@ DYNAMIC_MIDBAND_LO = float(os.getenv("DYNAMIC_MIDBAND_LO", "0.35"))
 DYNAMIC_MIDBAND_HI = float(os.getenv("DYNAMIC_MIDBAND_HI", "0.65"))
 DYNAMIC_HALF_SPREAD = float(os.getenv("DYNAMIC_HALF_SPREAD", "0.03"))
 DYNAMIC_MIN_Z = float(os.getenv("DYNAMIC_MIN_Z", "1.00"))
-DYNAMIC_WINDOW_START_S = float(os.getenv("DYNAMIC_WINDOW_START_S", "265.0"))
-DYNAMIC_WINDOW_END_S = float(os.getenv("DYNAMIC_WINDOW_END_S", "75.0"))
+DYNAMIC_WINDOW_START_S = float(os.getenv("DYNAMIC_WINDOW_START_S", "270.0"))
+DYNAMIC_WINDOW_END_S = float(os.getenv("DYNAMIC_WINDOW_END_S", "60.0"))
 DYNAMIC_MOMENTUM_MIN_MOVE_BPS = float(os.getenv("DYNAMIC_MOMENTUM_MIN_MOVE_BPS", "25.0"))
 DYNAMIC_MOMENTUM_MIN_ASK = float(os.getenv("DYNAMIC_MOMENTUM_MIN_ASK", "0.38"))
-DYNAMIC_MOMENTUM_MAX_ASK = float(os.getenv("DYNAMIC_MOMENTUM_MAX_ASK", "0.50"))
-DYNAMIC_MAX_BOOK_SPREAD = float(os.getenv("DYNAMIC_MAX_BOOK_SPREAD", "0.20"))
+DYNAMIC_MOMENTUM_MAX_ASK = float(os.getenv("DYNAMIC_MOMENTUM_MAX_ASK", "0.90"))
+DYNAMIC_MAX_BOOK_SPREAD = float(os.getenv("DYNAMIC_MAX_BOOK_SPREAD", "0.05"))
 DYNAMIC_ENTRY_COOLDOWN_S = float(os.getenv("DYNAMIC_ENTRY_COOLDOWN_S", "10.0"))
+
+# --- AVN-MAS Dynamic Price-Time Feasibility Matrix Parameters ---
+# Adaptive scaling with elapsed time t:
+# - t < 30s: Entry prohibited (noise & initial spread formation)
+# - 30s <= t < 90s: Move >= 2.0*sigma (~5.0 bps for BTC), max ask P_max = 0.72
+# - 90s <= t < 150s: Move >= 1.5*sigma (~5.3 bps for BTC), max ask P_max = 0.82
+# - 150s <= t < 210s: Move >= 1.2*sigma (~5.5 bps for BTC), max ask P_max = 0.88
+# - 210s <= t < 240s: Move >= 1.0*sigma (~5.8 bps for BTC), max ask P_max = 0.90
+# - t >= 240s (remaining <= 60s): Prohibit new entries
+# Volatility normalization: sigma(t) = daily_vol * sqrt(t / 86400.0) * spot
+DYNAMIC_MIN_ELAPSED_S = float(os.getenv("DYNAMIC_MIN_ELAPSED_S", "30.0"))
+DYNAMIC_MAX_ELAPSED_S = float(os.getenv("DYNAMIC_MAX_ELAPSED_S", "240.0"))
+
+# --- AVN-MAS Take-Profit & Adverse Stop-Loss Parameters ---
+TAKE_PROFIT_BID = float(os.getenv("TAKE_PROFIT_BID", "0.95"))
+TAKE_PROFIT_ASK = float(os.getenv("TAKE_PROFIT_ASK", "0.96"))
+STOP_LOSS_SALVAGE_MIN_BID = float(os.getenv("STOP_LOSS_SALVAGE_MIN_BID", "0.25"))
+
+
+def compute_dynamic_feasibility(
+    elapsed_s: float, spot: float, daily_vol: float
+) -> tuple[bool, float, float, float]:
+    """
+    Compute AVN-MAS Dynamic Price-Time Feasibility.
+    Returns:
+        (is_allowed: bool, min_move_usd: float, max_allowed_ask: float, sigma_t_usd: float)
+    """
+    t = float(elapsed_s)
+    s = float(spot)
+    vol = float(daily_vol)
+
+    if t < DYNAMIC_MIN_ELAPSED_S or t >= DYNAMIC_MAX_ELAPSED_S or s <= 0.0 or vol <= 0.0:
+        return False, 0.0, 0.0, 0.0
+
+    sigma_t = vol * ((t / 86400.0) ** 0.5) * s
+
+    if t < 90.0:
+        mult, max_ask = 2.0, 0.72
+    elif t < 150.0:
+        mult, max_ask = 1.5, 0.82
+    elif t < 210.0:
+        mult, max_ask = 1.2, 0.88
+    else:  # 210.0 <= t < 240.0
+        mult, max_ask = 1.0, 0.90
+
+    min_move_usd = mult * sigma_t
+    return True, min_move_usd, max_ask, sigma_t
+
 
 # --- H-005 Momentum-Into-Close (Novals/igus-style) ---
 MOMENTUM_WINDOW_START_S = float(os.getenv('MOMENTUM_WINDOW_START_S', '150.0'))
@@ -245,8 +293,14 @@ class AssetParams:
     def momentum_min_move_usd(self, spot: float) -> float:
         return self.momentum_min_move_bps / 1e4 * float(spot)
 
-    def dynamic_momentum_min_move_usd(self, spot: float) -> float:
+    def dynamic_momentum_min_move_usd(self, spot: float, elapsed_s: float | None = None) -> float:
+        if elapsed_s is not None:
+            _, min_move, _, _ = compute_dynamic_feasibility(elapsed_s, spot, self.daily_vol)
+            return min_move
         return DYNAMIC_MOMENTUM_MIN_MOVE_BPS / 1e4 * float(spot)
+
+    def dynamic_feasibility(self, spot: float, elapsed_s: float) -> tuple[bool, float, float, float]:
+        return compute_dynamic_feasibility(elapsed_s, spot, self.daily_vol)
 
     def momentum_max_move_usd(self, spot: float) -> float:
         return self.momentum_max_move_bps / 1e4 * float(spot)
@@ -306,8 +360,8 @@ TYPESAFE_BASE_URL = os.getenv("TYPESAFE_BASE_URL", "").strip() or None
 JEV_ENABLED = os.getenv("JEV_ENABLED", "yes").strip().lower() in ("yes", "y", "true", "1") and bool(TYPESAFE_API_KEY)
 JEV_MODEL = os.getenv("JEV_MODEL", "jev-latest").strip()
 JEV_TIMEOUT_S = _fenv("JEV_TIMEOUT_S", 1.2)
-JEV_MAX_REVERSAL_NOUL = _fenv("JEV_MAX_REVERSAL_NOUL", 0.28)
-JEV_MAX_FAKEOUT_NOUL = _fenv("JEV_MAX_FAKEOUT_NOUL", 0.30)
+JEV_MAX_REVERSAL_NOUL = _fenv("JEV_MAX_REVERSAL_NOUL", 0.32)
+JEV_MAX_FAKEOUT_NOUL = _fenv("JEV_MAX_FAKEOUT_NOUL", 0.35)
 JEV_MIN_CONVICTION_SCORE = _fenv("JEV_MIN_CONVICTION_SCORE", 1.65)
 JEV_MIN_DOWNSIZE_CONVICTION = _fenv("JEV_MIN_DOWNSIZE_CONVICTION", 1.40)
 JEV_DOWNSIZE_FACTOR = _fenv("JEV_DOWNSIZE_FACTOR", 0.50)

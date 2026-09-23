@@ -216,6 +216,9 @@ class JevAdvisor:
         spread: float,
         chop_crosses: int,
         daily_vol: float,
+        sigma_t: float | None = None,
+        min_move_usd: float | None = None,
+        max_allowed_ask: float | None = None,
     ) -> JevDecision:
         """Evaluate a dynamic candidate opportunity (Maker or Momentum) under JEV_DYNAMIC mode."""
         state = {
@@ -238,6 +241,12 @@ class JevAdvisor:
             "orderbook_spread": round(float(spread), 3),
             "daily_vol_prior": round(float(daily_vol), 4),
         }
+        if sigma_t is not None:
+            state["volatility_sigma_t"] = round(float(sigma_t), 4)
+        if min_move_usd is not None:
+            state["required_min_move_usd"] = round(float(min_move_usd), 4)
+        if max_allowed_ask is not None:
+            state["max_allowed_ask"] = round(float(max_allowed_ask), 3)
         return await self._evaluate(state, side=side, spot=spot, strike=strike)
 
     async def _evaluate(
@@ -342,8 +351,8 @@ class JevAdvisor:
             action_choice = str(res.choices["action"].choice)
             action_confidence = float(res.choices["action"].confidence)
 
-            # Synthesize final decision gating
-            is_toxic_regime = regime in ("mean_reverting_chop", "illiquid_or_spoofed", "exhaustion")
+            # Synthesize final decision gating: strictly approve on clean_trend regime
+            is_toxic_regime = (regime != "clean_trend")
             is_downsize_eligible = (
                 action_choice == "downsize"
                 and self.allow_downsizing

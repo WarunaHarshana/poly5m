@@ -633,7 +633,15 @@ class TWAPBot:
             spread = (float(q_ask) - float(q_bid)) if (q_bid is not None and q_ask is not None) else 1.0
             move_usd = spot - strike
             abs_z = abs(signed_z_dyn)
-            min_move_usd = params.dynamic_momentum_min_move_usd(spot)
+
+            allowed_feas, min_move_usd, max_allowed_ask, sigma_t = config.compute_dynamic_feasibility(
+                elapsed_s=elapsed_s, spot=spot, daily_vol=params.daily_vol
+            )
+
+            directional_coherence = (
+                (spot > strike and realized_twap > strike and favored_side == "UP")
+                or (spot < strike and realized_twap < strike and favored_side == "DOWN")
+            )
 
             # Seek new entry across both Momentum and Maker plays
             if in_eval_window and not slot.position and not slot.resting_order:
@@ -648,9 +656,10 @@ class TWAPBot:
                     and spread <= config.DYNAMIC_MAX_BOOK_SPREAD
                 ):
                     is_momentum_candidate = (
-                        abs(move_usd) >= min_move_usd
-                        and config.DYNAMIC_MOMENTUM_MIN_ASK <= float(q_ask) <= config.DYNAMIC_MOMENTUM_MAX_ASK
-                        and remaining_s <= config.MOMENTUM_WINDOW_START_S
+                        allowed_feas
+                        and directional_coherence
+                        and abs(move_usd) >= min_move_usd
+                        and config.DYNAMIC_MOMENTUM_MIN_ASK <= float(q_ask) <= max_allowed_ask
                     )
                     dyn_min_z = max(config.DYNAMIC_MIN_Z, params.midband_min_z)
                     is_maker_candidate = (
@@ -661,7 +670,8 @@ class TWAPBot:
 
                     if is_momentum_candidate:
                         logger.info(
-                            f"[{tag}] 🤖 Consulting Jev on MOMENTUM ({favored_side} @ {q_ask:.2f} | spot: {px(spot)} | S0: {px(strike)})..."
+                            f"[{tag}] 🤖 Consulting Jev on MOMENTUM ({favored_side} @ {q_ask:.2f} | spot: {px(spot)} | S0: {px(strike)} | "
+                            f"move: {move_usd:+.2f} >= {min_move_usd:.2f} | max_ask: {max_allowed_ask:.2f} | t={elapsed_s:.0f}s)..."
                         )
                         jev_dec = await self.jev.evaluate_dynamic(
                             asset=asset,
@@ -680,6 +690,9 @@ class TWAPBot:
                             spread=spread,
                             chop_crosses=chop,
                             daily_vol=params.daily_vol,
+                            sigma_t=sigma_t,
+                            min_move_usd=min_move_usd,
+                            max_allowed_ask=max_allowed_ask,
                         )
                         if jev_dec.passed:
                             logger.info(
@@ -1327,7 +1340,7 @@ class TWAPBot:
                     slot.resting_order = None
 
         if slot.position and slot.position.get("strategy") in (
-            "H-005_MOMENTUM", "LATE_MOMENTUM", "MOMENTUM", "H-005", "JEV_DYNAMIC_MOMENTUM"
+            "H-005_MOMENTUM", "LATE_MOMENTUM", "MOMENTUM", "H-005", "JEV_DYNAMIC_MOMENTUM", "JEV_DYNAMIC_MAKER"
         ):
             await self._manage_open_momentum_position(slot, market, remaining_s, tokens)
 
@@ -1564,10 +1577,43 @@ class TWAPBot:
             else:
                 # Wide/absurd book — do not stop-loss on thin bid alone
                 mark = None
-        elif best_ask is not None:
-            mark = float(best_ask)
+        # 1) "Free-Ride" Take-Profit Limit Exit:
+        # If current market best bid reaches >= 0.95 (or best_ask >= 0.96), trigger early take-profit exit
+        tp_bid = getattr(config, "TAKE_PROFIT_BID", 0.95)
+        tp_ask = getattr(config, "TAKE_PROFIT_ASK", 0.96)
+        if best_bid is not None and (float(best_bid) >= tp_bid or (best_ask is not None and float(best_ask) >= tp_ask)):
+            exit_px = float(best_bid)
+            logger.info(
+                f"[{slot.asset.upper()} TAKE-PROFIT] Free-ride take-profit triggered: "
+                f"best_bid={float(best_bid):.3f} (target {tp_bid:.2f}), best_ask={best_ask} (target {tp_ask:.2f}) | "
+                f"locking in profit @ {exit_px:.3f}"
+            )
+            await self._exit_position_early(slot, market, exit_px, reason="take_profit")
+            return
 
-        # 1) Stop-loss vs entry (mid only when spread is sane)
+        # 2) Adverse Stop-Loss:
+        # If spot crosses strike S0 against position (S_t < S0 for UP, or S_t > S0 for DOWN),
+        # trigger early exit if salvage bid >= 0.25 to preserve capital.
+        spot = self.cl_stream.price(slot.asset)
+        strike = slot.strike or pos.get("strike")
+        if spot is not None and strike is not None and spot > 0 and strike > 0:
+            adverse_cross = (side == "UP" and spot < strike) or (side == "DOWN" and spot > strike)
+            salvage_min = getattr(config, "STOP_LOSS_SALVAGE_MIN_BID", 0.25)
+            if adverse_cross:
+                if best_bid is not None and float(best_bid) >= salvage_min:
+                    logger.warning(
+                        f"[{slot.asset.upper()} ADVERSE STOP-LOSS] Spot {spot:.2f} crossed strike {strike:.2f} against {side}; "
+                        f"salvage bid {float(best_bid):.3f} >= {salvage_min:.2f} — triggering early capital preservation exit"
+                    )
+                    await self._exit_position_early(slot, market, float(best_bid), reason="stop_loss")
+                    return
+                else:
+                    logger.info(
+                        f"[{slot.asset.upper()} ADVERSE CROSS] Spot {spot:.2f} crossed strike {strike:.2f} against {side}, "
+                        f"salvage bid {best_bid} < {salvage_min:.2f} (holding to preserve option value)"
+                    )
+
+        # 3) Stop-loss vs entry (mid only when spread is sane)
         if (
             config.MOMENTUM_STOP_LOSS_ENABLED
             and mark is not None
@@ -1715,7 +1761,7 @@ class TWAPBot:
         self.risk.record_trade_result(pnl)
 
         logger.info("=" * 60)
-        logger.info(f"[{slot.asset.upper()} H-005 EARLY EXIT:{reason}] {market['slug']}")
+        logger.info(f"[{slot.asset.upper()} EARLY EXIT:{reason}] {market['slug']}")
         logger.info(
             f"   Main {pos['side']} entry={pos['price']:.3f} exit={exit_price:.3f} | "
             f"PnL ${pnl:+.2f} | Bankroll ${self.risk.bankroll:.2f}"
