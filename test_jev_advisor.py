@@ -560,7 +560,7 @@ class TestJevLiveIntegration(unittest.TestCase):
         if not api_key:
             self.skipTest("TYPESAFE_API_KEY not set in environment; skipping live call.")
 
-        advisor = JevAdvisor(api_key=api_key, enabled=True, timeout_s=3.0)
+        advisor = JevAdvisor(api_key=api_key, enabled=True, timeout_s=6.0)
         # Test Maker evaluation
         decision = asyncio.run(
             advisor.evaluate_maker(

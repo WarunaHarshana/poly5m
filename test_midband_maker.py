@@ -169,35 +169,35 @@ def test_midband_rejects_expensive_mid():
 
 
 def test_midband_altcoin_conviction_filter():
-    """Test that DOGE/SOL require higher Z-score than BTC (e.g. Z=0.85 passes BTC but fails DOGE)."""
+    """Test that DOGE/SOL require higher Z-score than BTC (e.g. Z=1.20 passes BTC but fails DOGE)."""
     eng = _engine()
     btc_params = config._load_asset_params("btc")
     doge_params = config._load_asset_params("doge")
 
-    # Signal with Z ≈ 0.85
+    # Signal with Z ≈ 1.20 (spot=102.20, s_req=99.80, sigma=2.0)
     btc_sig = eng.evaluate_midband(
         remaining_s=120.0,
         elapsed_s=120.0,
-        spot=101.50,
+        spot=102.20,
         strike=100.00,
         realized_twap=100.20,
         best_bid=0.46,
         best_ask=0.50,
         side="UP",
-        min_z=btc_params.midband_min_z,  # 0.50
+        min_z=btc_params.midband_min_z,  # 1.00
     )
     assert btc_sig.passed_gates
 
     doge_sig = eng.evaluate_midband(
         remaining_s=120.0,
         elapsed_s=120.0,
-        spot=101.50,
+        spot=102.20,
         strike=100.00,
         realized_twap=100.20,
         best_bid=0.46,
         best_ask=0.50,
         side="UP",
-        min_z=doge_params.midband_min_z,  # 1.20
+        min_z=doge_params.midband_min_z,  # 1.50
     )
     assert not doge_sig.passed_gates
     assert "Z-score" in doge_sig.skip_reason

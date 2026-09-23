@@ -361,7 +361,7 @@ class TWAPBot:
                 f"ask=[{p.min_buy_price:.2f}..{p.max_buy_price:.2f}] "
                 f"vol={p.daily_vol:.2%} sigma={p.min_sigma_bps:.2f}bps chop={p.chop_noise_bps:.2f}bps"
             )
-        if config.STRATEGY in ("JEV_DYNAMIC", "DYNAMIC", "HYBRID", "ADAPTIVE"):
+        if config.STRATEGY in ("JEV_DYNAMIC", "DYNAMIC", "HYBRID", "ADAPTIVE", "AVN_MAS", "AVN-MAS", "AVN_MOMENTUM", "AVN"):
             logger.info(
                 f"JEV_DYNAMIC Hybrid: band=[{config.DYNAMIC_MIDBAND_LO:.2f}..{config.DYNAMIC_MIDBAND_HI:.2f}] "
                 f"min_z={config.DYNAMIC_MIN_Z:.2f} time_left=[{config.DYNAMIC_WINDOW_END_S:.0f}..{config.DYNAMIC_WINDOW_START_S:.0f}]s "
@@ -519,16 +519,19 @@ class TWAPBot:
             return
 
         if slot.strike is None or slot.strike <= 0:
-            slot.strike = self.cl_stream.get_slot_strike(slot_start_ts, max_dist_s=5.0, asset=asset)
-            if slot.strike is None or slot.strike <= 0:
-                if elapsed_s <= 10.0:
-                    slot.strike = self.cl_stream.price(asset)
-                else:
-                    logger.warning(
-                        f"[{asset.upper()}] No strike tick within 5s of slot start (elapsed {elapsed_s:.1f}s); "
-                        f"skipping ungrounded slot to avoid strike drift."
-                    )
-                    return
+            if slot.position and slot.position.get("strike"):
+                slot.strike = float(slot.position["strike"])
+            else:
+                slot.strike = self.cl_stream.get_slot_strike(slot_start_ts, max_dist_s=5.0, asset=asset)
+                if slot.strike is None or slot.strike <= 0:
+                    if elapsed_s <= 10.0:
+                        slot.strike = self.cl_stream.price(asset)
+                    else:
+                        logger.warning(
+                            f"[{asset.upper()}] No strike tick within 5s of slot start (elapsed {elapsed_s:.1f}s); "
+                            f"skipping ungrounded slot to avoid strike drift."
+                        )
+                        return
             if slot.strike and slot.strike > 0:
                 self._save_slot_state(
                     slot_ts=slot_start_ts,
@@ -550,7 +553,7 @@ class TWAPBot:
         )
         min_sigma = params.min_sigma_usd(spot)
 
-        is_dynamic = (config.STRATEGY in ("JEV_DYNAMIC", "DYNAMIC", "HYBRID", "ADAPTIVE"))
+        is_dynamic = (config.STRATEGY in ("JEV_DYNAMIC", "DYNAMIC", "HYBRID", "ADAPTIVE", "AVN_MAS", "AVN-MAS", "AVN_MOMENTUM", "AVN"))
         is_momentum = (config.STRATEGY in ("H-005_MOMENTUM", "MOMENTUM", "H-005", "LATE_MOMENTUM"))
         is_midband = (config.STRATEGY in ("MIDBAND_MAKER", "MIDBAND", "H-006_MIDBAND_MAKER", "H-006"))
         is_sniper = False  # H-001 retired
@@ -630,13 +633,14 @@ class TWAPBot:
                         q_ask = r_ask
 
             mid_px = 0.5 * (float(q_bid) + float(q_ask)) if (q_bid is not None and q_ask is not None) else None
-            spread = (float(q_ask) - float(q_bid)) if (q_bid is not None and q_ask is not None) else 1.0
+            spread = round(float(q_ask) - float(q_bid), 4) if (q_bid is not None and q_ask is not None) else 1.0
             move_usd = spot - strike
             abs_z = abs(signed_z_dyn)
 
             allowed_feas, min_move_usd, max_allowed_ask, sigma_t = config.compute_dynamic_feasibility(
                 elapsed_s=elapsed_s, spot=spot, daily_vol=params.daily_vol
             )
+            effective_max_ask = min(max_allowed_ask, getattr(config, "DYNAMIC_MOMENTUM_MAX_ASK", 0.90))
 
             directional_coherence = (
                 (spot > strike and realized_twap > strike and favored_side == "UP")
@@ -659,7 +663,7 @@ class TWAPBot:
                         allowed_feas
                         and directional_coherence
                         and abs(move_usd) >= min_move_usd
-                        and config.DYNAMIC_MOMENTUM_MIN_ASK <= float(q_ask) <= max_allowed_ask
+                        and config.DYNAMIC_MOMENTUM_MIN_ASK <= float(q_ask) <= effective_max_ask
                     )
                     dyn_min_z = max(config.DYNAMIC_MIN_Z, params.midband_min_z)
                     is_maker_candidate = (
@@ -1339,8 +1343,14 @@ class TWAPBot:
                             logger.error(f"Error cancelling live order: {e}")
                     slot.resting_order = None
 
-        if slot.position and slot.position.get("strategy") in (
-            "H-005_MOMENTUM", "LATE_MOMENTUM", "MOMENTUM", "H-005", "JEV_DYNAMIC_MOMENTUM", "JEV_DYNAMIC_MAKER"
+        if slot.position and (
+            slot.position.get("strategy") in (
+                "H-005_MOMENTUM", "LATE_MOMENTUM", "MOMENTUM", "H-005",
+                "JEV_DYNAMIC_MOMENTUM", "JEV_DYNAMIC_MAKER",
+                "AVN_MAS", "AVN-MAS", "AVN_MOMENTUM",
+            )
+            or "DYNAMIC" in str(slot.position.get("strategy", ""))
+            or "AVN" in str(slot.position.get("strategy", ""))
         ):
             await self._manage_open_momentum_position(slot, market, remaining_s, tokens)
 
@@ -1467,6 +1477,7 @@ class TWAPBot:
             "price": ask,
             "shares": shares,
             "cost_usd": cost_usd,
+            "strike": slot.strike or signal.s_0,
             "z_score": signal.z_score,
             "prob": signal.model_prob,
             "fee": fee_usd,
@@ -1578,14 +1589,17 @@ class TWAPBot:
                 # Wide/absurd book — do not stop-loss on thin bid alone
                 mark = None
         # 1) "Free-Ride" Take-Profit Limit Exit:
-        # If current market best bid reaches >= 0.95 (or best_ask >= 0.96), trigger early take-profit exit
+        # If current market best bid reaches >= 0.95 (or TAKE_PROFIT_ASK = 0.96), trigger early take-profit exit.
+        # CRITICAL: We only exit if best_bid >= tp_target and best_bid > entry to guarantee locking in >= +15¢ profit.
+        # Never sell into a depressed bid when best_bid < tp_target!
         tp_bid = getattr(config, "TAKE_PROFIT_BID", 0.95)
         tp_ask = getattr(config, "TAKE_PROFIT_ASK", 0.96)
-        if best_bid is not None and (float(best_bid) >= tp_bid or (best_ask is not None and float(best_ask) >= tp_ask)):
+        tp_target = min(tp_bid, tp_ask)
+        if best_bid is not None and float(best_bid) >= tp_target and float(best_bid) > entry:
             exit_px = float(best_bid)
             logger.info(
                 f"[{slot.asset.upper()} TAKE-PROFIT] Free-ride take-profit triggered: "
-                f"best_bid={float(best_bid):.3f} (target {tp_bid:.2f}), best_ask={best_ask} (target {tp_ask:.2f}) | "
+                f"best_bid={float(best_bid):.3f} >= target {tp_target:.2f} (entry={entry:.3f}) | "
                 f"locking in profit @ {exit_px:.3f}"
             )
             await self._exit_position_early(slot, market, exit_px, reason="take_profit")
@@ -1613,9 +1627,11 @@ class TWAPBot:
                         f"salvage bid {best_bid} < {salvage_min:.2f} (holding to preserve option value)"
                     )
 
-        # 3) Stop-loss vs entry (mid only when spread is sane)
+        # 3) Legacy H-005 Stop-loss vs entry (mid only when spread is sane) - applies only to legacy H-005
+        is_legacy_h005 = pos.get("strategy") in ("H-005_MOMENTUM", "H-005", "LATE_MOMENTUM", "MOMENTUM")
         if (
-            config.MOMENTUM_STOP_LOSS_ENABLED
+            is_legacy_h005
+            and config.MOMENTUM_STOP_LOSS_ENABLED
             and mark is not None
             and entry > 0
             and mark <= entry * (1.0 - float(config.MOMENTUM_STOP_LOSS_PCT))
@@ -1627,8 +1643,8 @@ class TWAPBot:
             await self._exit_position_early(slot, market, mark, reason="stop_loss")
             return
 
-        # 2) Exit before final seconds (avoid last-second oracle chop)
-        if remaining_s <= float(config.MOMENTUM_EXIT_BEFORE_S) and remaining_s > 0.5:
+        # 4) Legacy H-005 Exit before final seconds (avoid last-second oracle chop) - applies only to legacy H-005
+        if is_legacy_h005 and remaining_s <= float(config.MOMENTUM_EXIT_BEFORE_S) and remaining_s > 0.5:
             exit_px = mark if mark is not None else entry
             logger.info(
                 f"[{slot.asset.upper()} H-005 EXIT-BEFORE] {remaining_s:.1f}s left <= {config.MOMENTUM_EXIT_BEFORE_S:.0f}s; "

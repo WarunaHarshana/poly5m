@@ -37,8 +37,8 @@ def test_per_coin_sigma_and_chop_scale_with_spot():
     # Altcoins require higher midband conviction than BTC
     assert doge.midband_min_z > btc.midband_min_z
     assert sol.midband_min_z > btc.midband_min_z
-    assert btc.midband_min_z == 0.50
-    assert doge.midband_min_z == 1.20
+    assert btc.midband_min_z == 1.00
+    assert doge.midband_min_z == 1.50
 
 
 def test_feed_isolates_assets():

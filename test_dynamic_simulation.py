@@ -556,6 +556,177 @@ class TestDynamicSimulation(unittest.IsolatedAsyncioTestCase):
         # Bot should HOLD the position (no fire sale at 0.12)
         self.assertIsNotNone(slot.position)
 
+    async def test_take_profit_does_not_fire_sale_on_low_bid(self):
+        """Take-profit must NOT dump position into a depressed bid when best_ask >= 0.96 but best_bid is low."""
+        asset = "btc"
+        now = time.time()
+        slot_start = now - 180.0
+
+        market = {
+            "slug": "btc-usd-5m-test-tp-guard",
+            "slot_start_ts": slot_start,
+            "start_time": slot_start,
+            "end_ts": slot_start + 300.0,
+            "end_time": slot_start + 300.0,
+            "strike_price": 90000.0,
+            "tokens": {"UP": "tok_up_btc", "DOWN": "tok_down_btc"},
+            "fee_rate": 0.0,
+        }
+
+        slot = self.bot.slots[asset]
+        slot.market = market
+        slot.strike = 90000.0
+
+        slot.position = {
+            "asset": asset,
+            "slot": market["slug"],
+            "strategy": "JEV_DYNAMIC_MOMENTUM",
+            "side": "UP",
+            "token_id": "tok_up_btc",
+            "price": 0.70,
+            "shares": 10.0,
+            "cost_usd": 7.00,
+            "strike": 90000.0,
+        }
+
+        self.bot.cl_stream._record(now, 90500.0, asset=asset)
+        # Ask is 0.96 (reaches tp_ask), but bid is only 0.20 (illiquid/wide)
+        self.bot.book_stream._apply_update("tok_up_btc", bid=0.20, ask=0.96, bid_sz=500, ask_sz=500)
+
+        await self.bot._tick_asset(slot, now)
+
+        # Position MUST NOT be dumped at 0.20 (no fire sale disguised as take-profit)
+        self.assertIsNotNone(slot.position)
+        self.assertNotIn(market["slug"], self.bot._slot_done)
+
+    async def test_spread_precision_at_exact_five_cents(self):
+        """Exact 0.05 spread (e.g. 0.74 - 0.69) must pass spread gate without IEEE float failure."""
+        asset = "btc"
+        now = time.time()
+        slot_start = now - 60.0
+
+        market = {
+            "slug": "btc-usd-5m-test-spread-precision",
+            "slot_start_ts": slot_start,
+            "start_time": slot_start,
+            "end_ts": slot_start + 300.0,
+            "end_time": slot_start + 300.0,
+            "strike_price": 90000.0,
+            "tokens": {"UP": "tok_up_btc", "DOWN": "tok_down_btc"},
+            "fee_rate": 0.0,
+        }
+
+        slot = self.bot.slots[asset]
+        slot.market = market
+        slot.strike = 90000.0
+
+        self.bot.cl_stream._record(slot_start, 90000.0, asset=asset)
+        self.bot.cl_stream._record(now, 90150.0, asset=asset)
+
+        # Bid 0.64, Ask 0.69 -> spread exactly 0.05 (in float: 0.69 - 0.64 = 0.050000000000000044)
+        self.bot.book_stream._apply_update("tok_up_btc", bid=0.64, ask=0.69, bid_sz=500, ask_sz=500)
+
+        mock_jev = JevDecision(
+            action="proceed", passed=True, size_multiplier=1.0, conviction=2.5,
+            reversal_risk=0.15, market_regime="clean_trend", confidence=0.88,
+            reason="Clean breakout.", latency_ms=50.0, fallback_used=False,
+        )
+        self.bot.jev.evaluate_dynamic = AsyncMock(return_value=mock_jev)
+
+        await self.bot._tick_asset(slot, now)
+
+        self.assertIsNotNone(slot.position)
+        self.assertEqual(slot.position["price"], 0.69)
+        self.assertEqual(slot.position["strike"], 90000.0)
+
+    async def test_adverse_stop_loss_preserved_position_strike(self):
+        """Adverse stop-loss works using preserved position strike even if slot.strike is lost."""
+        asset = "btc"
+        now = time.time()
+        slot_start = now - 180.0
+
+        market = {
+            "slug": "btc-usd-5m-test-lost-strike",
+            "slot_start_ts": slot_start,
+            "start_time": slot_start,
+            "end_ts": slot_start + 300.0,
+            "end_time": slot_start + 300.0,
+            "strike_price": 90000.0,
+            "tokens": {"UP": "tok_up_btc", "DOWN": "tok_down_btc"},
+            "fee_rate": 0.0,
+        }
+
+        slot = self.bot.slots[asset]
+        slot.market = market
+        slot.strike = None  # slot.strike cleared / ungrounded
+
+        slot.position = {
+            "asset": asset,
+            "slot": market["slug"],
+            "strategy": "JEV_DYNAMIC_MOMENTUM",
+            "side": "UP",
+            "token_id": "tok_up_btc",
+            "price": 0.72,
+            "shares": 10.0,
+            "cost_usd": 7.20,
+            "strike": 90000.0,  # Preserved in position payload
+        }
+
+        # Spot crashes to 89900 (< strike 90000)
+        self.bot.cl_stream._record(now, 89900.0, asset=asset)
+        # Salvage bid is 0.30 >= 0.25
+        self.bot.book_stream._apply_update("tok_up_btc", bid=0.30, ask=0.34, bid_sz=500, ask_sz=500)
+
+        await self.bot._tick_asset(slot, now)
+
+        # Stop-loss triggered via preserved strike
+        self.assertIsNone(slot.position)
+        self.assertIn(market["slug"], self.bot._slot_done)
+
+    async def test_avn_mas_strategy_alias_execution(self):
+        """Bot runs dynamic momentum flow when STRATEGY='AVN_MAS'."""
+        old_strat = config.STRATEGY
+        try:
+            config.STRATEGY = "AVN_MAS"
+            asset = "btc"
+            now = time.time()
+            slot_start = now - 60.0
+
+            market = {
+                "slug": "btc-usd-5m-test-avn-alias",
+                "slot_start_ts": slot_start,
+                "start_time": slot_start,
+                "end_ts": slot_start + 300.0,
+                "end_time": slot_start + 300.0,
+                "strike_price": 90000.0,
+                "tokens": {"UP": "tok_up_btc", "DOWN": "tok_down_btc"},
+                "fee_rate": 0.0,
+            }
+
+            slot = self.bot.slots[asset]
+            slot.market = market
+            slot.strike = 90000.0
+
+            self.bot.cl_stream._record(slot_start, 90000.0, asset=asset)
+            self.bot.cl_stream._record(now, 90150.0, asset=asset)
+
+            self.bot.book_stream._apply_update("tok_up_btc", bid=0.65, ask=0.70, bid_sz=500, ask_sz=500)
+
+            mock_jev = JevDecision(
+                action="proceed", passed=True, size_multiplier=1.0, conviction=2.5,
+                reversal_risk=0.15, market_regime="clean_trend", confidence=0.88,
+                reason="Clean breakout under AVN_MAS.", latency_ms=80.0, fallback_used=False,
+            )
+            self.bot.jev.evaluate_dynamic = AsyncMock(return_value=mock_jev)
+
+            await self.bot._tick_asset(slot, now)
+
+            self.assertIsNotNone(slot.position)
+            self.assertEqual(slot.position["strategy"], "JEV_DYNAMIC_MOMENTUM")
+            self.assertEqual(slot.position["price"], 0.70)
+        finally:
+            config.STRATEGY = old_strat
+
 
 if __name__ == "__main__":
     unittest.main()
