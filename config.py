@@ -17,8 +17,8 @@ MAX_ORACLE_STALE_S = float(os.getenv("MAX_ORACLE_STALE_S", os.getenv("ORACLE_STA
 
 # Polymarket 5-minute Up/Down coins (Chainlink TWAP settlement).
 KNOWN_5M_ASSETS = ("btc", "eth", "sol", "bnb", "xrp", "doge", "hype")
-# Default assets list excludes HYPE (3.5% daily vol, 33% win rate, high noise)
-DEFAULT_5M_ASSETS = ("btc", "eth", "sol", "bnb", "xrp", "doge")
+# Default assets list excludes HYPE, XRP, and DOGE (high noise / thin CLOB liquidity)
+DEFAULT_5M_ASSETS = ("btc", "eth", "sol", "bnb")
 
 
 def _parse_asset_list(raw: str) -> list[str]:
