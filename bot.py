@@ -519,9 +519,16 @@ class TWAPBot:
             return
 
         if slot.strike is None or slot.strike <= 0:
-            slot.strike = self.cl_stream.get_slot_strike(slot_start_ts, asset=asset)
+            slot.strike = self.cl_stream.get_slot_strike(slot_start_ts, max_dist_s=5.0, asset=asset)
             if slot.strike is None or slot.strike <= 0:
-                slot.strike = self.cl_stream.price(asset)
+                if elapsed_s <= 10.0:
+                    slot.strike = self.cl_stream.price(asset)
+                else:
+                    logger.warning(
+                        f"[{asset.upper()}] No strike tick within 5s of slot start (elapsed {elapsed_s:.1f}s); "
+                        f"skipping ungrounded slot to avoid strike drift."
+                    )
+                    return
             if slot.strike and slot.strike > 0:
                 self._save_slot_state(
                     slot_ts=slot_start_ts,
@@ -826,19 +833,53 @@ class TWAPBot:
                 cur_ask = cur_ask or 1.0
                 elapsed_resting = time.time() - ro.get("placed_at", time.time())
                 is_clob_fill = (cur_ask <= ro["price"])
+
+                # Adverse price move: spot crossed strike against resting order
+                adverse_cross = (
+                    (ro_side == "UP" and spot < strike)
+                    or (ro_side == "DOWN" and spot > strike)
+                )
+                # Adverse Z flip: momentum reversed against resting order
+                adverse_z = (
+                    (ro_side == "UP" and signed_z_dyn < -0.20)
+                    or (ro_side == "DOWN" and signed_z_dyn > 0.20)
+                )
+
+                # Realistic paper fill: filled if ask crossed bid, OR if bid is competitive at market top,
+                # book is liquid, and order rested >= 5 seconds without adverse price move.
+                competitive_at_top = (
+                    ro["price"] >= float(cur_bid) - 0.01
+                    and (float(cur_ask) - float(cur_bid)) <= config.DYNAMIC_MAX_BOOK_SPREAD
+                )
+                paper_passive_fill = (
+                    competitive_at_top
+                    and elapsed_resting >= max(5.0, config.MIDBAND_REQUOTE_SECONDS)
+                    and not adverse_cross
+                    and not adverse_z
+                )
                 is_paper_fill = (
                     config.MODE != "live"
-                    and elapsed_resting >= max(1.0, config.MIDBAND_REQUOTE_SECONDS)
-                    and (is_clob_fill if config.MIDBAND_PAPER_REQUIRE_CROSS else True)
+                    and (is_clob_fill or paper_passive_fill)
                 )
+
                 mid_now = 0.5 * (float(cur_bid) + float(cur_ask)) if (cur_bid and cur_ask) else None
                 cancel = False
+                cancel_reason = "band/time"
                 if remaining_s < config.DYNAMIC_WINDOW_END_S:
                     cancel = True
-                if mid_now is not None and not (config.DYNAMIC_MIDBAND_LO <= mid_now <= config.DYNAMIC_MIDBAND_HI):
+                    cancel_reason = f"window_end ({remaining_s:.0f}s left)"
+                elif mid_now is not None and not (config.DYNAMIC_MIDBAND_LO <= mid_now <= config.DYNAMIC_MIDBAND_HI):
                     cancel = True
-                if cancel and not is_paper_fill:
-                    logger.info(f"[{tag}] JEV_DYNAMIC cancel resting @{ro['price']:.2f} (band/time)")
+                    cancel_reason = f"mid_left_band (mid={mid_now:.2f})"
+                elif adverse_cross:
+                    cancel = True
+                    cancel_reason = f"adverse_spot_cross (spot={spot:.2f} vs strike={strike:.2f})"
+                elif adverse_z:
+                    cancel = True
+                    cancel_reason = f"adverse_z_flip (z={signed_z_dyn:.2f})"
+
+                if cancel:
+                    logger.info(f"[{tag}] JEV_DYNAMIC cancel resting @{ro['price']:.2f} ({cancel_reason})")
                     if config.MODE == "live" and ro.get("order_id"):
                         try:
                             self.live_client.cancel_order(ro["order_id"])
@@ -1129,20 +1170,42 @@ class TWAPBot:
                 cur_ask = cur_ask or 1.0
                 elapsed_resting = time.time() - ro.get("placed_at", time.time())
                 is_clob_fill = (cur_ask <= ro["price"])
+
+                adverse_cross = (
+                    (ro_side == "UP" and spot < strike)
+                    or (ro_side == "DOWN" and spot > strike)
+                )
+
+                competitive_at_top = (
+                    ro["price"] >= float(cur_bid) - 0.01
+                    and (float(cur_ask) - float(cur_bid)) <= config.MIDBAND_MAX_BOOK_SPREAD
+                )
+                paper_passive_fill = (
+                    competitive_at_top
+                    and elapsed_resting >= max(5.0, config.MIDBAND_REQUOTE_SECONDS)
+                    and not adverse_cross
+                )
                 is_paper_fill = (
                     config.MODE != "live"
-                    and elapsed_resting >= max(1.0, config.MIDBAND_REQUOTE_SECONDS)
-                    and (is_clob_fill if config.MIDBAND_PAPER_REQUIRE_CROSS else True)
+                    and (is_clob_fill or paper_passive_fill)
                 )
-                # Cancel if mid left the band or time ran out
+
+                # Cancel if mid left the band or time ran out or adverse price cross
                 mid_now = 0.5 * (float(cur_bid) + float(cur_ask)) if cur_bid and cur_ask else None
                 cancel = False
+                cancel_reason = "band/time"
                 if remaining_s < config.MIDBAND_MIN_SECONDS_LEFT:
                     cancel = True
-                if mid_now is not None and not (config.MIDBAND_LO <= mid_now <= config.MIDBAND_HI):
+                    cancel_reason = f"window_end ({remaining_s:.0f}s left)"
+                elif mid_now is not None and not (config.MIDBAND_LO <= mid_now <= config.MIDBAND_HI):
                     cancel = True
-                if cancel and not is_paper_fill:
-                    logger.info(f"[{tag}] Midband cancel resting @{ro['price']:.2f} (band/time)")
+                    cancel_reason = f"mid_left_band (mid={mid_now:.2f})"
+                elif adverse_cross:
+                    cancel = True
+                    cancel_reason = f"adverse_spot_cross (spot={spot:.2f} vs strike={strike:.2f})"
+
+                if cancel:
+                    logger.info(f"[{tag}] Midband cancel resting @{ro['price']:.2f} ({cancel_reason})")
                     # BUG #1 fix: cancel live CLOB order too, not just in-memory state
                     if config.MODE == "live" and ro.get("order_id"):
                         try:

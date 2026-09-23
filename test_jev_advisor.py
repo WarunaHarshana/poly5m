@@ -19,6 +19,7 @@ class TestJevAdvisor(unittest.TestCase):
             max_reversal_noul=0.35,
             min_conviction_score=1.50,
             downsize_factor=0.50,
+            allow_downsizing=False,
         )
 
     def test_init_and_stats(self):
@@ -201,6 +202,64 @@ class TestJevAdvisor(unittest.TestCase):
         self.assertTrue(dec2.passed)
         self.assertEqual(dec2.size_multiplier, 0.50)
         self.assertEqual(permissive_advisor.total_downsized, 1)
+
+    @patch("jev_advisor.AsyncTypeSafeClient")
+    def test_decoupled_downsize_conviction(self, mock_client_cls):
+        mock_instance = MagicMock()
+        mock_client_cls.return_value.__aenter__.return_value = mock_instance
+
+        # Advisor with 1.65 full hurdle, 1.40 downsize hurdle
+        advisor = JevAdvisor(
+            api_key="test_key",
+            enabled=True,
+            allow_downsizing=True,
+            downsize_factor=0.50,
+            min_conviction_score=1.65,
+            min_downsize_conviction=1.40,
+            max_reversal_noul=0.35,
+        )
+
+        # Subtest 1: Conviction 1.50 (below 1.65, but >= 1.40) with action="downsize" -> PASSES at 50%
+        res_pass = MagicMock()
+        res_pass.nouls = {"reversal_risk": MagicMock(noul=0.20), "fakeout_risk": MagicMock(noul=0.10)}
+        res_pass.choices = {
+            "regime": MagicMock(choice="clean_trend"),
+            "action": MagicMock(choice="downsize", confidence=0.75),
+        }
+        res_pass.scores = {"conviction": MagicMock(score=1.50)}
+        mock_instance.system_one = AsyncMock(return_value=res_pass)
+
+        dec_pass = asyncio.run(
+            advisor.evaluate_maker(
+                asset="btc", side="UP", spot=91000.0, strike=90950.0, realized_twap=90980.0,
+                z_score=1.2, remaining_s=120.0, elapsed_s=180.0, best_bid=0.45, best_ask=0.49,
+                target_bid=0.47, spread=0.04, chop_crosses=1, daily_vol=0.0106,
+            )
+        )
+        self.assertTrue(dec_pass.passed)
+        self.assertEqual(dec_pass.size_multiplier, 0.50)
+        self.assertEqual(advisor.total_downsized, 1)
+
+        # Subtest 2: Conviction 1.30 (< 1.40) with action="downsize" -> VETOED
+        res_veto = MagicMock()
+        res_veto.nouls = {"reversal_risk": MagicMock(noul=0.20), "fakeout_risk": MagicMock(noul=0.10)}
+        res_veto.choices = {
+            "regime": MagicMock(choice="clean_trend"),
+            "action": MagicMock(choice="downsize", confidence=0.75),
+        }
+        res_veto.scores = {"conviction": MagicMock(score=1.30)}
+        mock_instance.system_one = AsyncMock(return_value=res_veto)
+
+        dec_veto = asyncio.run(
+            advisor.evaluate_maker(
+                asset="btc", side="UP", spot=91000.0, strike=90950.0, realized_twap=90980.0,
+                z_score=1.2, remaining_s=120.0, elapsed_s=180.0, best_bid=0.45, best_ask=0.49,
+                target_bid=0.47, spread=0.04, chop_crosses=1, daily_vol=0.0106,
+            )
+        )
+        self.assertFalse(dec_veto.passed)
+        self.assertEqual(dec_veto.size_multiplier, 0.0)
+        self.assertIn("uncertainty veto", dec_veto.reason)
 
     @patch("jev_advisor.AsyncTypeSafeClient")
     def test_mocked_veto_fakeout_trap(self, mock_client_cls):

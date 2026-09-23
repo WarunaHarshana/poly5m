@@ -97,7 +97,7 @@ class ChainlinkRTDSStream:
             return bool(self._history.get(a))
 
     def get_slot_strike(
-        self, slot_start_ts: float, max_dist_s: float = 30.0, asset: str | None = None
+        self, slot_start_ts: float, max_dist_s: float = 5.0, asset: str | None = None
     ) -> float | None:
         """Find the tick closest to slot start time."""
         a = self._asset_or_default(asset)

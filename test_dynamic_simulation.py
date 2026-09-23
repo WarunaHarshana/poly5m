@@ -66,10 +66,7 @@ class TestDynamicSimulation(unittest.IsolatedAsyncioTestCase):
         self.bot.cl_stream._record(slot_start + 120.0, 91080.0, asset=asset)
         self.bot.cl_stream._record(now, 91300.0, asset=asset)  # spot=91300, +$300 move (~33 bps)
 
-        # Setup order book with liquid ask (within positive payout range)
-        # Temporarily widen momentum ask range for test (production effectively disables momentum taker)
-        config.DYNAMIC_MOMENTUM_MIN_ASK = 0.40
-        config.DYNAMIC_MOMENTUM_MAX_ASK = 0.50
+        # Setup order book with liquid ask (within positive payout range 0.38 - 0.50)
         self.bot.book_stream._apply_update("tok_up_btc", bid=0.45, ask=0.49, bid_sz=500, ask_sz=500)
 
         # Mock Jev decision: Approved clean trend
@@ -206,6 +203,57 @@ class TestDynamicSimulation(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(slot.position)
         self.assertIsNone(slot.resting_order)
         self.assertNotIn(market["slug"], self.bot._slot_done)
+
+    async def test_dynamic_maker_adverse_move_cancellation(self):
+        """Simulate dynamic maker order cancellation when spot price reverses adversely."""
+        asset = "sol"
+        now = time.time()
+        slot_start = now - 120.0
+
+        market = {
+            "slug": "sol-usd-5m-test-adverse-cancel",
+            "slot_start_ts": slot_start,
+            "start_time": slot_start,
+            "end_ts": slot_start + 300.0,
+            "end_time": slot_start + 300.0,
+            "strike_price": 180.00,
+            "tokens": {"UP": "tok_up_sol", "DOWN": "tok_down_sol"},
+            "fee_rate": 0.0,
+        }
+
+        slot = self.bot.slots[asset]
+        slot.market = market
+        slot.strike = 180.00
+
+        self.bot.cl_stream._record(slot_start, 180.00, asset=asset)
+        self.bot.cl_stream._record(slot_start + 60.0, 180.10, asset=asset)
+        self.bot.cl_stream._record(now, 180.15, asset=asset)
+
+        self.bot.book_stream._apply_update("tok_up_sol", bid=0.48, ask=0.52, bid_sz=500, ask_sz=500)
+
+        # Place initial maker bid
+        mock_jev_decision = JevDecision(
+            action="proceed", passed=True, size_multiplier=1.0, conviction=2.0,
+            reversal_risk=0.15, market_regime="clean_trend", confidence=0.85,
+            reason="Clean trend above strike.", latency_ms=100.0, fallback_used=False,
+        )
+        self.bot.jev.evaluate_dynamic = AsyncMock(return_value=mock_jev_decision)
+
+        await self.bot._tick_asset(slot, now)
+        self.assertIsNotNone(slot.resting_order)
+        self.assertEqual(slot.resting_order["side"], "UP")
+
+        # Now simulate market crash: spot drops to 179.80 (< strike 180.00)
+        crash_time = now + 5.0
+        self.bot.cl_stream._record(crash_time, 179.80, asset=asset)
+        # Orderbook ask dumps down to 0.45 (which would have triggered an adverse paper fill under old code!)
+        self.bot.book_stream._apply_update("tok_up_sol", bid=0.40, ask=0.45, bid_sz=500, ask_sz=500)
+
+        await self.bot._tick_asset(slot, crash_time)
+
+        # Assert: Resting order cancelled, position NEVER opened!
+        self.assertIsNone(slot.resting_order)
+        self.assertIsNone(slot.position)
 
 
 if __name__ == "__main__":

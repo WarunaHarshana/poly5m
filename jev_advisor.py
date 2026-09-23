@@ -57,6 +57,7 @@ class JevAdvisor:
         max_reversal_noul: float | None = None,
         max_fakeout_noul: float | None = None,
         min_conviction_score: float | None = None,
+        min_downsize_conviction: float | None = None,
         downsize_factor: float | None = None,
         allow_downsizing: bool | None = None,
     ):
@@ -73,6 +74,11 @@ class JevAdvisor:
         )
         self.min_conviction_score = (
             config.JEV_MIN_CONVICTION_SCORE if min_conviction_score is None else float(min_conviction_score)
+        )
+        self.min_downsize_conviction = (
+            getattr(config, "JEV_MIN_DOWNSIZE_CONVICTION", 1.40)
+            if min_downsize_conviction is None
+            else float(min_downsize_conviction)
         )
         self.downsize_factor = (
             config.JEV_DOWNSIZE_FACTOR if downsize_factor is None else float(downsize_factor)
@@ -338,7 +344,15 @@ class JevAdvisor:
 
             # Synthesize final decision gating
             is_toxic_regime = regime in ("mean_reverting_chop", "illiquid_or_spoofed", "exhaustion")
-            is_downsize_veto = (action_choice == "downsize" and not self.allow_downsizing)
+            is_downsize_eligible = (
+                action_choice == "downsize"
+                and self.allow_downsizing
+                and conviction_score >= self.min_downsize_conviction
+            )
+            is_downsize_veto = (action_choice == "downsize" and not is_downsize_eligible)
+            is_conviction_veto = (
+                False if is_downsize_eligible else (conviction_score < self.min_conviction_score)
+            )
 
             if (
                 action_choice == "abstain"
@@ -346,7 +360,7 @@ class JevAdvisor:
                 or reversal_risk > self.max_reversal_noul
                 or fakeout_risk > self.max_fakeout_noul
                 or is_toxic_regime
-                or conviction_score < self.min_conviction_score
+                or is_conviction_veto
             ):
                 passed = False
                 size_mult = 0.0
@@ -354,18 +368,20 @@ class JevAdvisor:
                 if action_choice == "abstain":
                     reasons.append("action=abstain")
                 elif is_downsize_veto:
-                    reasons.append("action=downsize(uncertainty veto)")
+                    reasons.append(
+                        f"action=downsize(uncertainty veto: conviction={conviction_score:.2f} or disallowed)"
+                    )
                 if is_toxic_regime:
                     reasons.append(f"regime={regime}")
                 if reversal_risk > self.max_reversal_noul:
                     reasons.append(f"reversal={reversal_risk:.2f} (max {self.max_reversal_noul:.2f})")
                 if fakeout_risk > self.max_fakeout_noul:
                     reasons.append(f"fakeout={fakeout_risk:.2f} (max {self.max_fakeout_noul:.2f})")
-                if conviction_score < self.min_conviction_score:
+                if is_conviction_veto:
                     reasons.append(f"conviction={conviction_score:.2f} (min {self.min_conviction_score:.2f})")
                 reason = f"Vetoed by Jev: {', '.join(reasons)}"
                 self.total_vetoed += 1
-            elif action_choice == "downsize" and self.allow_downsizing:
+            elif is_downsize_eligible:
                 passed = True
                 size_mult = self.downsize_factor
                 reason = (
