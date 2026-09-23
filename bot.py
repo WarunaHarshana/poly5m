@@ -1580,11 +1580,17 @@ class TWAPBot:
 
         entry = float(pos["price"])
 
-        # Track peak market bid & activate trailing breakeven
+        # Track peak market bid & activate dynamic trailing profit stop
         if best_bid is not None:
             peak_bid = max(float(pos.get("peak_bid", entry)), float(best_bid))
             pos["peak_bid"] = peak_bid
-            if config.TRAILING_BREAKEVEN_ENABLED and peak_bid >= config.TRAILING_BREAKEVEN_TRIGGER:
+            trailing_enabled = (
+                getattr(config, "TRAILING_PROFIT_ENABLED", True)
+                and getattr(config, "TRAILING_BREAKEVEN_ENABLED", True)
+            )
+            min_peak = getattr(config, "TRAILING_PROFIT_MIN_PEAK", 0.78)
+            if trailing_enabled and peak_bid >= min_peak:
+                pos["trailing_active"] = True
                 pos["breakeven_active"] = True
 
         # Mark carefully: raw best bid on thin CLOB books is often garbage (e.g. 0.28 vs 0.87 ask).
@@ -1613,11 +1619,19 @@ class TWAPBot:
             await self._exit_position_early(slot, market, exit_px, reason="take_profit")
             return
 
-        # 2) Trailing Breakeven Stop-Loss:
-        # If position surged to >= TRAILING_BREAKEVEN_TRIGGER (e.g. 0.85) but failed to reach take-profit
-        # and starts collapsing back towards entry, exit at or near breakeven to protect capital.
-        if config.TRAILING_BREAKEVEN_ENABLED and pos.get("breakeven_active") and best_bid is not None:
-            peak_bid = float(pos.get("peak_bid", entry))
+        # 2) Dynamic Trailing Profit Stop (Target 3):
+        # Once peak_bid >= TRAILING_PROFIT_MIN_PEAK (e.g. 0.78), compute dynamic trailing stop:
+        # stop_price = round(peak_bid - TRAILING_PROFIT_DISTANCE, 4) (default 8¢ trailing distance)
+        # Ensure stop_price >= entry + round_trip_fee so it also guarantees breakeven+fees if activated.
+        # If best_bid <= stop_price and best_bid >= entry - 0.05:
+        # Trigger early exit with reason f"trailing_profit (peak: {peak_bid:.2f}, exit: {best_bid:.2f}, entry: {entry:.2f})"
+        trailing_enabled = (
+            getattr(config, "TRAILING_PROFIT_ENABLED", True)
+            and getattr(config, "TRAILING_BREAKEVEN_ENABLED", True)
+        )
+        min_peak = getattr(config, "TRAILING_PROFIT_MIN_PEAK", 0.78)
+        peak_bid = float(pos.get("peak_bid", entry))
+        if trailing_enabled and (pos.get("trailing_active") or pos.get("breakeven_active") or peak_bid >= min_peak) and best_bid is not None:
             fee_rate = float(
                 market.get("fee_rate")
                 if market.get("fee_rate") is not None
@@ -1625,15 +1639,18 @@ class TWAPBot:
             )
             # Round-trip taker fee (entry + exit legs): approx 2 * fee_rate * p * (1 - p)
             round_trip_fee = 2.0 * fee_rate * entry * (1.0 - entry)
-            cfg_buffer = getattr(config, "TRAILING_BREAKEVEN_BUFFER", 0.01)
-            # Fee-aware buffer: covers round-trip taker fees plus configured safety cushion
-            be_buffer = round(round_trip_fee + cfg_buffer, 4)
+            trail_distance = getattr(config, "TRAILING_PROFIT_DISTANCE", 0.08)
+            stop_price = round(peak_bid - trail_distance, 4)
+            min_breakeven = round(entry + round_trip_fee, 4)
+            if min_breakeven < peak_bid:
+                stop_price = max(stop_price, min_breakeven)
             floor = round(entry - 0.05, 4)
-            if float(best_bid) <= entry + be_buffer and float(best_bid) >= floor:
-                reason = f"trailing_breakeven (peak: {peak_bid:.2f}, exit: {float(best_bid):.2f}, entry: {entry:.2f})"
+            if float(best_bid) <= stop_price and float(best_bid) >= floor:
+                reason = f"trailing_profit (peak: {peak_bid:.2f}, exit: {float(best_bid):.2f}, entry: {entry:.2f})"
                 logger.warning(
-                    f"[{slot.asset.upper()} TRAILING BREAKEVEN] Peak {peak_bid:.2f} >= {config.TRAILING_BREAKEVEN_TRIGGER:.2f}, "
-                    f"pulled back to {float(best_bid):.2f} <= entry {entry:.2f} + buffer {be_buffer:.2f} (fees: {round_trip_fee:.3f}) — triggering early breakeven exit"
+                    f"[{slot.asset.upper()} TRAILING PROFIT] Peak {peak_bid:.2f} >= {min_peak:.2f}, "
+                    f"pulled back to {float(best_bid):.2f} <= stop_price {stop_price:.2f} "
+                    f"(entry {entry:.2f}, fees: {round_trip_fee:.3f}) — triggering early exit"
                 )
                 await self._exit_position_early(slot, market, float(best_bid), reason=reason)
                 return

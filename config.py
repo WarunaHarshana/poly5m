@@ -96,8 +96,13 @@ TAKE_PROFIT_BID = float(os.getenv("TAKE_PROFIT_BID", "0.95"))
 TAKE_PROFIT_ASK = float(os.getenv("TAKE_PROFIT_ASK", "0.96"))
 STOP_LOSS_SALVAGE_MIN_BID = float(os.getenv("STOP_LOSS_SALVAGE_MIN_BID", "0.25"))
 
-# --- Trailing Breakeven Stop-Loss Parameters ---
-TRAILING_BREAKEVEN_ENABLED = os.getenv("TRAILING_BREAKEVEN_ENABLED", "yes").strip().lower() in ("yes", "y", "true", "1")
+# --- Dynamic Trailing Profit Stop Parameters ---
+TRAILING_PROFIT_ENABLED = os.getenv("TRAILING_PROFIT_ENABLED", os.getenv("TRAILING_BREAKEVEN_ENABLED", "yes")).strip().lower() in ("yes", "y", "true", "1")
+TRAILING_PROFIT_DISTANCE = float(os.getenv("TRAILING_PROFIT_DISTANCE", "0.08"))
+TRAILING_PROFIT_MIN_PEAK = float(os.getenv("TRAILING_PROFIT_MIN_PEAK", "0.78"))
+
+# Legacy aliases for backward compatibility
+TRAILING_BREAKEVEN_ENABLED = TRAILING_PROFIT_ENABLED
 TRAILING_BREAKEVEN_TRIGGER = float(os.getenv("TRAILING_BREAKEVEN_TRIGGER", "0.85"))
 TRAILING_BREAKEVEN_BUFFER = float(os.getenv("TRAILING_BREAKEVEN_BUFFER", "0.01"))
 
