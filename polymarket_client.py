@@ -234,6 +234,14 @@ class PolymarketPublicClient:
                         except Exception:
                             pass
 
+                        price_to_beat = None
+                        try:
+                            meta = ev.get("eventMetadata") if isinstance(ev.get("eventMetadata"), dict) else {}
+                            if meta.get("priceToBeat") is not None:
+                                price_to_beat = float(meta["priceToBeat"])
+                        except Exception:
+                            price_to_beat = None
+
                         return {
                             "slug": slug,
                             "asset": coin,
@@ -242,6 +250,7 @@ class PolymarketPublicClient:
                             "end_ts": start_ts + slot,
                             "tokens": tokens,
                             "fee_rate": fee_rate,
+                            "price_to_beat": price_to_beat,
                             "question": m.get("question", f"{coin.upper()} 5-minute Up/Down"),
                         }
             except Exception:

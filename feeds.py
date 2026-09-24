@@ -151,6 +151,12 @@ class ChainlinkRTDSStream:
         with self._lock:
             return bool(self._history.get(a))
 
+    def history_snapshot(self, asset: str | None = None) -> list[tuple[float, float]]:
+        """Copy of the (ts, price) tick history for an asset (thread-safe)."""
+        a = self._asset_or_default(asset)
+        with self._lock:
+            return list(self._history.get(a) or [])
+
     def get_slot_strike(
         self, slot_start_ts: float, max_dist_s: float = 5.0, asset: str | None = None
     ) -> float | None:

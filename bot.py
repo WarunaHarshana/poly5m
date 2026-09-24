@@ -35,6 +35,7 @@ from journal import configure as journal_configure
 from journal import write as journal_write
 from http_api import StatusServer, is_official_trade, load_trades
 from jev_advisor import JevAdvisor, JevDecision
+import move_ref
 
 logging.basicConfig(
     level=logging.INFO,
@@ -105,6 +106,12 @@ class CoinSlot:
     position: dict | None = None
     resting_order: dict | None = None
     risk_block_logged: bool = False
+    # Conservative momentum move reference (per slot, cached once resolved)
+    strike_twap: float | None = None
+    strike_twap_source: str | None = None
+    strike_twap_resolved: bool = False
+    move_ref_used: str | None = None
+    move_ref_block_logged: bool = False
 
 
 class TWAPBot:
@@ -541,6 +548,11 @@ class TWAPBot:
         for slot in self.slots.values():
             slot.market = None
             slot.strike = None
+            slot.strike_twap = None
+            slot.strike_twap_source = None
+            slot.strike_twap_resolved = False
+            slot.move_ref_used = None
+            slot.move_ref_block_logged = False
             market = self.pub_client.find_active_5m_slot(now_ts=now, asset=slot.asset)
             if not market:
                 logger.warning(f"[{slot.asset.upper()}] Could not discover market for slot {window_ts}")
@@ -728,6 +740,13 @@ class TWAPBot:
             move_usd = spot - strike
             abs_z = abs(signed_z_dyn)
 
+            # Momentum entry move reference (spot strike vs settlement-TWAP strike).
+            move_ref_mode = move_ref.normalize_mode(getattr(config, "MOMENTUM_MOVE_REF", "conservative"))
+            if move_ref_mode == move_ref.MODE_CONSERVATIVE:
+                self._ensure_twap_strike(slot, market, slot_start_ts, elapsed_s)
+            gate_move_usd, move_ref_used = move_ref.entry_move(move_ref_mode, spot, strike, slot.strike_twap)
+            slot.move_ref_used = move_ref_used
+
             allowed_feas, min_move_usd, max_allowed_ask, sigma_t = config.compute_dynamic_feasibility(
                 elapsed_s=elapsed_s, spot=spot, daily_vol=params.daily_vol
             )
@@ -753,13 +772,55 @@ class TWAPBot:
                     momentum_min_elapsed = float(
                         getattr(config, "DYNAMIC_MOMENTUM_MIN_ELAPSED_S", 90.0)
                     )
+                    if move_ref_mode == move_ref.MODE_SPOT:
+                        move_gate_ok = abs(move_usd) >= min_move_usd
+                    else:
+                        move_gate_ok = move_ref.gate_move_ok(gate_move_usd, min_move_usd, favored_side)
                     is_momentum_candidate = (
                         allowed_feas
                         and float(elapsed_s) >= momentum_min_elapsed
                         and directional_coherence
-                        and abs(move_usd) >= min_move_usd
+                        and move_gate_ok
                         and config.DYNAMIC_MOMENTUM_MIN_ASK <= float(q_ask) <= effective_max_ask
                     )
+                    if (
+                        not is_momentum_candidate
+                        and not move_gate_ok
+                        and move_ref_mode == move_ref.MODE_CONSERVATIVE
+                        and allowed_feas
+                        and float(elapsed_s) >= momentum_min_elapsed
+                        and directional_coherence
+                        and abs(move_usd) >= min_move_usd
+                        and config.DYNAMIC_MOMENTUM_MIN_ASK <= float(q_ask) <= effective_max_ask
+                    ):
+                        # Spot-only gate would have allowed this momentum entry; conservative ref blocks it.
+                        if not slot.move_ref_block_logged:
+                            twap_move = (spot - slot.strike_twap) if slot.strike_twap else None
+                            logger.warning(
+                                f"[{tag}] MOVE_REF_BLOCK asset={asset} side={favored_side} spot_move={move_usd:+.2f} "
+                                f"twap_move={(f'{twap_move:+.2f}' if twap_move is not None else 'n/a')} "
+                                f"used_move={gate_move_usd:+.2f} threshold={min_move_usd:.2f} ref={move_ref_used} "
+                                f"strike_spot={strike:.4f} strike_twap={(f'{slot.strike_twap:.4f}' if slot.strike_twap else 'n/a')} "
+                                f"src={slot.strike_twap_source} ask={float(q_ask):.2f} t={elapsed_s:.0f}s"
+                            )
+                            journal_write(
+                                "move_ref_block",
+                                asset=asset,
+                                slot=slot_key,
+                                side=favored_side,
+                                spot=spot,
+                                spot_move=round(move_usd, 4),
+                                twap_move=(round(twap_move, 4) if twap_move is not None else None),
+                                used_move=round(gate_move_usd, 4),
+                                threshold=round(min_move_usd, 4),
+                                move_ref_used=move_ref_used,
+                                strike_spot=strike,
+                                strike_twap=slot.strike_twap,
+                                strike_twap_source=slot.strike_twap_source,
+                                ask=float(q_ask),
+                                elapsed_s=round(float(elapsed_s), 1),
+                            )
+                            slot.move_ref_block_logged = True
                     dyn_min_z = max(config.DYNAMIC_MIN_Z, params.midband_min_z)
                     is_maker_candidate = (
                         mid_px is not None
@@ -770,7 +831,8 @@ class TWAPBot:
                     if is_momentum_candidate:
                         logger.info(
                             f"[{tag}] 🤖 Consulting Jev on MOMENTUM ({favored_side} @ {q_ask:.2f} | spot: {px(spot)} | S0: {px(strike)} | "
-                            f"move: {move_usd:+.2f} >= {min_move_usd:.2f} | max_ask: {max_allowed_ask:.2f} | t={elapsed_s:.0f}s)..."
+                            f"move: {move_usd:+.2f} >= {min_move_usd:.2f} | max_ask: {max_allowed_ask:.2f} | t={elapsed_s:.0f}s | "
+                            f"ref: {move_ref_used} gate_move: {gate_move_usd:+.2f})..."
                         )
                         jev_dec = await self.jev.evaluate_dynamic(
                             asset=asset,
@@ -1026,6 +1088,7 @@ class TWAPBot:
                         "strike": strike,
                         "official": False,
                         "jev": ro.get("jev"),
+                        **{k: ro.get(k) for k in ("strike_spot", "strike_twap", "strike_twap_source", "move_ref_mode", "move_ref_used")},
                     }
                     slot.resting_order = None
                     logger.info(
@@ -1484,6 +1547,47 @@ class TWAPBot:
             if slot.position:
                 self._queue_settlement(slot)
 
+    def _ensure_twap_strike(self, slot: CoinSlot, market: dict, slot_start_ts: float, elapsed_s: float) -> None:
+        """Resolve the TWAP-based strike estimate once per slot and cache it on the slot."""
+        if slot.strike_twap_resolved:
+            return
+        # Let late-arriving ticks stamped just before slot open land before we average.
+        if elapsed_s is not None and float(elapsed_s) < 3.0:
+            return
+        window_s = float(getattr(config, "SETTLEMENT_TWAP_WINDOW_S", 60.0))
+        value, source = move_ref.estimate_twap_strike(
+            self.cl_stream,
+            slot_start_ts,
+            window_s,
+            asset=slot.asset,
+            price_to_beat=(market or {}).get("price_to_beat"),
+        )
+        slot.strike_twap = value
+        slot.strike_twap_source = source
+        slot.strike_twap_resolved = True
+        tag = slot.asset.upper()
+        if value is not None:
+            diff = (float(slot.strike) - value) if slot.strike else None
+            logger.info(
+                f"[{tag}] MOVE_REF strike_spot={(f'{slot.strike:.4f}' if slot.strike else 'n/a')} "
+                f"strike_twap={value:.4f} src={source} window={window_s:.0f}s "
+                f"spot_minus_twap={(f'{diff:+.4f}' if diff is not None else 'n/a')} slot={(market or {}).get('slug')}"
+            )
+        else:
+            logger.warning(
+                f"[{tag}] MOVE_REF TWAP strike unavailable for {(market or {}).get('slug')} "
+                f"(insufficient pre-open ticks over {window_s:.0f}s); momentum gate falls back to spot strike"
+            )
+
+    def _strike_meta(self, slot: CoinSlot) -> dict:
+        return {
+            "strike_spot": slot.strike,
+            "strike_twap": slot.strike_twap,
+            "strike_twap_source": slot.strike_twap_source,
+            "move_ref_mode": move_ref.normalize_mode(getattr(config, "MOMENTUM_MOVE_REF", "conservative")),
+            "move_ref_used": slot.move_ref_used,
+        }
+
     async def _place_taker_order(
         self,
         slot: CoinSlot,
@@ -1602,6 +1706,7 @@ class TWAPBot:
             entry_elapsed_s=el_s,
             entry_window_time=entry_window_time,
             jev=jev_decision.to_dict() if jev_decision else None,
+            **self._strike_meta(slot),
         )
 
         slot.position = {
@@ -1627,6 +1732,7 @@ class TWAPBot:
             "entry_window_time": entry_window_time,
             "order_id": order_id,
             "jev": jev_decision.to_dict() if jev_decision else None,
+            **self._strike_meta(slot),
         }
 
     async def _place_maker_bid(
@@ -1690,6 +1796,7 @@ class TWAPBot:
             "placed_at": time.time(),
             "order_id": order_id,
             "jev": jev_decision.to_dict() if jev_decision else None,
+            **self._strike_meta(slot),
         }
 
 
@@ -2257,6 +2364,7 @@ class TWAPBot:
             "official": True,
             "settlement_source": f"early_exit_{reason}",
             "jev": pos.get("jev"),
+            **{k: pos.get(k) for k in ("strike_spot", "strike_twap", "strike_twap_source", "move_ref_mode", "move_ref_used")},
         }
         journal_write(
             "settlement",
@@ -2453,6 +2561,7 @@ class TWAPBot:
             "official": bool(resolution.get("official")),
             "early_exit": False,
             "jev": pos.get("jev"),
+            **{k: pos.get(k) for k in ("strike_spot", "strike_twap", "strike_twap_source", "move_ref_mode", "move_ref_used")},
         }
         journal_write(
             "settlement",

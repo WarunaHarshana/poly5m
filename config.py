@@ -90,6 +90,13 @@ DYNAMIC_ENTRY_COOLDOWN_S = float(os.getenv("DYNAMIC_ENTRY_COOLDOWN_S", "10.0"))
 DYNAMIC_MIN_ELAPSED_S = float(os.getenv("DYNAMIC_MIN_ELAPSED_S", "30.0"))
 # Momentum taker only — maker mid-band may still quote earlier in the window.
 DYNAMIC_MOMENTUM_MIN_ELAPSED_S = float(os.getenv("DYNAMIC_MOMENTUM_MIN_ELAPSED_S", "90.0"))
+# Momentum entry move reference. Markets settle on Chainlink 60s-TWAP (finalPrice vs priceToBeat),
+# not the raw spot tick at slot open. "conservative" measures the entry move against both the spot
+# strike and a TWAP strike estimate and uses the smaller magnitude (0 if they disagree on direction).
+# "spot" restores the legacy spot-strike-only behaviour exactly.
+MOMENTUM_MOVE_REF = os.getenv("MOMENTUM_MOVE_REF", "conservative").strip().lower()
+# Window (seconds before slot open) averaged to estimate the TWAP-based price-to-beat.
+SETTLEMENT_TWAP_WINDOW_S = float(os.getenv("SETTLEMENT_TWAP_WINDOW_S", "60"))
 DYNAMIC_MAX_ELAPSED_S = float(os.getenv("DYNAMIC_MAX_ELAPSED_S", "240.0"))
 
 # --- AVN-MAS Take-Profit & Adverse Stop-Loss Parameters ---
