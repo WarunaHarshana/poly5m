@@ -128,6 +128,90 @@ def public_trade(row: dict) -> dict:
     }
 
 
+# --- /stats breakdown helpers (reporting only; no trading behaviour) -------
+
+EXIT_REASON_BUCKETS = (
+    "settled_win", "settled_loss", "take_profit", "trailing_profit",
+    "adverse_stop", "hard_flatten_expiry", "failsafe", "exit_before", "other",
+)
+ENTRY_ELAPSED_BUCKETS = ("<45", "45-90", "90-120", "120-180", "180+", "unknown")
+STRATEGY_LEG_BUCKETS = ("momentum", "maker", "other")
+
+
+def exit_reason_bucket(reason: Any) -> str:
+    """Normalize a free-text exit_reason (e.g. 'trailing_profit (peak: 0.80, ...)') to a category."""
+    r = str(reason or "").strip().lower()
+    if not r:
+        return "other"
+    if r.startswith(("settlement_won", "settled_win")):
+        return "settled_win"
+    if r.startswith(("settlement_lost", "settled_loss", "settlement_loss")):
+        return "settled_loss"
+    if r.startswith("take_profit"):
+        return "take_profit"
+    if r.startswith("trailing_profit"):
+        return "trailing_profit"
+    if r.startswith(("stop_loss", "urgent_stop_loss", "adverse_stop", "salvage")):
+        return "adverse_stop"
+    if r.startswith("hard_flatten"):
+        return "hard_flatten_expiry"
+    if r.startswith("failsafe"):
+        return "failsafe"
+    if r.startswith("exit_before"):
+        return "exit_before"
+    return "other"
+
+
+def entry_elapsed_bucket(elapsed: Any) -> str:
+    """Bucket seconds elapsed in the 5-min round at entry."""
+    if elapsed is None or isinstance(elapsed, bool):
+        return "unknown"
+    try:
+        e = float(elapsed)
+    except (TypeError, ValueError):
+        return "unknown"
+    if e != e or e < 0:  # NaN / negative
+        return "unknown"
+    if e < 45:
+        return "<45"
+    if e < 90:
+        return "45-90"
+    if e < 120:
+        return "90-120"
+    if e < 180:
+        return "120-180"
+    return "180+"
+
+
+def strategy_leg_bucket(strategy: Any) -> str:
+    s = str(strategy or "").upper()
+    if "MOMENTUM" in s:
+        return "momentum"
+    if "MAKER" in s:
+        return "maker"
+    return "other"
+
+
+def _group_resolved(resolved: list[dict], key_fn: Callable[[dict], str], order: tuple[str, ...] | None = None) -> dict[str, dict]:
+    groups: dict[str, dict] = {}
+    for r in resolved:
+        k = key_fn(r)
+        bucket = groups.setdefault(k, {"trades": 0, "wins": 0, "pnl": 0.0, "cost": 0.0, "fee": 0.0, "total_cost": 0.0})
+        bucket["trades"] += 1
+        bucket["wins"] += 1 if r.get("won") else 0
+        bucket["pnl"] = round(bucket["pnl"] + float(r.get("pnl") or 0.0), 2)
+        bucket["cost"] = round(bucket["cost"] + float(r.get("cost") or 0.0), 4)
+        bucket["fee"] = round(bucket["fee"] + float(r.get("fee") or 0.0), 4)
+        bucket["total_cost"] = round(bucket["total_cost"] + float(r.get("total_cost") or r.get("cost") or 0.0), 4)
+    for bucket in groups.values():
+        n = bucket["trades"]
+        bucket["win_rate"] = round(bucket["wins"] / n, 4) if n else 0.0
+    if order:
+        rank = {k: i for i, k in enumerate(order)}
+        groups = dict(sorted(groups.items(), key=lambda kv: rank.get(kv[0], len(rank))))
+    return groups
+
+
 def build_stats(trades: list[dict], snapshot: dict[str, Any] | None = None) -> dict:
     rows = [public_trade(t) for t in trades]
     resolved = [r for r in rows if r.get("won") is not None and r.get("pnl") is not None]
@@ -136,19 +220,10 @@ def build_stats(trades: list[dict], snapshot: dict[str, Any] | None = None) -> d
     cost = sum(float(r.get("cost") or 0.0) for r in resolved)
     total_fee = sum(float(r.get("fee") or 0.0) for r in resolved)
     total_outlay = sum(float(r.get("total_cost") or (float(r.get("cost") or 0.0) + float(r.get("fee") or 0.0))) for r in resolved)
-    by_asset: dict[str, dict] = {}
-    for r in resolved:
-        a = r.get("asset") or "unknown"
-        bucket = by_asset.setdefault(a, {"trades": 0, "wins": 0, "pnl": 0.0, "cost": 0.0, "fee": 0.0, "total_cost": 0.0})
-        bucket["trades"] += 1
-        bucket["wins"] += 1 if r.get("won") else 0
-        bucket["pnl"] = round(bucket["pnl"] + float(r.get("pnl") or 0.0), 2)
-        bucket["cost"] = round(bucket["cost"] + float(r.get("cost") or 0.0), 4)
-        bucket["fee"] = round(bucket["fee"] + float(r.get("fee") or 0.0), 4)
-        bucket["total_cost"] = round(bucket["total_cost"] + float(r.get("total_cost") or r.get("cost") or 0.0), 4)
-    for bucket in by_asset.values():
-        n = bucket["trades"]
-        bucket["win_rate"] = round(bucket["wins"] / n, 4) if n else 0.0
+    by_asset = _group_resolved(resolved, lambda r: r.get("asset") or "unknown")
+    by_exit_reason = _group_resolved(resolved, lambda r: exit_reason_bucket(r.get("exit_reason")), EXIT_REASON_BUCKETS)
+    by_entry_elapsed = _group_resolved(resolved, lambda r: entry_elapsed_bucket(r.get("entry_elapsed_s")), ENTRY_ELAPSED_BUCKETS)
+    by_strategy_leg = _group_resolved(resolved, lambda r: strategy_leg_bucket(r.get("strategy")), STRATEGY_LEG_BUCKETS)
     now = time.time()
     day_pnl = 0.0
     for raw in trades:
@@ -182,6 +257,9 @@ def build_stats(trades: list[dict], snapshot: dict[str, Any] | None = None) -> d
         "open_positions": snap.get("open_positions") or [],
         "uptime_seconds": snap.get("uptime_seconds"),
         "by_asset": by_asset,
+        "by_exit_reason": by_exit_reason,
+        "by_entry_elapsed": by_entry_elapsed,
+        "by_strategy_leg": by_strategy_leg,
         "jev": snap.get("jev"),
     }
 
