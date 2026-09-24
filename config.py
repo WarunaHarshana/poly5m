@@ -88,6 +88,8 @@ DYNAMIC_ENTRY_COOLDOWN_S = float(os.getenv("DYNAMIC_ENTRY_COOLDOWN_S", "10.0"))
 # - t >= 240s (remaining <= 60s): Prohibit new entries
 # Volatility normalization: sigma(t) = daily_vol * sqrt(t / 86400.0) * spot
 DYNAMIC_MIN_ELAPSED_S = float(os.getenv("DYNAMIC_MIN_ELAPSED_S", "30.0"))
+# Momentum taker only — maker mid-band may still quote earlier in the window.
+DYNAMIC_MOMENTUM_MIN_ELAPSED_S = float(os.getenv("DYNAMIC_MOMENTUM_MIN_ELAPSED_S", "90.0"))
 DYNAMIC_MAX_ELAPSED_S = float(os.getenv("DYNAMIC_MAX_ELAPSED_S", "240.0"))
 
 # --- AVN-MAS Take-Profit & Adverse Stop-Loss Parameters ---
@@ -392,6 +394,6 @@ JEV_TIMEOUT_S = _fenv("JEV_TIMEOUT_S", 1.2)
 JEV_MAX_REVERSAL_NOUL = _fenv("JEV_MAX_REVERSAL_NOUL", 0.32)
 JEV_MAX_FAKEOUT_NOUL = _fenv("JEV_MAX_FAKEOUT_NOUL", 0.35)
 JEV_MIN_CONVICTION_SCORE = _fenv("JEV_MIN_CONVICTION_SCORE", 1.65)
-JEV_MIN_DOWNSIZE_CONVICTION = _fenv("JEV_MIN_DOWNSIZE_CONVICTION", 1.40)
+JEV_MIN_DOWNSIZE_CONVICTION = _fenv("JEV_MIN_DOWNSIZE_CONVICTION", 1.15)
 JEV_DOWNSIZE_FACTOR = _fenv("JEV_DOWNSIZE_FACTOR", 0.50)
 JEV_ALLOW_DOWNSIZING = os.getenv("JEV_ALLOW_DOWNSIZING", "true").strip().lower() in ("true", "1", "yes")

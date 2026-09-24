@@ -750,8 +750,12 @@ class TWAPBot:
                     and 0.0 < float(q_bid) < float(q_ask) < 1.0
                     and spread <= config.DYNAMIC_MAX_BOOK_SPREAD
                 ):
+                    momentum_min_elapsed = float(
+                        getattr(config, "DYNAMIC_MOMENTUM_MIN_ELAPSED_S", 90.0)
+                    )
                     is_momentum_candidate = (
                         allowed_feas
+                        and float(elapsed_s) >= momentum_min_elapsed
                         and directional_coherence
                         and abs(move_usd) >= min_move_usd
                         and config.DYNAMIC_MOMENTUM_MIN_ASK <= float(q_ask) <= effective_max_ask
@@ -1793,7 +1797,8 @@ class TWAPBot:
             stop_price = round(peak_bid - trail_distance, 4)
             if min_breakeven < peak_bid:
                 stop_price = max(stop_price, min_breakeven)
-            floor = round(entry - 0.05, 4)
+            # Trailing profit must not scratch below entry+fees; deep crashes belong to adverse SL.
+            floor = round(entry + round_trip_fee, 4)
             stop_price = max(stop_price, floor)
             if float(best_bid) <= stop_price and float(best_bid) >= floor:
                 reason = f"trailing_profit (peak: {peak_bid:.2f}, exit: {float(best_bid):.2f}, entry: {entry:.2f})"
@@ -1909,6 +1914,10 @@ class TWAPBot:
                     salvage_min = float(getattr(config, "STOP_LOSS_SALVAGE_MIN_BID", 0.10))
                     persistence_s = float(getattr(config, "STOP_LOSS_PERSISTENCE_SECONDS", 10.0))
 
+                # Final 30s: accept any scrap of liquidity via complement / panic floor.
+                if remaining_s <= 30.0:
+                    salvage_min = min(salvage_min, 0.01)
+
                 if is_adverse_confirmed:
                     if adverse_duration >= persistence_s or (is_catastrophic and persistence_s == 0.0):
                         if (best_bid is None or float(best_bid) < salvage_min) and opp_token_id:
@@ -1939,6 +1948,16 @@ class TWAPBot:
                                 f"salvage bid {float(best_bid):.3f} >= {salvage_min:.2f} — triggering early capital preservation exit"
                             )
                             await self._exit_position_early(slot, market, float(best_bid), reason=exit_reason)
+                            return
+                        elif is_hard_flatten:
+                            # Never ride to $0.00 in the final hard-flatten window.
+                            force_px = max(0.01, float(best_bid) if best_bid is not None else 0.01)
+                            logger.warning(
+                                f"[{slot.asset.upper()} HARD_FLATTEN_EXPIRY] Spot {spot:.2f} crossed strike {strike:.2f} against {side} "
+                                f"(adverse_dist={adverse_dist:.2f}, remaining={remaining_s:.1f}s); "
+                                f"forcing flatten @ {force_px:.3f} (book illiquid / below salvage floor)"
+                            )
+                            await self._exit_position_early(slot, market, force_px, reason="hard_flatten_expiry")
                             return
                         else:
                             logger.info(
