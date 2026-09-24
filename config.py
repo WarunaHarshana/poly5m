@@ -82,9 +82,9 @@ DYNAMIC_ENTRY_COOLDOWN_S = float(os.getenv("DYNAMIC_ENTRY_COOLDOWN_S", "10.0"))
 # --- AVN-MAS Dynamic Price-Time Feasibility Matrix Parameters ---
 # Adaptive scaling with elapsed time t:
 # - t < 30s: Entry prohibited (noise & initial spread formation)
-# - 30s <= t < 90s: Move >= 2.0*sigma (~5.0 bps for BTC), max ask P_max = 0.70
-# - 90s <= t < 150s: Move >= 1.5*sigma (~5.3 bps for BTC), max ask P_max = 0.76
-# - 150s <= t < 240s: Move >= 1.2*sigma (~5.5 bps for BTC), max ask P_max = 0.80
+# - 30s <= t < 120s: Move >= 2.0*sigma (~5.0 bps for BTC), max ask P_max = 0.72
+# - 120s <= t < 180s: Move >= 1.5*sigma (~5.3 bps for BTC), max ask P_max = 0.78
+# - 180s <= t < 240s: Move >= 1.2*sigma (~5.5 bps for BTC), max ask P_max = 0.80
 # - t >= 240s (remaining <= 60s): Prohibit new entries
 # Volatility normalization: sigma(t) = daily_vol * sqrt(t / 86400.0) * spot
 DYNAMIC_MIN_ELAPSED_S = float(os.getenv("DYNAMIC_MIN_ELAPSED_S", "30.0"))
@@ -93,7 +93,7 @@ DYNAMIC_MAX_ELAPSED_S = float(os.getenv("DYNAMIC_MAX_ELAPSED_S", "240.0"))
 # --- AVN-MAS Take-Profit & Adverse Stop-Loss Parameters ---
 TAKE_PROFIT_BID = float(os.getenv("TAKE_PROFIT_BID", "0.95"))
 TAKE_PROFIT_ASK = float(os.getenv("TAKE_PROFIT_ASK", "0.96"))
-STOP_LOSS_SALVAGE_MIN_BID = float(os.getenv("STOP_LOSS_SALVAGE_MIN_BID", "0.25"))
+STOP_LOSS_SALVAGE_MIN_BID = float(os.getenv("STOP_LOSS_SALVAGE_MIN_BID", "0.10"))
 
 # Urgent Late-Round Capital Salvage (remaining <= 45s)
 STOP_LOSS_URGENT_SALVAGE_MIN_BID = float(os.getenv("STOP_LOSS_URGENT_SALVAGE_MIN_BID", "0.05"))
@@ -116,8 +116,8 @@ STOP_LOSS_PERSISTENCE_SECONDS = float(os.getenv("STOP_LOSS_PERSISTENCE_SECONDS",
 STOP_LOSS_REQUIRE_TWAP = os.getenv("STOP_LOSS_REQUIRE_TWAP", "yes").strip().lower() in ("yes", "y", "true", "1")
 
 # --- Dynamic Trailing Profit Stop Parameters ---
-# Defaulted to 'no' (disabled) based on live audit: 8¢ trail choked winning trades during normal CLOB spreads
-TRAILING_PROFIT_ENABLED = os.getenv("TRAILING_PROFIT_ENABLED", os.getenv("TRAILING_BREAKEVEN_ENABLED", "no")).strip().lower() in ("yes", "y", "true", "1")
+# Armed when peak bid reaches >= 0.78, trails by 0.08 to lock in profit before expiry
+TRAILING_PROFIT_ENABLED = os.getenv("TRAILING_PROFIT_ENABLED", os.getenv("TRAILING_BREAKEVEN_ENABLED", "yes")).strip().lower() in ("yes", "y", "true", "1")
 TRAILING_PROFIT_DISTANCE = float(os.getenv("TRAILING_PROFIT_DISTANCE", "0.08"))
 TRAILING_PROFIT_MIN_PEAK = float(os.getenv("TRAILING_PROFIT_MIN_PEAK", "0.78"))
 
@@ -144,11 +144,11 @@ def compute_dynamic_feasibility(
 
     sigma_t = vol * ((t / 86400.0) ** 0.5) * s
 
-    if t < 90.0:
-        mult, max_ask = 2.0, 0.70
-    elif t < 150.0:
-        mult, max_ask = 1.5, 0.76
-    else:  # 150.0 <= t < 240.0
+    if t < 120.0:
+        mult, max_ask = 2.0, 0.72
+    elif t < 180.0:
+        mult, max_ask = 1.5, 0.78
+    else:  # 180.0 <= t < 240.0
         mult, max_ask = 1.2, 0.80
 
     max_ask = min(max_ask, DYNAMIC_MOMENTUM_MAX_ASK)
@@ -251,9 +251,9 @@ DEFAULT_CHOP_NOISE_BPS = _fenv("CHOP_NOISE_BPS", 3.0 / _BTC_REF_SPOT * 1e4)
 DEFAULT_MOMENTUM_MIN_MOVE_BPS = _fenv("MOMENTUM_MIN_MOVE_BPS", 70.0 / _BTC_REF_SPOT * 1e4)
 DEFAULT_MOMENTUM_MAX_MOVE_BPS = _fenv("MOMENTUM_MAX_MOVE_BPS", 300.0 / _BTC_REF_SPOT * 1e4)
 
-# Per-coin realized-vol prior (alts chop more than BTC).
+# Per-coin realized-vol prior (alts chop more than BTC; BTC tightened from 0.0106 to prevent sub-5bps noise triggers).
 _DAILY_VOL = {
-    "btc": 0.0106,
+    "btc": 0.0135,
     "eth": 0.0140,
     "sol": 0.0220,
     "bnb": 0.0160,
@@ -273,7 +273,7 @@ _MAX_BUY = {
 }
 # Higher Z on noisier coins to prevent coin-flip entries.
 _MIN_Z = {
-    "btc": 1.65,
+    "btc": 1.95,    # was 1.65 — BTC 5m chop requires higher directional conviction
     "eth": 1.65,
     "sol": 2.00,    # was 1.70 — lost at Z=1.94
     "bnb": 1.70,

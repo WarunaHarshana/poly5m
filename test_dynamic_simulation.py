@@ -271,31 +271,32 @@ class TestDynamicSimulation(unittest.IsolatedAsyncioTestCase):
         allowed, min_move, max_ask, _ = config.compute_dynamic_feasibility(29.9, spot, daily_vol)
         self.assertFalse(allowed)
 
-        # Tier 1: 30s <= t < 90s: mult=2.0, max_ask=0.70
+        # Tier 1: 30s <= t < 120s: mult=2.0, max_ask=0.72
         allowed, min_move, max_ask, sigma_t = config.compute_dynamic_feasibility(30.0, spot, daily_vol)
         self.assertTrue(allowed)
-        self.assertEqual(max_ask, 0.70)
+        self.assertEqual(max_ask, 0.72)
         expected_sigma_30 = daily_vol * ((30.0 / 86400.0) ** 0.5) * spot
         self.assertAlmostEqual(sigma_t, expected_sigma_30, places=4)
         self.assertAlmostEqual(min_move, 2.0 * expected_sigma_30, places=4)
 
-        allowed, min_move, max_ask, _ = config.compute_dynamic_feasibility(89.9, spot, daily_vol)
+        allowed, min_move, max_ask, _ = config.compute_dynamic_feasibility(119.9, spot, daily_vol)
         self.assertTrue(allowed)
-        self.assertEqual(max_ask, 0.70)
+        self.assertEqual(max_ask, 0.72)
 
-        # Tier 2: 90s <= t < 150s: mult=1.5, max_ask=0.76
-        allowed, min_move, max_ask, sigma_t = config.compute_dynamic_feasibility(90.0, spot, daily_vol)
+        # Tier 2: 120s <= t < 180s: mult=1.5, max_ask=0.78
+        allowed, min_move, max_ask, sigma_t = config.compute_dynamic_feasibility(120.0, spot, daily_vol)
         self.assertTrue(allowed)
-        self.assertEqual(max_ask, 0.76)
-        expected_sigma_90 = daily_vol * ((90.0 / 86400.0) ** 0.5) * spot
-        self.assertAlmostEqual(min_move, 1.5 * expected_sigma_90, places=4)
+        self.assertEqual(max_ask, 0.78)
+        expected_sigma_120 = daily_vol * ((120.0 / 86400.0) ** 0.5) * spot
+        self.assertAlmostEqual(sigma_t, expected_sigma_120, places=4)
+        self.assertAlmostEqual(min_move, 1.5 * expected_sigma_120, places=4)
 
-        # Tier 3: 150s <= t < 240s: mult=1.2, max_ask=0.80
-        allowed, min_move, max_ask, sigma_t = config.compute_dynamic_feasibility(150.0, spot, daily_vol)
+        # Tier 3: 180s <= t < 240s: mult=1.2, max_ask=0.80
+        allowed, min_move, max_ask, sigma_t = config.compute_dynamic_feasibility(180.0, spot, daily_vol)
         self.assertTrue(allowed)
         self.assertEqual(max_ask, 0.80)
-        expected_sigma_150 = daily_vol * ((150.0 / 86400.0) ** 0.5) * spot
-        self.assertAlmostEqual(min_move, 1.2 * expected_sigma_150, places=4)
+        expected_sigma_180 = daily_vol * ((180.0 / 86400.0) ** 0.5) * spot
+        self.assertAlmostEqual(min_move, 1.2 * expected_sigma_180, places=4)
 
         # Tier 3 (continued at 210s): mult=1.2, max_ask=0.80
         allowed, min_move, max_ask, sigma_t = config.compute_dynamic_feasibility(210.0, spot, daily_vol)
@@ -2022,6 +2023,85 @@ class TestDynamicSimulation(unittest.IsolatedAsyncioTestCase):
         trade = loaded[-1]
         self.assertEqual(trade["exit_reason"], "failsafe_orderbook_flatten")
         self.assertEqual(trade["exit_price"], 0.12)
+
+    async def test_salvage_triggers_at_12_cents_mid_round(self):
+        """In mid-round (remaining > 45s), an adverse cross should salvage at 0.12 with new 0.10 floor instead of holding to 0.00."""
+        asset = "btc"
+        now = time.time()
+        slot_start = now - 180.0  # 180s elapsed, 120s remaining
+
+        market = {
+            "slug": "btc-usd-5m-test-salvage-12c",
+            "slot_start_ts": slot_start,
+            "start_time": slot_start,
+            "end_ts": slot_start + 300.0,
+            "end_time": slot_start + 300.0,
+            "strike_price": 90000.0,
+            "tokens": {"UP": "tok_up_btc", "DOWN": "tok_down_btc"},
+            "fee_rate": 0.0,
+        }
+        slot = self.bot.slots[asset]
+        slot.market = market
+        slot.strike = 90000.0
+        slot.position = {
+            "strategy": "JEV_DYNAMIC_MOMENTUM",
+            "side": "UP",
+            "token_id": "tok_up_btc",
+            "opp_token_id": "tok_down_btc",
+            "price": 0.65,
+            "shares": 5.0,
+            "cost_usd": 3.25,
+            "fee": 0.08,
+            "strike": 90000.0,
+            "slot_start_ts": slot_start,
+            "entry_time": slot_start + 30.0,
+            "adverse_start_ts": now - 15.0,  # adverse held for 15s >= 10s persistence
+        }
+
+        # Realized TWAP also adverse (below strike)
+        self.bot.cl_stream._record(slot_start, 90000.0, asset=asset)
+        self.bot.cl_stream._record(slot_start + 60.0, 89900.0, asset=asset)
+        self.bot.cl_stream._record(now, 89850.0, asset=asset)
+
+        # Orderbook bid is 0.12 (previously rejected under 0.25 floor; now accepted under 0.10 floor)
+        self.bot.book_stream._apply_update("tok_up_btc", bid=0.12, ask=0.16, bid_sz=500, ask_sz=500)
+
+        await self.bot._manage_open_momentum_position(
+            slot, market, remaining_s=120.0, tokens=market["tokens"],
+            spot=89850.0, strike=90000.0, elapsed_s=180.0, now=now,
+        )
+
+        self.assertIsNone(slot.position, "Position should have been salvaged at 0.12 bid")
+        loaded = load_trades(self.bot._trades_log_path)
+        trade = loaded[-1]
+        self.assertEqual(trade["exit_reason"], "stop_loss")
+        self.assertEqual(trade["exit_price"], 0.12)
+
+    def test_trailing_profit_enabled_by_default(self):
+        """Verify that trailing profit stop is enabled by default in config."""
+        self.assertTrue(config.TRAILING_PROFIT_ENABLED)
+
+    def test_dynamic_feasibility_120s_threshold(self):
+        """Verify the 120s threshold in compute_dynamic_feasibility."""
+        spot = 90000.0
+        vol = 0.0135
+        # At 119.9s -> mult is 2.0, max_ask is 0.72
+        allowed_early, min_move_early, max_ask_early, sigma_early = config.compute_dynamic_feasibility(119.9, spot, vol)
+        self.assertTrue(allowed_early)
+        self.assertEqual(max_ask_early, 0.72)
+        self.assertAlmostEqual(min_move_early, 2.0 * sigma_early, places=4)
+
+        # At 120.0s -> mult drops to 1.5, max_ask is 0.78
+        allowed_mid, min_move_mid, max_ask_mid, sigma_mid = config.compute_dynamic_feasibility(120.0, spot, vol)
+        self.assertTrue(allowed_mid)
+        self.assertEqual(max_ask_mid, 0.78)
+        self.assertAlmostEqual(min_move_mid, 1.5 * sigma_mid, places=4)
+
+    def test_btc_noise_filter(self):
+        """Verify that BTC has calibrated min_z (1.95) and daily_vol (0.0135)."""
+        btc_params = config.ASSET_PARAMS["btc"]
+        self.assertEqual(btc_params.min_z, 1.95)
+        self.assertEqual(btc_params.daily_vol, 0.0135)
 
 
 if __name__ == "__main__":

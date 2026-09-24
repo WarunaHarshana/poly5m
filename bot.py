@@ -1906,7 +1906,7 @@ class TWAPBot:
                     salvage_min = float(getattr(config, "STOP_LOSS_URGENT_SALVAGE_MIN_BID", 0.05))
                     persistence_s = float(getattr(config, "STOP_LOSS_URGENT_PERSISTENCE_SECONDS", 3.0))
                 else:
-                    salvage_min = float(getattr(config, "STOP_LOSS_SALVAGE_MIN_BID", 0.25))
+                    salvage_min = float(getattr(config, "STOP_LOSS_SALVAGE_MIN_BID", 0.10))
                     persistence_s = float(getattr(config, "STOP_LOSS_PERSISTENCE_SECONDS", 10.0))
 
                 if is_adverse_confirmed:
