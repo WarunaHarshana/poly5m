@@ -1797,9 +1797,8 @@ class TWAPBot:
             stop_price = round(peak_bid - trail_distance, 4)
             if min_breakeven < peak_bid:
                 stop_price = max(stop_price, min_breakeven)
-            # Trailing profit must not scratch below entry+fees; deep crashes belong to adverse SL.
-            floor = round(entry + round_trip_fee, 4)
-            stop_price = max(stop_price, floor)
+            # Trailing profit must not scratch below entry; deep crashes belong to adverse SL.
+            floor = round(entry, 4)
             if float(best_bid) <= stop_price and float(best_bid) >= floor:
                 reason = f"trailing_profit (peak: {peak_bid:.2f}, exit: {float(best_bid):.2f}, entry: {entry:.2f})"
                 logger.warning(

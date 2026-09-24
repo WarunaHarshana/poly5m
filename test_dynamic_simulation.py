@@ -313,10 +313,10 @@ class TestDynamicSimulation(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(allowed)
 
     async def test_dynamic_tier1_momentum_flow(self):
-        """Simulate momentum entry during Tier 1 (30s <= t < 90s) with P_max = 0.72."""
+        """Simulate momentum entry during Tier 1 (90s <= t < 120s) with P_max = 0.72."""
         asset = "btc"
         now = time.time()
-        slot_start = now - 60.0  # 60s elapsed, 240s remaining (Tier 1)
+        slot_start = now - 100.0  # 100s elapsed (>= DYNAMIC_MOMENTUM_MIN_ELAPSED_S=90s), 200s remaining (Tier 1)
 
         market = {
             "slug": "btc-usd-5m-test-tier1",
@@ -353,6 +353,42 @@ class TestDynamicSimulation(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(slot.position["strategy"], "JEV_DYNAMIC_MOMENTUM")
         self.assertEqual(slot.position["price"], 0.68)
         self.assertEqual(slot.position["side"], "UP")
+
+    async def test_dynamic_momentum_blocked_before_90s(self):
+        """Momentum taker entries must be strictly blocked before t = 90s to avoid early noise."""
+        asset = "btc"
+        now = time.time()
+        slot_start = now - 60.0  # 60s elapsed < 90s min threshold
+
+        market = {
+            "slug": "btc-usd-5m-test-early-blocked",
+            "slot_start_ts": slot_start,
+            "start_time": slot_start,
+            "end_ts": slot_start + 300.0,
+            "end_time": slot_start + 300.0,
+            "strike_price": 90000.0,
+            "tokens": {"UP": "tok_up_btc", "DOWN": "tok_down_btc"},
+            "fee_rate": 0.0,
+        }
+
+        slot = self.bot.slots[asset]
+        slot.market = market
+        slot.strike = 90000.0
+
+        self.bot.cl_stream._record(slot_start, 90000.0, asset=asset)
+        self.bot.cl_stream._record(now, 90150.0, asset=asset)
+
+        self.bot.book_stream._apply_update("tok_up_btc", bid=0.64, ask=0.68, bid_sz=500, ask_sz=500)
+
+        mock_jev = JevDecision(
+            action="proceed", passed=True, size_multiplier=1.0, conviction=2.5,
+            reversal_risk=0.15, market_regime="clean_trend", confidence=0.88,
+            reason="Clean breakout.", latency_ms=50.0, fallback_used=False,
+        )
+        self.bot.jev.evaluate_dynamic = AsyncMock(return_value=mock_jev)
+
+        await self.bot._tick_asset(slot, now)
+        self.assertIsNone(slot.position, "Momentum taker must be blocked before t=90s")
 
     async def test_directional_coherence_rejection(self):
         """Reject entry when spot and realized TWAP disagree on direction."""
@@ -1310,7 +1346,7 @@ class TestDynamicSimulation(unittest.IsolatedAsyncioTestCase):
         """Exact 0.05 spread (e.g. 0.74 - 0.69) must pass spread gate without IEEE float failure."""
         asset = "btc"
         now = time.time()
-        slot_start = now - 60.0
+        slot_start = now - 120.0
 
         market = {
             "slug": "btc-usd-5m-test-spread-precision",
@@ -1404,7 +1440,7 @@ class TestDynamicSimulation(unittest.IsolatedAsyncioTestCase):
             config.STRATEGY = "AVN_MAS"
             asset = "btc"
             now = time.time()
-            slot_start = now - 60.0
+            slot_start = now - 120.0
 
             market = {
                 "slug": "btc-usd-5m-test-avn-alias",
