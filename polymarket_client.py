@@ -54,6 +54,31 @@ def fillable_ask_shares(book: dict | None, limit_px: float, requested_shares: fl
     return shares, vwap
 
 
+def fillable_bid_shares(book: dict | None, requested_shares: float, floor_px: float = 0.0) -> tuple[float, float]:
+    """Shares and VWAP a sell of requested_shares would get walking down the real bid book (>= floor_px)."""
+    if not book or requested_shares <= 0:
+        return 0.0, 0.0
+    levels = []
+    for level in book.get("bids") or []:
+        try:
+            px = float(level.get("price") if isinstance(level, dict) else level)
+            sz = float((level.get("size") if isinstance(level, dict) else 0.0) or 0.0)
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if 0.0 < px < 1.0 and sz > 0 and px >= floor_px:
+            levels.append((px, sz))
+    levels.sort(key=lambda x: -x[0])  # best (highest) bid first, regardless of book ordering
+    shares = 0.0
+    notional = 0.0
+    for px, sz in levels:
+        take = min(sz, requested_shares - shares)
+        if take <= 0:
+            break
+        shares += take
+        notional += take * px
+    return shares, ((notional / shares) if shares > 0 else 0.0)
+
+
 def extract_best_bid_ask(book: dict | None) -> tuple[float | None, float | None]:
     """Extract true best bid and true best ask from a Polymarket orderbook dict.
 

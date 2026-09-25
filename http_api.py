@@ -143,7 +143,7 @@ def _row_shadow_verdict(row: dict) -> str | None:
 
 EXIT_REASON_BUCKETS = (
     "settled_win", "settled_loss", "take_profit", "trailing_profit",
-    "adverse_stop", "hard_flatten_expiry", "failsafe", "exit_before", "other",
+    "adverse_stop", "price_stop", "hard_flatten_expiry", "failsafe", "exit_before", "other",
 )
 ENTRY_ELAPSED_BUCKETS = ("<45", "45-90", "90-120", "120-180", "180+", "unknown")
 STRATEGY_LEG_BUCKETS = ("momentum", "maker", "other")
@@ -165,6 +165,8 @@ def exit_reason_bucket(reason: Any) -> str:
         return "trailing_profit"
     if r.startswith(("stop_loss", "urgent_stop_loss", "adverse_stop", "salvage")):
         return "adverse_stop"
+    if r.startswith("price_stop"):
+        return "price_stop"
     if r.startswith("hard_flatten"):
         return "hard_flatten_expiry"
     if r.startswith("failsafe"):

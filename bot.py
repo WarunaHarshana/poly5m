@@ -27,6 +27,7 @@ from polymarket_client import (
     PolymarketPublicClient,
     PolymarketLiveClient,
     fillable_ask_shares,
+    fillable_bid_shares,
     extract_best_bid_ask,
     extract_market_top,
 )
@@ -2187,6 +2188,11 @@ class TWAPBot:
                 await self._exit_position_early(slot, market, float(best_bid), reason=reason)
                 return
 
+        # 2b) Bid-based max-loss stop (PRICE_STOP_*): independent of spot/TWAP/sigma conditions.
+        if getattr(config, "PRICE_STOP_ENABLED", False) and entry > 0 and token_id:
+            if await self._check_price_stop(slot, market, pos, token_id, entry, remaining_s, now):
+                return
+
         # 3) Adverse Stop-Loss with Hysteresis Buffer, TWAP Coherence & Persistence Filter:
         # A momentary 1-tick dip across strike must NOT trigger an instantaneous fire sale.
         # Live audit proved 1-tick stop-outs caused -$5.78 in profit leaks on winning trades.
@@ -2411,6 +2417,79 @@ class TWAPBot:
             # Extreme conviction on our side (crowd piled in) -> tiny opposite hedge
             if main_ask is not None and main_ask >= float(config.MOMENTUM_HEDGE_TRIGGER_ASK):
                 await self._place_micro_hedge(slot, market, tokens, pos, main_ask)
+
+    def _real_best_bid(self, token_id: str) -> float | None:
+        """Best bid from the token's OWN book only (no 1-opp_ask complement inference)."""
+        top = self.book_stream.get_top(token_id)
+        bid = top.get("bid") if top else None
+        if bid is None:
+            try:
+                bid, _ = extract_best_bid_ask(self.pub_client.get_order_book(token_id))
+            except Exception:
+                bid = None
+        return float(bid) if bid is not None else None
+
+    def _paper_sell_price(self, token_id: str, shares: float, best_bid: float) -> tuple[float, str]:
+        """Paper exit price when selling `shares` into the real bid book: VWAP over bid levels.
+
+        Unfilled remainder (book too thin) is marked at 0.01. Never better than the best bid.
+        """
+        try:
+            book = self.pub_client.get_order_book(token_id)
+        except Exception:
+            book = None
+        filled, vwap = fillable_bid_shares(book, shares)
+        if filled <= 0:
+            return float(best_bid), "ws_best_bid"
+        px = (filled * vwap + max(0.0, shares - filled) * 0.01) / shares
+        src = "book_vwap" if filled + 1e-9 >= shares else f"book_vwap_partial({filled:.2f}/{shares:.2f})"
+        return round(min(float(best_bid), px), 4), src
+
+    async def _check_price_stop(
+        self, slot: CoinSlot, market: dict, pos: dict, token_id: str, entry: float,
+        remaining_s: float, now: float | None,
+    ) -> bool:
+        """Bid-based max-loss stop. Returns True when the position was exited."""
+        tag = slot.asset.upper()
+        frac = float(getattr(config, "PRICE_STOP_FRACTION", 0.50))
+        pers = float(getattr(config, "PRICE_STOP_PERSISTENCE_S", 5.0))
+        thr = round(entry * frac, 4)
+        now_ts = float(now) if now is not None else time.time()
+        bid = self._real_best_bid(token_id)
+        if bid is None or bid > thr:
+            if pos.get("price_stop_start_ts") is not None:
+                logger.info(
+                    f"[{tag}] PRICE_STOP reset bid={(f'{bid:.3f}' if bid is not None else 'n/a')} > thr={thr:.3f} "
+                    f"(entry={entry:.3f} x {frac:.2f})"
+                )
+                pos["price_stop_start_ts"] = None
+            return False
+        if pos.get("price_stop_start_ts") is None:
+            pos["price_stop_start_ts"] = now_ts
+            logger.info(
+                f"[{tag}] PRICE_STOP armed bid={bid:.3f} <= thr={thr:.3f} (entry={entry:.3f} x {frac:.2f}), "
+                f"need {pers:.1f}s persistence, remaining={remaining_s:.1f}s"
+            )
+        held = now_ts - float(pos["price_stop_start_ts"])
+        if held + 1e-9 < pers:
+            return False
+        shares = float(pos.get("shares") or 0.0)
+        if config.MODE == "live":
+            exit_px, src = bid, "best_bid"
+        else:
+            exit_px, src = self._paper_sell_price(token_id, shares, bid)
+        logger.warning(
+            f"[{tag}] PRICE_STOP exit {pos.get('strategy')} {pos.get('side')} entry={entry:.3f} bid={bid:.3f} "
+            f"<= thr={thr:.3f} for {held:.1f}s >= {pers:.1f}s | sell {shares:.2f} sh @ {exit_px:.3f} ({src}) "
+            f"remaining={remaining_s:.1f}s"
+        )
+        journal_write(
+            "price_stop", asset=slot.asset, slot=pos.get("slot"), strategy=pos.get("strategy"),
+            side=pos.get("side"), entry=entry, bid=bid, threshold=thr, fraction=frac, held_s=round(held, 2),
+            exit_price=exit_px, exit_price_source=src, shares=shares, remaining_s=round(remaining_s, 1),
+        )
+        await self._exit_position_early(slot, market, exit_px, reason="price_stop")
+        return True
 
     async def _place_micro_hedge(
         self, slot: CoinSlot, market: dict, tokens: dict, pos: dict, main_ask: float

@@ -138,6 +138,15 @@ STOP_LOSS_PERSISTENCE_SECONDS = float(os.getenv("STOP_LOSS_PERSISTENCE_SECONDS",
 # Dual agreement: Realized TWAP must also cross strike against position
 STOP_LOSS_REQUIRE_TWAP = os.getenv("STOP_LOSS_REQUIRE_TWAP", "yes").strip().lower() in ("yes", "y", "true", "1")
 
+# --- Bid-based max-loss stop (price_stop), independent of spot/TWAP/sigma conditions ---
+# Exit when the position token's own best bid (no complement inference) stays <= entry * PRICE_STOP_FRACTION
+# for >= PRICE_STOP_PERSISTENCE_S. Paper exits sell into the real bid book (VWAP over bid levels for our size).
+# Default OFF: a replay of 43 trades on Polymarket trade prints showed it stops out more winners than it saves
+# at every fraction tested (0.45-0.70). Enable with PRICE_STOP_ENABLED=1.
+PRICE_STOP_ENABLED = os.getenv("PRICE_STOP_ENABLED", "no").strip().lower() in ("yes", "y", "true", "1", "on")
+PRICE_STOP_FRACTION = float(os.getenv("PRICE_STOP_FRACTION", "0.50"))
+PRICE_STOP_PERSISTENCE_S = float(os.getenv("PRICE_STOP_PERSISTENCE_S", "5.0"))
+
 # --- Dynamic Trailing Profit Stop Parameters ---
 # Armed when peak bid reaches >= 0.78, trails by 0.08 to lock in profit before expiry
 TRAILING_PROFIT_ENABLED = os.getenv("TRAILING_PROFIT_ENABLED", os.getenv("TRAILING_BREAKEVEN_ENABLED", "yes")).strip().lower() in ("yes", "y", "true", "1")
