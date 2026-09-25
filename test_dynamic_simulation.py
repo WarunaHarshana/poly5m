@@ -273,7 +273,7 @@ class TestDynamicSimulation(unittest.IsolatedAsyncioTestCase):
         allowed, min_move, max_ask, _ = config.compute_dynamic_feasibility(29.9, spot, daily_vol)
         self.assertFalse(allowed)
 
-        # Tier 1: 30s <= t < 120s: mult=2.0, max_ask=0.72
+        # Tier 1: 30s <= t < 150s: mult=2.0, max_ask=0.72
         allowed, min_move, max_ask, sigma_t = config.compute_dynamic_feasibility(30.0, spot, daily_vol)
         self.assertTrue(allowed)
         self.assertEqual(max_ask, 0.72)
@@ -281,31 +281,33 @@ class TestDynamicSimulation(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(sigma_t, expected_sigma_30, places=4)
         self.assertAlmostEqual(min_move, 2.0 * expected_sigma_30, places=4)
 
-        allowed, min_move, max_ask, _ = config.compute_dynamic_feasibility(119.9, spot, daily_vol)
+        allowed, min_move, max_ask, _ = config.compute_dynamic_feasibility(149.9, spot, daily_vol)
         self.assertTrue(allowed)
         self.assertEqual(max_ask, 0.72)
 
-        # Tier 2: 120s <= t < 180s: mult=1.5, max_ask=0.78
-        allowed, min_move, max_ask, sigma_t = config.compute_dynamic_feasibility(120.0, spot, daily_vol)
+        # Tier 2: 150s <= t < 200s: mult=1.6, max_ask=0.72
+        allowed, min_move, max_ask, sigma_t = config.compute_dynamic_feasibility(150.0, spot, daily_vol)
         self.assertTrue(allowed)
-        self.assertEqual(max_ask, 0.78)
-        expected_sigma_120 = daily_vol * ((120.0 / 86400.0) ** 0.5) * spot
-        self.assertAlmostEqual(sigma_t, expected_sigma_120, places=4)
-        self.assertAlmostEqual(min_move, 1.5 * expected_sigma_120, places=4)
+        self.assertEqual(max_ask, 0.72)
+        expected_sigma_150 = daily_vol * ((150.0 / 86400.0) ** 0.5) * spot
+        self.assertAlmostEqual(sigma_t, expected_sigma_150, places=4)
+        self.assertAlmostEqual(min_move, 1.6 * expected_sigma_150, places=4)
 
-        # Tier 3: 180s <= t < 240s: mult=1.2, max_ask=0.80
-        allowed, min_move, max_ask, sigma_t = config.compute_dynamic_feasibility(180.0, spot, daily_vol)
+        allowed, min_move, max_ask, _ = config.compute_dynamic_feasibility(199.9, spot, daily_vol)
         self.assertTrue(allowed)
-        self.assertEqual(max_ask, 0.80)
-        expected_sigma_180 = daily_vol * ((180.0 / 86400.0) ** 0.5) * spot
-        self.assertAlmostEqual(min_move, 1.2 * expected_sigma_180, places=4)
+        self.assertEqual(max_ask, 0.72)
 
-        # Tier 3 (continued at 210s): mult=1.2, max_ask=0.80
-        allowed, min_move, max_ask, sigma_t = config.compute_dynamic_feasibility(210.0, spot, daily_vol)
+        # Tier 3: 200s <= t < 240s: mult=1.3, max_ask=0.72
+        allowed, min_move, max_ask, sigma_t = config.compute_dynamic_feasibility(200.0, spot, daily_vol)
         self.assertTrue(allowed)
-        self.assertEqual(max_ask, 0.80)
-        expected_sigma_210 = daily_vol * ((210.0 / 86400.0) ** 0.5) * spot
-        self.assertAlmostEqual(min_move, 1.2 * expected_sigma_210, places=4)
+        self.assertEqual(max_ask, 0.72)
+        expected_sigma_200 = daily_vol * ((200.0 / 86400.0) ** 0.5) * spot
+        self.assertAlmostEqual(sigma_t, expected_sigma_200, places=4)
+        self.assertAlmostEqual(min_move, 1.3 * expected_sigma_200, places=4)
+
+        allowed, min_move, max_ask, sigma_t = config.compute_dynamic_feasibility(239.9, spot, daily_vol)
+        self.assertTrue(allowed)
+        self.assertEqual(max_ask, 0.72)
 
         # Boundary: t >= 240s prohibited
         allowed, min_move, max_ask, _ = config.compute_dynamic_feasibility(240.0, spot, daily_vol)
@@ -550,40 +552,40 @@ class TestDynamicSimulation(unittest.IsolatedAsyncioTestCase):
 
         self.bot.cl_stream._record(now, 90500.0, asset=asset)
 
-        # 1. Market best bid rises to 0.80 (>= TRAILING_PROFIT_MIN_PEAK 0.78)
-        self.bot.book_stream._apply_update("tok_up_btc", bid=0.80, ask=0.82, bid_sz=500, ask_sz=500)
+        # 1. Market best bid rises to 0.84 (>= TRAILING_PROFIT_MIN_PEAK 0.83)
+        self.bot.book_stream._apply_update("tok_up_btc", bid=0.84, ask=0.86, bid_sz=500, ask_sz=500)
         await self.bot._tick_asset(slot, now)
 
-        # Position should still be active, with peak_bid=0.80 and trailing_active=True
+        # Position should still be active, with peak_bid=0.84 and trailing_active=True
         self.assertIsNotNone(slot.position)
-        self.assertEqual(slot.position.get("peak_bid"), 0.80)
+        self.assertEqual(slot.position.get("peak_bid"), 0.84)
         self.assertTrue(slot.position.get("trailing_active"))
 
-        # Intermediate price 0.73 (> stop_price 0.72) does NOT trigger exit
+        # Intermediate price 0.77 (> stop_price 0.76) does NOT trigger exit
         now_inter = now + 1.0
         self.bot.cl_stream._record(now_inter, 90480.0, asset=asset)
-        self.bot.book_stream._apply_update("tok_up_btc", bid=0.73, ask=0.75, bid_sz=500, ask_sz=500)
+        self.bot.book_stream._apply_update("tok_up_btc", bid=0.77, ask=0.79, bid_sz=500, ask_sz=500)
         await self.bot._tick_asset(slot, now_inter)
         self.assertIsNotNone(slot.position)
 
-        # 2. Market best bid drops to 0.72 (<= 0.80 - 0.08 = 0.72 stop_price) -> triggers trailing profit exit
+        # 2. Market best bid drops to 0.76 (<= 0.84 - 0.08 = 0.76 stop_price) -> triggers trailing profit exit
         initial_bankroll = self.bot.risk.bankroll
         now_exit = now + 2.0
         self.bot.cl_stream._record(now_exit, 90450.0, asset=asset)
-        self.bot.book_stream._apply_update("tok_up_btc", bid=0.72, ask=0.74, bid_sz=500, ask_sz=500)
+        self.bot.book_stream._apply_update("tok_up_btc", bid=0.76, ask=0.78, bid_sz=500, ask_sz=500)
         await self.bot._tick_asset(slot, now_exit)
 
         # Position should now be cleanly closed via trailing profit exit
         self.assertIsNone(slot.position)
         self.assertIn(market["slug"], self.bot._slot_done)
 
-        # Verify positive PnL: entry 0.60, exit 0.72 on 10 shares -> +$1.20 profit
-        expected_pnl = 10.0 * (0.72 - 0.60)
+        # Verify positive PnL: entry 0.60, exit 0.76 on 10 shares -> +$1.60 profit
+        expected_pnl = 10.0 * (0.76 - 0.60)
         self.assertAlmostEqual(self.bot.risk.bankroll, initial_bankroll + expected_pnl, places=2)
         self.assertGreater(self.bot.risk.bankroll, initial_bankroll)
 
     async def test_dynamic_trailing_profit_does_not_arm_below_min_peak(self):
-        """When peak reaches 0.77 (< 0.78 min peak), trailing profit stop does not arm and does not exit on 8c drop."""
+        """When peak reaches 0.82 (< 0.83 min peak), trailing profit stop does not arm and does not exit on 8c drop."""
         asset = "btc"
         now = time.time()
         slot_start = now - 180.0
@@ -616,23 +618,23 @@ class TestDynamicSimulation(unittest.IsolatedAsyncioTestCase):
         }
 
         self.bot.cl_stream._record(now, 90500.0, asset=asset)
-        # Bid reaches 0.77 (< 0.78 min peak)
-        self.bot.book_stream._apply_update("tok_up_btc", bid=0.77, ask=0.79, bid_sz=500, ask_sz=500)
+        # Bid reaches 0.82 (< 0.83 min peak)
+        self.bot.book_stream._apply_update("tok_up_btc", bid=0.82, ask=0.84, bid_sz=500, ask_sz=500)
         await self.bot._tick_asset(slot, now)
 
         self.assertIsNotNone(slot.position)
         self.assertFalse(slot.position.get("trailing_active", False))
 
-        # Drops 8c down to 0.69: should NOT exit because trailing stop was never armed
+        # Drops 8c down to 0.74: should NOT exit because trailing stop was never armed
         now2 = now + 1.0
         self.bot.cl_stream._record(now2, 90450.0, asset=asset)
-        self.bot.book_stream._apply_update("tok_up_btc", bid=0.69, ask=0.71, bid_sz=500, ask_sz=500)
+        self.bot.book_stream._apply_update("tok_up_btc", bid=0.74, ask=0.76, bid_sz=500, ask_sz=500)
         await self.bot._tick_asset(slot, now2)
 
         self.assertIsNotNone(slot.position)
 
     async def test_dynamic_trailing_profit_fee_aware_breakeven_protection(self):
-        """When peak is 0.78 and entry is 0.72 with fees, stop_price guarantees breakeven+fees."""
+        """When peak is 0.83 and entry is 0.72 with fees, stop_price guarantees breakeven+fees."""
         asset = "btc"
         now = time.time()
         slot_start = now - 180.0
@@ -653,8 +655,8 @@ class TestDynamicSimulation(unittest.IsolatedAsyncioTestCase):
         slot.strike = 90000.0
 
         # Entry 0.72, fee_rate 0.07: round_trip_fee = 2 * 0.07 * 0.72 * 0.28 = 0.0282
-        # entry + fee = 0.7482. Peak 0.78 - 0.08 = 0.70 < 0.7482.
-        # stop_price clamped to 0.7482 (guaranteeing breakeven+fees).
+        # min_breakeven = 0.7482. min_lock_profit = 0.7582. Peak 0.83 - 0.08 = 0.75 < 0.7582.
+        # stop_price clamped to 0.7582 (guaranteeing breakeven+fees+profit).
         slot.position = {
             "asset": asset,
             "slot": market["slug"],
@@ -669,24 +671,24 @@ class TestDynamicSimulation(unittest.IsolatedAsyncioTestCase):
         }
 
         self.bot.cl_stream._record(now, 90500.0, asset=asset)
-        # Peak reaches 0.78
-        self.bot.book_stream._apply_update("tok_up_btc", bid=0.78, ask=0.80, bid_sz=500, ask_sz=500)
+        # Peak reaches 0.83
+        self.bot.book_stream._apply_update("tok_up_btc", bid=0.83, ask=0.85, bid_sz=500, ask_sz=500)
         await self.bot._tick_asset(slot, now)
 
         self.assertIsNotNone(slot.position)
         self.assertTrue(slot.position.get("trailing_active"))
 
-        # At bid 0.75 (> 0.7482 stop_price), position should NOT exit
+        # At bid 0.77 (> 0.7582 stop_price), position should NOT exit
         now2 = now + 1.0
         self.bot.cl_stream._record(now2, 90480.0, asset=asset)
-        self.bot.book_stream._apply_update("tok_up_btc", bid=0.75, ask=0.77, bid_sz=500, ask_sz=500)
+        self.bot.book_stream._apply_update("tok_up_btc", bid=0.77, ask=0.79, bid_sz=500, ask_sz=500)
         await self.bot._tick_asset(slot, now2)
         self.assertIsNotNone(slot.position)
 
-        # At bid 0.74 (<= 0.7482 stop_price), position exits to protect breakeven+fees
+        # At bid 0.75 (<= 0.7582 stop_price and >= floor 0.72), position exits to protect breakeven+fees
         now3 = now + 2.0
         self.bot.cl_stream._record(now3, 90450.0, asset=asset)
-        self.bot.book_stream._apply_update("tok_up_btc", bid=0.74, ask=0.76, bid_sz=500, ask_sz=500)
+        self.bot.book_stream._apply_update("tok_up_btc", bid=0.75, ask=0.77, bid_sz=500, ask_sz=500)
         await self.bot._tick_asset(slot, now3)
         self.assertIsNone(slot.position)
         self.assertIn(market["slug"], self.bot._slot_done)
@@ -713,7 +715,7 @@ class TestDynamicSimulation(unittest.IsolatedAsyncioTestCase):
         slot.strike = 90000.0
 
         # Entry 0.80: round_trip_fee = 2 * 0.07 * 0.80 * 0.20 = 0.0224
-        # min_breakeven = 0.8224. min_peak = max(0.78, 0.8324) = 0.8324.
+        # min_breakeven = 0.8224. min_lock_profit = 0.8324. min_peak = max(0.83, 0.8324) = 0.8324.
         slot.position = {
             "asset": asset,
             "slot": market["slug"],
@@ -749,15 +751,15 @@ class TestDynamicSimulation(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(slot.position)
         self.assertTrue(slot.position.get("trailing_active"))
 
-        # Peak is 0.86: stop_price = max(0.86 - 0.08, 0.8224) = 0.8224
-        # Bid 0.84 (> 0.8224): should hold
+        # Peak is 0.86: stop_price = max(0.86 - 0.08, 0.8324) = 0.8324
+        # Bid 0.84 (> 0.8324): should hold
         now4 = now + 3.0
         self.bot.cl_stream._record(now4, 90530.0, asset=asset)
         self.bot.book_stream._apply_update("tok_up_btc", bid=0.84, ask=0.86, bid_sz=500, ask_sz=500)
         await self.bot._tick_asset(slot, now4)
         self.assertIsNotNone(slot.position)
 
-        # Bid pulls back to 0.82 (<= stop_price 0.8224 and >= floor 0.75): triggers exit to protect breakeven
+        # Bid pulls back to 0.82 (<= stop_price 0.8324 and >= floor 0.80): triggers exit to protect breakeven
         now5 = now + 4.0
         self.bot.cl_stream._record(now5, 90500.0, asset=asset)
         self.bot.book_stream._apply_update("tok_up_btc", bid=0.82, ask=0.84, bid_sz=500, ask_sz=500)
@@ -2119,21 +2121,21 @@ class TestDynamicSimulation(unittest.IsolatedAsyncioTestCase):
         """Verify that trailing profit stop is enabled by default in config."""
         self.assertTrue(config.TRAILING_PROFIT_ENABLED)
 
-    def test_dynamic_feasibility_120s_threshold(self):
-        """Verify the 120s threshold in compute_dynamic_feasibility."""
+    def test_dynamic_feasibility_150s_threshold(self):
+        """Verify the 150s threshold in compute_dynamic_feasibility."""
         spot = 90000.0
         vol = 0.0135
-        # At 119.9s -> mult is 2.0, max_ask is 0.72
-        allowed_early, min_move_early, max_ask_early, sigma_early = config.compute_dynamic_feasibility(119.9, spot, vol)
+        # At 149.9s -> mult is 2.0, max_ask is 0.72
+        allowed_early, min_move_early, max_ask_early, sigma_early = config.compute_dynamic_feasibility(149.9, spot, vol)
         self.assertTrue(allowed_early)
         self.assertEqual(max_ask_early, 0.72)
         self.assertAlmostEqual(min_move_early, 2.0 * sigma_early, places=4)
 
-        # At 120.0s -> mult drops to 1.5, max_ask is 0.78
-        allowed_mid, min_move_mid, max_ask_mid, sigma_mid = config.compute_dynamic_feasibility(120.0, spot, vol)
+        # At 150.0s -> mult drops to 1.6, max_ask is 0.72
+        allowed_mid, min_move_mid, max_ask_mid, sigma_mid = config.compute_dynamic_feasibility(150.0, spot, vol)
         self.assertTrue(allowed_mid)
-        self.assertEqual(max_ask_mid, 0.78)
-        self.assertAlmostEqual(min_move_mid, 1.5 * sigma_mid, places=4)
+        self.assertEqual(max_ask_mid, 0.72)
+        self.assertAlmostEqual(min_move_mid, 1.6 * sigma_mid, places=4)
 
     def test_btc_noise_filter(self):
         """Verify that BTC has calibrated min_z (1.95) and daily_vol (0.0135)."""

@@ -2119,9 +2119,10 @@ class TWAPBot:
         # Round-trip taker fee (entry + exit legs): approx 2 * fee_rate * p * (1 - p)
         round_trip_fee = 2.0 * fee_rate * entry * (1.0 - entry)
         min_breakeven = round(entry + round_trip_fee, 4)
+        min_lock_profit = round(min_breakeven + 0.01, 4)
         min_peak = max(
-            float(getattr(config, "TRAILING_PROFIT_MIN_PEAK", 0.78)),
-            round(min_breakeven + 0.01, 4),
+            float(getattr(config, "TRAILING_PROFIT_MIN_PEAK", 0.83)),
+            min_lock_profit,
         )
 
         trailing_enabled = (
@@ -2174,8 +2175,9 @@ class TWAPBot:
         if trailing_enabled and (pos.get("trailing_active") or pos.get("breakeven_active") or peak_bid >= min_peak) and best_bid is not None:
             trail_distance = getattr(config, "TRAILING_PROFIT_DISTANCE", 0.08)
             stop_price = round(peak_bid - trail_distance, 4)
-            if min_breakeven < peak_bid:
-                stop_price = max(stop_price, min_breakeven)
+            min_lock_profit = round(entry + round_trip_fee + 0.01, 4)
+            if min_lock_profit < peak_bid:
+                stop_price = max(stop_price, min_lock_profit)
             # Trailing profit must not scratch below entry; deep crashes belong to adverse SL.
             floor = round(entry, 4)
             if float(best_bid) <= stop_price and float(best_bid) >= floor:

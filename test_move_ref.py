@@ -123,7 +123,7 @@ class TestMoveRefBotIntegration(unittest.IsolatedAsyncioTestCase):
     async def _run(self, mode: str, price_to_beat, pre_open_ticks: bool = False):
         config.MOMENTUM_MOVE_REF = mode
         now = time.time()
-        slot_start = now - 124.0
+        slot_start = now - 160.0
         slot = self.bot.slots["btc"]
         slot.market = {
             "slug": f"btc-updown-5m-test-moveref-{mode}-{price_to_beat}",
@@ -145,9 +145,9 @@ class TestMoveRefBotIntegration(unittest.IsolatedAsyncioTestCase):
         cl._record(slot_start + 90.0, 84320.0, asset="btc")
         cl._record(now, SPOT, asset="btc")
         cl._last_tick_time["btc"] = time.time()
-        self.bot.book_stream._apply_update("tok_down", bid=0.74, ask=0.76, bid_sz=500, ask_sz=500)
-        self.bot.book_stream._apply_update("tok_up", bid=0.24, ask=0.26, bid_sz=500, ask_sz=500)
-        _, thr, _, _ = config.compute_dynamic_feasibility(elapsed_s=124.0, spot=SPOT, daily_vol=slot.params.daily_vol)
+        self.bot.book_stream._apply_update("tok_down", bid=0.68, ask=0.70, bid_sz=500, ask_sz=500)
+        self.bot.book_stream._apply_update("tok_up", bid=0.30, ask=0.32, bid_sz=500, ask_sz=500)
+        _, thr, _, _ = config.compute_dynamic_feasibility(elapsed_s=160.0, spot=SPOT, daily_vol=slot.params.daily_vol)
         await self.bot._tick_asset(slot, now)
         return slot, thr
 
@@ -208,8 +208,8 @@ class TestMoveRefBotIntegration(unittest.IsolatedAsyncioTestCase):
 
 
 def thr_plus(tc) -> float:
-    """TWAP strike offset that clears the dynamic threshold at t=124s (DOWN side)."""
+    """TWAP strike offset that clears the dynamic threshold at t=160s (DOWN side)."""
     params = config.ASSET_PARAMS["btc"]
-    _, thr, _, _ = config.compute_dynamic_feasibility(elapsed_s=124.0, spot=SPOT, daily_vol=params.daily_vol)
+    _, thr, _, _ = config.compute_dynamic_feasibility(elapsed_s=160.0, spot=SPOT, daily_vol=params.daily_vol)
     off = max(thr * 1.1, abs(SPOT - STRIKE_SPOT) * 0.95)
     return off

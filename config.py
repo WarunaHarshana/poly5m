@@ -75,16 +75,16 @@ DYNAMIC_WINDOW_START_S = float(os.getenv("DYNAMIC_WINDOW_START_S", "270.0"))
 DYNAMIC_WINDOW_END_S = float(os.getenv("DYNAMIC_WINDOW_END_S", "60.0"))
 DYNAMIC_MOMENTUM_MIN_MOVE_BPS = float(os.getenv("DYNAMIC_MOMENTUM_MIN_MOVE_BPS", "25.0"))
 DYNAMIC_MOMENTUM_MIN_ASK = float(os.getenv("DYNAMIC_MOMENTUM_MIN_ASK", "0.38"))
-DYNAMIC_MOMENTUM_MAX_ASK = float(os.getenv("DYNAMIC_MOMENTUM_MAX_ASK", "0.80"))
+DYNAMIC_MOMENTUM_MAX_ASK = float(os.getenv("DYNAMIC_MOMENTUM_MAX_ASK", "0.72"))
 DYNAMIC_MAX_BOOK_SPREAD = float(os.getenv("DYNAMIC_MAX_BOOK_SPREAD", "0.05"))
 DYNAMIC_ENTRY_COOLDOWN_S = float(os.getenv("DYNAMIC_ENTRY_COOLDOWN_S", "10.0"))
 
 # --- AVN-MAS Dynamic Price-Time Feasibility Matrix Parameters ---
 # Adaptive scaling with elapsed time t:
 # - t < 30s: Entry prohibited (noise & initial spread formation)
-# - 30s <= t < 120s: Move >= 2.0*sigma (~5.0 bps for BTC), max ask P_max = 0.72
-# - 120s <= t < 180s: Move >= 1.5*sigma (~5.3 bps for BTC), max ask P_max = 0.78
-# - 180s <= t < 240s: Move >= 1.2*sigma (~5.5 bps for BTC), max ask P_max = 0.80
+# - 30s <= t < 150s: Move >= 2.0*sigma, max ask P_max = 0.72
+# - 150s <= t < 200s: Move >= 1.6*sigma, max ask P_max = 0.72
+# - 200s <= t < 240s: Move >= 1.3*sigma, max ask P_max = 0.72
 # - t >= 240s (remaining <= 60s): Prohibit new entries
 # Volatility normalization: sigma(t) = daily_vol * sqrt(t / 86400.0) * spot
 DYNAMIC_MIN_ELAPSED_S = float(os.getenv("DYNAMIC_MIN_ELAPSED_S", "30.0"))
@@ -148,10 +148,10 @@ PRICE_STOP_FRACTION = float(os.getenv("PRICE_STOP_FRACTION", "0.50"))
 PRICE_STOP_PERSISTENCE_S = float(os.getenv("PRICE_STOP_PERSISTENCE_S", "5.0"))
 
 # --- Dynamic Trailing Profit Stop Parameters ---
-# Armed when peak bid reaches >= 0.78, trails by 0.08 to lock in profit before expiry
+# Armed when peak bid reaches >= 0.83, trails by 0.08 to lock in profit before expiry
 TRAILING_PROFIT_ENABLED = os.getenv("TRAILING_PROFIT_ENABLED", os.getenv("TRAILING_BREAKEVEN_ENABLED", "yes")).strip().lower() in ("yes", "y", "true", "1")
 TRAILING_PROFIT_DISTANCE = float(os.getenv("TRAILING_PROFIT_DISTANCE", "0.08"))
-TRAILING_PROFIT_MIN_PEAK = float(os.getenv("TRAILING_PROFIT_MIN_PEAK", "0.78"))
+TRAILING_PROFIT_MIN_PEAK = float(os.getenv("TRAILING_PROFIT_MIN_PEAK", "0.83"))
 
 # Legacy aliases for backward compatibility
 TRAILING_BREAKEVEN_ENABLED = TRAILING_PROFIT_ENABLED
@@ -176,12 +176,12 @@ def compute_dynamic_feasibility(
 
     sigma_t = vol * ((t / 86400.0) ** 0.5) * s
 
-    if t < 120.0:
+    if t < 150.0:
         mult, max_ask = 2.0, 0.72
-    elif t < 180.0:
-        mult, max_ask = 1.5, 0.78
-    else:  # 180.0 <= t < 240.0
-        mult, max_ask = 1.2, 0.80
+    elif t < 200.0:
+        mult, max_ask = 1.6, 0.72
+    else:  # 200.0 <= t < 240.0
+        mult, max_ask = 1.3, 0.72
 
     max_ask = min(max_ask, DYNAMIC_MOMENTUM_MAX_ASK)
     min_move_usd = mult * sigma_t
