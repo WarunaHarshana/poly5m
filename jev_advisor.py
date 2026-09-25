@@ -38,6 +38,11 @@ class JevDecision:
     fallback_used: bool
     fakeout_risk: float = 0.0  # Noul (0.0 to 1.0)
     evaluated_at: float = 0.0
+    # JEV_SHADOW: when set, this decision was NOT enforced (trade proceeds at 1.0x);
+    # the real Jev verdict is kept here for logging / journaling / trade tagging.
+    shadow: bool = False
+    shadow_verdict: str | None = None  # "approve" | "veto" | "downsize" | "error"
+    shadow_decision: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -60,11 +65,13 @@ class JevAdvisor:
         min_downsize_conviction: float | None = None,
         downsize_factor: float | None = None,
         allow_downsizing: bool | None = None,
+        shadow: bool | None = None,
     ):
         self.api_key = (api_key or config.TYPESAFE_API_KEY).strip()
         self.base_url = base_url or config.TYPESAFE_BASE_URL
         self.model = model or config.JEV_MODEL
         self.enabled = config.JEV_ENABLED if enabled is None else bool(enabled)
+        self.shadow = bool(getattr(config, "JEV_SHADOW", False)) if shadow is None else bool(shadow)
         self.timeout_s = config.JEV_TIMEOUT_S if timeout_s is None else float(timeout_s)
         self.max_reversal_noul = (
             config.JEV_MAX_REVERSAL_NOUL if max_reversal_noul is None else float(max_reversal_noul)
@@ -95,6 +102,8 @@ class JevAdvisor:
         self.total_fallbacks: int = 0
         self.total_latency_ms: float = 0.0
         self.last_decision: JevDecision | None = None
+        # Shadow-mode telemetry (real verdicts of non-enforced consults)
+        self.shadow_counts: dict[str, int] = {"approve": 0, "veto": 0, "downsize": 0, "error": 0}
 
         if not HAS_TYPESAFE:
             logger.warning("typesafe-sdk is not installed; JevAdvisor running in fallback mode.")
@@ -121,8 +130,58 @@ class JevAdvisor:
             "vetoed": self.total_vetoed,
             "fallbacks": self.total_fallbacks,
             "avg_latency_ms": avg_lat,
+            "shadow_mode": self.shadow_active,
+            "shadow": {"evaluations": sum(self.shadow_counts.values()), **self.shadow_counts},
             "last_decision": self.last_decision.to_dict() if self.last_decision else None,
         }
+
+    @property
+    def shadow_active(self) -> bool:
+        """Shadow mode only applies when Jev would otherwise be active (enabled + SDK)."""
+        return bool(self.shadow and self.enabled and HAS_TYPESAFE)
+
+    @staticmethod
+    def classify_verdict(decision: JevDecision) -> str:
+        if decision.fallback_used or decision.market_regime in ("unknown_timeout", "error_fallback"):
+            return "error"
+        if not decision.passed:
+            return "veto"
+        if decision.size_multiplier < 1.0:
+            return "downsize"
+        return "approve"
+
+    def _shadowize(self, real: JevDecision | None, error: Exception | None = None) -> JevDecision:
+        """Wrap the real verdict into a non-enforced pass at 1.0x (JEV_SHADOW)."""
+        if real is None:
+            verdict = "error"
+            real_dict: dict[str, Any] = {
+                "action": "error", "passed": False, "size_multiplier": 0.0, "conviction": 0.0,
+                "reversal_risk": None, "fakeout_risk": None, "market_regime": "error_fallback",
+                "confidence": 0.0, "reason": f"Jev shadow error ({error})", "latency_ms": 0.0,
+                "fallback_used": True, "evaluated_at": time.time(),
+            }
+        else:
+            verdict = self.classify_verdict(real)
+            real_dict = real.to_dict()
+        self.shadow_counts[verdict] = self.shadow_counts.get(verdict, 0) + 1
+        label = "shadow_error" if verdict == "error" else verdict
+        return JevDecision(
+            action="proceed",
+            passed=True,
+            size_multiplier=1.0,
+            conviction=float(real_dict.get("conviction") or 0.0),
+            reversal_risk=float(real_dict.get("reversal_risk") or 0.0),
+            market_regime=str(real_dict.get("market_regime") or ""),
+            confidence=float(real_dict.get("confidence") or 0.0),
+            reason=f"JEV_SHADOW not enforced (real={label}): {real_dict.get('reason')}",
+            latency_ms=float(real_dict.get("latency_ms") or 0.0),
+            fallback_used=bool(real_dict.get("fallback_used")),
+            fakeout_risk=float(real_dict.get("fakeout_risk") or 0.0),
+            evaluated_at=float(real_dict.get("evaluated_at") or time.time()),
+            shadow=True,
+            shadow_verdict=verdict,
+            shadow_decision=real_dict,
+        )
 
     async def evaluate_maker(
         self,
@@ -247,7 +306,15 @@ class JevAdvisor:
             state["required_min_move_usd"] = round(float(min_move_usd), 4)
         if max_allowed_ask is not None:
             state["max_allowed_ask"] = round(float(max_allowed_ask), 3)
-        return await self._evaluate(state, side=side, spot=spot, strike=strike)
+        if not self.shadow_active:
+            return await self._evaluate(state, side=side, spot=spot, strike=strike)
+        # JEV_SHADOW: always consult Jev, record the real verdict, never block the trade.
+        try:
+            real = await self._evaluate(state, side=side, spot=spot, strike=strike)
+        except Exception as e:  # defensive: shadow errors must never block a trade
+            logger.warning(f"Jev shadow evaluation raised ({e}); proceeding (shadow_error)")
+            return self._shadowize(None, error=e)
+        return self._shadowize(real)
 
     async def _evaluate(
         self,

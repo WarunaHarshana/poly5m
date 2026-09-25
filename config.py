@@ -414,3 +414,6 @@ JEV_MIN_CONVICTION_SCORE = _fenv("JEV_MIN_CONVICTION_SCORE", 1.65)
 JEV_MIN_DOWNSIZE_CONVICTION = _fenv("JEV_MIN_DOWNSIZE_CONVICTION", 1.15)
 JEV_DOWNSIZE_FACTOR = _fenv("JEV_DOWNSIZE_FACTOR", 0.50)
 JEV_ALLOW_DOWNSIZING = os.getenv("JEV_ALLOW_DOWNSIZING", "true").strip().lower() in ("true", "1", "yes")
+# JEV_SHADOW: consult Jev and log/journal/tag its real verdict, but never enforce it
+# (every consult proceeds as an approve at size 1.0; timeouts/errors never block).
+JEV_SHADOW = os.getenv("JEV_SHADOW", "no").strip().lower() in ("yes", "y", "true", "1", "on")

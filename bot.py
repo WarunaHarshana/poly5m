@@ -435,6 +435,10 @@ class TWAPBot:
                 f"min_z={config.DYNAMIC_MIN_Z:.2f} time_left=[{config.DYNAMIC_WINDOW_END_S:.0f}..{config.DYNAMIC_WINDOW_START_S:.0f}]s "
                 f"concurrency_cap={config.MAX_CONCURRENT_ENTRIES} base_stake=${config.BASE_STAKE_USD:.2f}"
             )
+            if self.jev.shadow_active:
+                logger.info("JEV_SHADOW=on: Jev is consulted and logged but NOT enforced (all consults proceed at 1.0x)")
+            elif getattr(config, "JEV_SHADOW", False):
+                logger.info("JEV_SHADOW set but Jev is not active (disabled / no key / no SDK); shadow has no effect")
         elif config.STRATEGY in ("MIDBAND_MAKER", "MIDBAND", "H-006_MIDBAND_MAKER", "H-006"):
             logger.info(
                 f"Mid-band maker: band=[{config.MIDBAND_LO:.2f}..{config.MIDBAND_HI:.2f}] "
@@ -933,6 +937,8 @@ class TWAPBot:
                             min_move_usd=min_move_usd,
                             max_allowed_ask=max_allowed_ask,
                         )
+                        self._log_jev_shadow(tag, "MOMENTUM", asset, favored_side, float(q_ask), jev_dec,
+                                             slot=slot_key, elapsed_s=elapsed_s)
                         if jev_dec.passed:
                             logger.info(
                                 f"[{tag}] ⚡ JEV_DYNAMIC MOMENTUM ({favored_side} @ {q_ask:.2f} x {jev_dec.size_multiplier:.0%}): {jev_dec.reason}"
@@ -1015,6 +1021,8 @@ class TWAPBot:
                                 chop_crosses=chop,
                                 daily_vol=params.daily_vol,
                             )
+                            self._log_jev_shadow(tag, "MAKER", asset, favored_side, float(target_bid), jev_dec,
+                                                 slot=slot_key, elapsed_s=elapsed_s)
                             if jev_dec.passed:
                                 logger.info(
                                     f"[{tag}] 📥 JEV_DYNAMIC MAKER ({favored_side} @ {target_bid:.2f} x {jev_dec.size_multiplier:.0%}): {jev_dec.reason}"
@@ -1200,6 +1208,7 @@ class TWAPBot:
                         "strike": strike,
                         "official": False,
                         "jev": ro.get("jev"),
+                        **self._jev_shadow_tags(ro.get("jev")),
                         **{k: ro.get(k) for k in ("strike_spot", "strike_twap", "strike_twap_source", "move_ref_mode", "move_ref_used")},
                     }
                     if not slot.position.get("strike_twap") and slot.strike_twap:
@@ -1224,6 +1233,7 @@ class TWAPBot:
                         side=ro["side"],
                         price=ro["price"],
                         shares=ro["shares"],
+                        **self._jev_shadow_tags(ro.get("jev")),
                         **feats,
                     )
 
@@ -1556,6 +1566,7 @@ class TWAPBot:
                         "strike": strike,
                         "official": False,
                         "jev": ro.get("jev"),
+                        **self._jev_shadow_tags(ro.get("jev")),
                     }
                     slot.resting_order = None
                     logger.info(
@@ -1640,6 +1651,7 @@ class TWAPBot:
                         "entry_window_time": _format_window_time(el_s),
                         "order_id": ro["order_id"],
                         "jev": ro.get("jev"),
+                        **self._jev_shadow_tags(ro.get("jev")),
                     }
                     logger.info("=" * 60)
                     logger.info(f"✅ [{tag} H-004 MAKER BID FILLED] BUY {ro['side']} @ {ro['price']:.2f}")
@@ -1746,6 +1758,60 @@ class TWAPBot:
             strike_twap_source=slot.strike_twap_source,
             **payload,
         )
+
+    @staticmethod
+    def _jev_shadow_tags(jev: dict | None) -> dict:
+        """Persistable JEV_SHADOW tags derived from the stored Jev decision dict."""
+        jev = jev or {}
+        verdict = jev.get("shadow_verdict") if jev.get("shadow") else None
+        real = jev.get("shadow_decision") or {}
+        conv = real.get("conviction", jev.get("conviction")) if verdict else None
+        return {"jev_shadow_verdict": verdict, "jev_shadow_conviction": conv}
+
+    def _log_jev_shadow(
+        self, tag: str, leg: str, asset: str, side: str, price: float, jev_dec: JevDecision,
+        slot: str | None = None, elapsed_s: float | None = None,
+    ) -> None:
+        """JEV_SHADOW: log + journal the real (non-enforced) Jev verdict. Never raises."""
+        if not getattr(jev_dec, "shadow", False):
+            return
+        try:
+            real = jev_dec.shadow_decision or {}
+            verdict = jev_dec.shadow_verdict or "error"
+            label = "shadow_error" if verdict == "error" else verdict
+
+            def _f(v, nd=2):
+                try:
+                    return f"{float(v):.{nd}f}"
+                except (TypeError, ValueError):
+                    return "na"
+
+            logger.info(
+                f"[{tag}] 👻 JEV_SHADOW {leg} {side} @ {price:.2f} verdict={label} "
+                f"conv={_f(real.get('conviction'))} rev={_f(real.get('reversal_risk'))} "
+                f"fake={_f(real.get('fakeout_risk'))} regime={real.get('market_regime')} "
+                f"lat={_f(real.get('latency_ms'), 0)}ms | {real.get('reason')} -> proceeding at 100% (not enforced)"
+            )
+            journal_write(
+                "jev_shadow",
+                strategy=f"JEV_DYNAMIC_{leg}",
+                asset=asset,
+                side=side,
+                price=price,
+                slot=slot,
+                elapsed_s=elapsed_s,
+                verdict=label,
+                conviction=real.get("conviction"),
+                reversal_risk=real.get("reversal_risk"),
+                fakeout_risk=real.get("fakeout_risk"),
+                regime=real.get("market_regime"),
+                action=real.get("action"),
+                reason=real.get("reason"),
+                latency_ms=real.get("latency_ms"),
+                jev=real,
+            )
+        except Exception as e:  # logging must never block the trade
+            logger.warning(f"[{tag}] JEV_SHADOW log failed: {e}")
 
     def _maker_fill_features(
         self, slot: CoinSlot, ro: dict, spot=None, z_spot=None, z_twap=None,
@@ -1896,6 +1962,7 @@ class TWAPBot:
             entry_elapsed_s=el_s,
             entry_window_time=entry_window_time,
             jev=jev_decision.to_dict() if jev_decision else None,
+            **self._jev_shadow_tags(jev_decision.to_dict() if jev_decision else None),
             **self._strike_meta(slot),
         )
 
@@ -1922,6 +1989,7 @@ class TWAPBot:
             "entry_window_time": entry_window_time,
             "order_id": order_id,
             "jev": jev_decision.to_dict() if jev_decision else None,
+            **self._jev_shadow_tags(jev_decision.to_dict() if jev_decision else None),
             **self._strike_meta(slot),
         }
 
@@ -1986,6 +2054,7 @@ class TWAPBot:
             "placed_at": time.time(),
             "order_id": order_id,
             "jev": jev_decision.to_dict() if jev_decision else None,
+            **self._jev_shadow_tags(jev_decision.to_dict() if jev_decision else None),
             **self._strike_meta(slot),
         }
 
@@ -2554,6 +2623,7 @@ class TWAPBot:
             "official": True,
             "settlement_source": f"early_exit_{reason}",
             "jev": pos.get("jev"),
+            **self._jev_shadow_tags(pos.get("jev")),
             **{k: pos.get(k) for k in ("strike_spot", "strike_twap", "strike_twap_source", "move_ref_mode", "move_ref_used")},
             "maker_features": pos.get("maker_features"),
         }
@@ -2580,6 +2650,7 @@ class TWAPBot:
             fee=round(fee + exit_fee, 4),
             total_cost=total_cost,
             jev=pos.get("jev"),
+            **self._jev_shadow_tags(pos.get("jev")),
             **{k: pos.get(k) for k in ("strike_spot", "strike_twap", "strike_twap_source", "move_ref_mode", "move_ref_used")},
             maker_features=pos.get("maker_features"),
         )
@@ -2754,6 +2825,7 @@ class TWAPBot:
             "official": bool(resolution.get("official")),
             "early_exit": False,
             "jev": pos.get("jev"),
+            **self._jev_shadow_tags(pos.get("jev")),
             **{k: pos.get(k) for k in ("strike_spot", "strike_twap", "strike_twap_source", "move_ref_mode", "move_ref_used")},
             "maker_features": pos.get("maker_features"),
         }
@@ -2780,6 +2852,7 @@ class TWAPBot:
             fee=fee,
             total_cost=total_cost,
             jev=pos.get("jev"),
+            **self._jev_shadow_tags(pos.get("jev")),
             **{k: pos.get(k) for k in ("strike_spot", "strike_twap", "strike_twap_source", "move_ref_mode", "move_ref_used")},
             maker_features=pos.get("maker_features"),
         )

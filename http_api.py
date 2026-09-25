@@ -125,7 +125,18 @@ def public_trade(row: dict) -> dict:
         "unofficial": not is_official_trade(row),
         "polymarket_url": f"https://polymarket.com/event/{slug}" if slug else None,
         "jev": row.get("jev"),
+        "jev_shadow_verdict": _row_shadow_verdict(row),
+        "jev_shadow_conviction": row.get("jev_shadow_conviction"),
     }
+
+
+def _row_shadow_verdict(row: dict) -> str | None:
+    v = row.get("jev_shadow_verdict")
+    if v is None:
+        jev = row.get("jev") or {}
+        if isinstance(jev, dict) and jev.get("shadow"):
+            v = jev.get("shadow_verdict")
+    return v
 
 
 # --- /stats breakdown helpers (reporting only; no trading behaviour) -------
@@ -136,6 +147,7 @@ EXIT_REASON_BUCKETS = (
 )
 ENTRY_ELAPSED_BUCKETS = ("<45", "45-90", "90-120", "120-180", "180+", "unknown")
 STRATEGY_LEG_BUCKETS = ("momentum", "maker", "other")
+JEV_SHADOW_BUCKETS = ("approve", "veto", "downsize", "error", "none")
 
 
 def exit_reason_bucket(reason: Any) -> str:
@@ -192,6 +204,16 @@ def strategy_leg_bucket(strategy: Any) -> str:
     return "other"
 
 
+def jev_shadow_bucket(verdict: Any) -> str:
+    """Bucket the real (non-enforced) Jev verdict recorded under JEV_SHADOW."""
+    v = str(verdict or "").strip().lower()
+    if v in ("shadow_error", "error", "timeout"):
+        return "error"
+    if v in ("approve", "veto", "downsize"):
+        return v
+    return "none"
+
+
 def _group_resolved(resolved: list[dict], key_fn: Callable[[dict], str], order: tuple[str, ...] | None = None) -> dict[str, dict]:
     groups: dict[str, dict] = {}
     for r in resolved:
@@ -224,6 +246,7 @@ def build_stats(trades: list[dict], snapshot: dict[str, Any] | None = None) -> d
     by_exit_reason = _group_resolved(resolved, lambda r: exit_reason_bucket(r.get("exit_reason")), EXIT_REASON_BUCKETS)
     by_entry_elapsed = _group_resolved(resolved, lambda r: entry_elapsed_bucket(r.get("entry_elapsed_s")), ENTRY_ELAPSED_BUCKETS)
     by_strategy_leg = _group_resolved(resolved, lambda r: strategy_leg_bucket(r.get("strategy")), STRATEGY_LEG_BUCKETS)
+    by_jev_shadow = _group_resolved(resolved, lambda r: jev_shadow_bucket(r.get("jev_shadow_verdict")), JEV_SHADOW_BUCKETS)
     now = time.time()
     day_pnl = 0.0
     for raw in trades:
@@ -260,6 +283,7 @@ def build_stats(trades: list[dict], snapshot: dict[str, Any] | None = None) -> d
         "by_exit_reason": by_exit_reason,
         "by_entry_elapsed": by_entry_elapsed,
         "by_strategy_leg": by_strategy_leg,
+        "by_jev_shadow": by_jev_shadow,
         "jev": snap.get("jev"),
     }
 
