@@ -97,6 +97,16 @@ DYNAMIC_MOMENTUM_MIN_ELAPSED_S = float(os.getenv("DYNAMIC_MOMENTUM_MIN_ELAPSED_S
 MOMENTUM_MOVE_REF = os.getenv("MOMENTUM_MOVE_REF", "conservative").strip().lower()
 # Window (seconds before slot open) averaged to estimate the TWAP-based price-to-beat.
 SETTLEMENT_TWAP_WINDOW_S = float(os.getenv("SETTLEMENT_TWAP_WINDOW_S", "60"))
+# --- JEV_DYNAMIC maker entry guards (see maker_guard.py) ---
+# Maker z is also computed against the TWAP (settlement) strike; the bid is blocked when spot z and
+# TWAP z disagree on direction or the TWAP z on our side is < MAKER_MIN_TWAP_SIGMA, and a resting bid
+# is cancelled on an adverse TWAP-strike cross. Falls back to legacy behaviour without a TWAP strike.
+MAKER_TWAP_GUARD = os.getenv("MAKER_TWAP_GUARD", "1").strip().lower() in ("yes", "y", "true", "1", "on")
+MAKER_MIN_TWAP_SIGMA = float(os.getenv("MAKER_MIN_TWAP_SIGMA", "0.25"))
+# Adverse-selection guard: skip quoting / cancel resting bid (blocking the fill) when the favoured
+# token's mid has dropped >= MAKER_MAX_MID_DROP_60S from its high over the last MAKER_MID_WINDOW_S.
+MAKER_MAX_MID_DROP_60S = float(os.getenv("MAKER_MAX_MID_DROP_60S", "0.15"))
+MAKER_MID_WINDOW_S = float(os.getenv("MAKER_MID_WINDOW_S", "60"))
 DYNAMIC_MAX_ELAPSED_S = float(os.getenv("DYNAMIC_MAX_ELAPSED_S", "240.0"))
 
 # --- AVN-MAS Take-Profit & Adverse Stop-Loss Parameters ---

@@ -16,7 +16,7 @@ import shutil
 import signal
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -36,6 +36,7 @@ from journal import write as journal_write
 from http_api import StatusServer, is_official_trade, load_trades
 from jev_advisor import JevAdvisor, JevDecision
 import move_ref
+import maker_guard
 
 logging.basicConfig(
     level=logging.INFO,
@@ -112,6 +113,9 @@ class CoinSlot:
     strike_twap_resolved: bool = False
     move_ref_used: str | None = None
     move_ref_block_logged: bool = False
+    # Maker guard / momentum elapsed-gate logging (once per slot per reason)
+    maker_block_logged: set = field(default_factory=set)
+    momentum_gate_logged: bool = False
 
 
 class TWAPBot:
@@ -129,6 +133,7 @@ class TWAPBot:
         self.pub_client = PolymarketPublicClient()
         self.risk = RiskManager()
         self.jev = JevAdvisor()
+        self._mid_hist = maker_guard.MidHistory(float(getattr(config, "MAKER_MID_WINDOW_S", 60.0)))
         self.live_client = None
         if config.MODE == "live":
             if config.LIVE_CONFIRM not in ("yes", "y", "true", "1"):
@@ -553,6 +558,8 @@ class TWAPBot:
             slot.strike_twap_resolved = False
             slot.move_ref_used = None
             slot.move_ref_block_logged = False
+            slot.maker_block_logged = set()
+            slot.momentum_gate_logged = False
             market = self.pub_client.find_active_5m_slot(now_ts=now, asset=slot.asset)
             if not market:
                 logger.warning(f"[{slot.asset.upper()}] Could not discover market for slot {window_ts}")
@@ -742,10 +749,25 @@ class TWAPBot:
 
             # Momentum entry move reference (spot strike vs settlement-TWAP strike).
             move_ref_mode = move_ref.normalize_mode(getattr(config, "MOMENTUM_MOVE_REF", "conservative"))
-            if move_ref_mode == move_ref.MODE_CONSERVATIVE:
+            maker_guard_on = bool(getattr(config, "MAKER_TWAP_GUARD", False))
+            if move_ref_mode == move_ref.MODE_CONSERVATIVE or maker_guard_on:
                 self._ensure_twap_strike(slot, market, slot_start_ts, elapsed_s)
             gate_move_usd, move_ref_used = move_ref.entry_move(move_ref_mode, spot, strike, slot.strike_twap)
             slot.move_ref_used = move_ref_used
+
+            # Maker guard inputs: mid history per token and z against the TWAP (settlement) strike.
+            if mid_px is not None:
+                self._mid_hist.add(fav_token, now, mid_px)
+                self._mid_hist.add(opp_token, now, 1.0 - mid_px)
+            z_twap_dyn = None
+            if maker_guard_on and slot.strike_twap:
+                try:
+                    _, z_twap_dyn, _ = slot.engine.compute_s_req_and_z(
+                        spot=spot, strike=slot.strike_twap, realized_twap=realized_twap,
+                        elapsed_s=elapsed_s, remaining_s=remaining_s, sigma_twap_usd=sigma_twap_dyn
+                    )
+                except Exception:
+                    z_twap_dyn = None
 
             allowed_feas, min_move_usd, max_allowed_ask, sigma_t = config.compute_dynamic_feasibility(
                 elapsed_s=elapsed_s, spot=spot, daily_vol=params.daily_vol
@@ -821,12 +843,68 @@ class TWAPBot:
                                 elapsed_s=round(float(elapsed_s), 1),
                             )
                             slot.move_ref_block_logged = True
+                    if (
+                        not slot.momentum_gate_logged
+                        and allowed_feas
+                        and float(elapsed_s) < momentum_min_elapsed
+                        and directional_coherence
+                        and abs(move_usd) >= min_move_usd
+                        and config.DYNAMIC_MOMENTUM_MIN_ASK <= float(q_ask) <= effective_max_ask
+                    ):
+                        # Debug: momentum candidate rejected only by the elapsed gate (once per slot).
+                        logger.info(
+                            f"[{tag}] MOMENTUM_GATE_EARLY asset={asset} side={favored_side} t={elapsed_s:.0f}s "
+                            f"< {momentum_min_elapsed:.0f}s z={abs_z:.2f} ask={float(q_ask):.2f} "
+                            f"spot_move={move_usd:+.2f} threshold={min_move_usd:.2f} "
+                            f"move_ref={move_ref_used} move_ref_ok={move_gate_ok} used_move={gate_move_usd:+.2f}"
+                        )
+                        journal_write(
+                            "momentum_elapsed_gate",
+                            asset=asset,
+                            slot=slot_key,
+                            side=favored_side,
+                            elapsed_s=round(float(elapsed_s), 1),
+                            min_elapsed_s=momentum_min_elapsed,
+                            z=round(abs_z, 3),
+                            ask=float(q_ask),
+                            spot_move=round(move_usd, 4),
+                            used_move=round(gate_move_usd, 4),
+                            threshold=round(min_move_usd, 4),
+                            move_ref_used=move_ref_used,
+                            move_ref_ok=bool(move_gate_ok),
+                        )
+                        slot.momentum_gate_logged = True
                     dyn_min_z = max(config.DYNAMIC_MIN_Z, params.midband_min_z)
                     is_maker_candidate = (
                         mid_px is not None
                         and config.DYNAMIC_MIDBAND_LO <= mid_px <= config.DYNAMIC_MIDBAND_HI
                         and abs_z >= dyn_min_z
                     )
+                    maker_feats = None
+                    if is_maker_candidate and maker_guard_on:
+                        mk_ok, mk_reason, mk_z_used, mk_ref = maker_guard.check_quote(
+                            favored_side, signed_z_dyn, z_twap_dyn,
+                            float(getattr(config, "MAKER_MIN_TWAP_SIGMA", 0.25)),
+                        )
+                        mk_hi, mk_drop = self._mid_hist.drop(fav_token, now, mid_px)
+                        if mk_ok and maker_guard.mid_drop_blocked(
+                            mk_drop, float(getattr(config, "MAKER_MAX_MID_DROP_60S", 0.15))
+                        ):
+                            mk_ok, mk_reason = False, maker_guard.REASON_MID_DROP
+                        if not mk_ok:
+                            is_maker_candidate = False
+                            self._log_maker_block(
+                                slot, slot_key, mk_reason, stage="quote", side=favored_side, spot=spot,
+                                z_spot=signed_z_dyn, z_twap=z_twap_dyn, mid=mid_px, mid_high=mk_hi,
+                                mid_drop=mk_drop, elapsed_s=elapsed_s,
+                            )
+                        else:
+                            maker_feats = {
+                                "twap_sigma": (round(z_twap_dyn, 4) if z_twap_dyn is not None else None),
+                                "spot_sigma": round(float(signed_z_dyn), 4),
+                                "maker_z_used": round(float(mk_z_used), 4),
+                                "maker_z_ref": mk_ref,
+                            }
 
                     if is_momentum_candidate:
                         logger.info(
@@ -974,6 +1052,8 @@ class TWAPBot:
                                     size_multiplier=jev_dec.size_multiplier,
                                     jev_decision=jev_dec,
                                 )
+                                if slot.resting_order is not None and maker_feats:
+                                    slot.resting_order["quote_features"] = maker_feats
                             else:
                                 logger.info(f"[{tag}] 🛑 Jev VETOED maker bid: {jev_dec.reason}")
                                 journal_write(
@@ -1037,6 +1117,29 @@ class TWAPBot:
                 )
 
                 mid_now = 0.5 * (float(cur_bid) + float(cur_ask)) if (cur_bid and cur_ask) else None
+                if mid_now is not None and ro_token:
+                    self._mid_hist.add(ro_token, now, mid_now)
+                    if ro_opp_token:
+                        self._mid_hist.add(ro_opp_token, now, 1.0 - mid_now)
+                ro_hi, ro_drop = self._mid_hist.drop(ro_token, now, mid_now)
+                guard_reason = None
+                ro_z_twap = None
+                if maker_guard_on:
+                    if maker_guard.twap_cross_adverse(ro_side, spot, slot.strike_twap):
+                        guard_reason = maker_guard.REASON_TWAP_CROSS
+                    elif maker_guard.mid_drop_blocked(
+                        ro_drop, float(getattr(config, "MAKER_MAX_MID_DROP_60S", 0.15))
+                    ):
+                        guard_reason = maker_guard.REASON_MID_DROP
+                    elif is_paper_fill or (config.MODE == "live" and is_clob_fill):
+                        # Re-check the settlement-strike z before counting a fill.
+                        ro_z_twap = z_twap_dyn
+                        g_ok, g_reason, _, _ = maker_guard.check_quote(
+                            ro_side, signed_z_dyn, ro_z_twap,
+                            float(getattr(config, "MAKER_MIN_TWAP_SIGMA", 0.25)),
+                        )
+                        if not g_ok:
+                            guard_reason = g_reason
                 cancel = False
                 cancel_reason = "band/time"
                 if remaining_s < config.DYNAMIC_WINDOW_END_S:
@@ -1045,6 +1148,15 @@ class TWAPBot:
                 elif mid_now is not None and not (config.DYNAMIC_MIDBAND_LO <= mid_now <= config.DYNAMIC_MIDBAND_HI):
                     cancel = True
                     cancel_reason = f"mid_left_band (mid={mid_now:.2f})"
+                elif guard_reason:
+                    cancel = True
+                    cancel_reason = f"maker_guard_{guard_reason}"
+                    self._log_maker_block(
+                        slot, slot_key, guard_reason, stage="resting", side=ro_side, spot=spot,
+                        z_spot=signed_z_dyn, z_twap=z_twap_dyn, mid=mid_now, mid_high=ro_hi,
+                        mid_drop=ro_drop, elapsed_s=elapsed_s, bid=ro.get("price"),
+                        would_fill=bool(is_paper_fill or (config.MODE == "live" and is_clob_fill)),
+                    )
                 elif adverse_cross:
                     cancel = True
                     cancel_reason = f"adverse_spot_cross (spot={spot:.2f} vs strike={strike:.2f})"
@@ -1090,9 +1202,29 @@ class TWAPBot:
                         "jev": ro.get("jev"),
                         **{k: ro.get(k) for k in ("strike_spot", "strike_twap", "strike_twap_source", "move_ref_mode", "move_ref_used")},
                     }
+                    if not slot.position.get("strike_twap") and slot.strike_twap:
+                        slot.position["strike_twap"] = slot.strike_twap
+                        slot.position["strike_twap_source"] = slot.strike_twap_source
+                    if not slot.position.get("strike_spot"):
+                        slot.position["strike_spot"] = slot.strike
+                    feats = self._maker_fill_features(
+                        slot, ro, spot=spot, z_spot=signed_z_dyn, z_twap=z_twap_dyn,
+                        mid_high=ro_hi, mid_drop=ro_drop, elapsed_s=el_s,
+                    )
+                    slot.position["maker_features"] = feats
                     slot.resting_order = None
                     logger.info(
                         f"[{tag}] ✅ JEV_DYNAMIC MAKER FILL {ro['side']} @{ro['price']:.3f} x {ro['shares']:.2f}"
+                    )
+                    logger.info(f"[{tag}] MAKER_FILL_FEATURES {json.dumps(feats, default=str)}")
+                    journal_write(
+                        "maker_fill",
+                        asset=asset,
+                        slot=ro.get("slot"),
+                        side=ro["side"],
+                        price=ro["price"],
+                        shares=ro["shares"],
+                        **feats,
                     )
 
         elif is_momentum:
@@ -1578,6 +1710,64 @@ class TWAPBot:
                 f"[{tag}] MOVE_REF TWAP strike unavailable for {(market or {}).get('slug')} "
                 f"(insufficient pre-open ticks over {window_s:.0f}s); momentum gate falls back to spot strike"
             )
+
+    def _log_maker_block(self, slot: CoinSlot, slot_key: str, reason: str | None, stage: str, **kw) -> None:
+        """MAKER_BLOCK log + journal; quote-stage blocks log once per slot per reason."""
+        reason = reason or "unknown"
+        key = f"{stage}:{reason}"
+        if stage == "quote" and key in slot.maker_block_logged:
+            return
+        slot.maker_block_logged.add(key)
+
+        def _f(v, fmt):
+            return format(v, fmt) if isinstance(v, (int, float)) else "n/a"
+
+        logger.warning(
+            f"[{slot.asset.upper()}] MAKER_BLOCK reason={reason} stage={stage} side={kw.get('side')} "
+            f"z_spot={_f(kw.get('z_spot'), '+.2f')} z_twap={_f(kw.get('z_twap'), '+.2f')} "
+            f"strike_spot={_f(slot.strike, '.4f')} strike_twap={_f(slot.strike_twap, '.4f')} "
+            f"spot={_f(kw.get('spot'), '.4f')} mid={_f(kw.get('mid'), '.3f')} "
+            f"mid_60s_high={_f(kw.get('mid_high'), '.3f')} mid_drop={_f(kw.get('mid_drop'), '.3f')} "
+            f"t={_f(kw.get('elapsed_s'), '.0f')}s"
+            + (f" bid={_f(kw.get('bid'), '.2f')} would_fill={kw.get('would_fill')}" if stage == "resting" else "")
+        )
+        payload = {
+            k: (round(v, 6) if isinstance(v, float) else v)
+            for k, v in kw.items()
+        }
+        journal_write(
+            "maker_block",
+            asset=slot.asset,
+            slot=slot_key,
+            reason=reason,
+            stage=stage,
+            strike_spot=slot.strike,
+            strike_twap=slot.strike_twap,
+            strike_twap_source=slot.strike_twap_source,
+            **payload,
+        )
+
+    def _maker_fill_features(
+        self, slot: CoinSlot, ro: dict, spot=None, z_spot=None, z_twap=None,
+        mid_high=None, mid_drop=None, elapsed_s=None,
+    ) -> dict:
+        jev = ro.get("jev") or {}
+        side = ro.get("side")
+        sgn = 1.0 if str(side).upper() == "UP" else -1.0
+        return {
+            "strike_spot": slot.strike,
+            "strike_twap": slot.strike_twap,
+            "strike_twap_source": slot.strike_twap_source,
+            "spot": spot,
+            "twap_sigma": (round(sgn * float(z_twap), 4) if z_twap is not None else None),
+            "spot_sigma": (round(sgn * float(z_spot), 4) if z_spot is not None else None),
+            "mid_60s_high": (round(mid_high, 4) if mid_high is not None else None),
+            "mid_drop_60s": (round(mid_drop, 4) if mid_drop is not None else None),
+            "elapsed_s": elapsed_s,
+            "jev_conviction": jev.get("conviction"),
+            "maker_guard": bool(getattr(config, "MAKER_TWAP_GUARD", False)),
+            "quote_features": ro.get("quote_features"),
+        }
 
     def _strike_meta(self, slot: CoinSlot) -> dict:
         return {
@@ -2365,6 +2555,7 @@ class TWAPBot:
             "settlement_source": f"early_exit_{reason}",
             "jev": pos.get("jev"),
             **{k: pos.get(k) for k in ("strike_spot", "strike_twap", "strike_twap_source", "move_ref_mode", "move_ref_used")},
+            "maker_features": pos.get("maker_features"),
         }
         journal_write(
             "settlement",
@@ -2389,6 +2580,8 @@ class TWAPBot:
             fee=round(fee + exit_fee, 4),
             total_cost=total_cost,
             jev=pos.get("jev"),
+            **{k: pos.get(k) for k in ("strike_spot", "strike_twap", "strike_twap_source", "move_ref_mode", "move_ref_used")},
+            maker_features=pos.get("maker_features"),
         )
         self._save_trade_record(record)
 
@@ -2562,6 +2755,7 @@ class TWAPBot:
             "early_exit": False,
             "jev": pos.get("jev"),
             **{k: pos.get(k) for k in ("strike_spot", "strike_twap", "strike_twap_source", "move_ref_mode", "move_ref_used")},
+            "maker_features": pos.get("maker_features"),
         }
         journal_write(
             "settlement",
@@ -2586,6 +2780,8 @@ class TWAPBot:
             fee=fee,
             total_cost=total_cost,
             jev=pos.get("jev"),
+            **{k: pos.get(k) for k in ("strike_spot", "strike_twap", "strike_twap_source", "move_ref_mode", "move_ref_used")},
+            maker_features=pos.get("maker_features"),
         )
         self._save_trade_record(record)
 

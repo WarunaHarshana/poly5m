@@ -100,7 +100,7 @@ class TestMoveRefBotIntegration(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.temp_dir = Path(tempfile.mkdtemp())
         self.saved = {k: getattr(config, k) for k in (
-            "MODE", "STRATEGY", "MOMENTUM_MOVE_REF", "PAPER_FOK_REQUIRE_SIZE")}
+            "MODE", "STRATEGY", "MOMENTUM_MOVE_REF", "PAPER_FOK_REQUIRE_SIZE", "MAKER_TWAP_GUARD")}
         config.MODE = "paper_live"
         config.STRATEGY = "JEV_DYNAMIC"
         config.PAPER_FOK_REQUIRE_SIZE = False
@@ -198,6 +198,7 @@ class TestMoveRefBotIntegration(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(slot.strike_twap, STRIKE_SPOT, places=4)
 
     async def test_e_spot_mode_unchanged(self):
+        config.MAKER_TWAP_GUARD = False  # maker guard also resolves the TWAP strike; isolate spot mode
         slot, thr = await self._run("spot", PRICE_TO_BEAT)
         self._assert_precondition(thr)
         self.assertIsNotNone(slot.position)  # legacy behaviour: the forensic trade is taken
