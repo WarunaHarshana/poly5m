@@ -113,6 +113,7 @@ class TestDynamicSimulation(unittest.IsolatedAsyncioTestCase):
 
         market = {
             "slug": "sol-usd-5m-test-dynamic-maker",
+            "price_to_beat": 180.00,  # TWAP strike available (MAKER_REQUIRE_TWAP default on)
             "slot_start_ts": slot_start,
             "start_time": slot_start,
             "end_ts": slot_start + 300.0,
@@ -219,6 +220,7 @@ class TestDynamicSimulation(unittest.IsolatedAsyncioTestCase):
 
         market = {
             "slug": "sol-usd-5m-test-adverse-cancel",
+            "price_to_beat": 180.00,  # TWAP strike available (MAKER_REQUIRE_TWAP default on)
             "slot_start_ts": slot_start,
             "start_time": slot_start,
             "end_ts": slot_start + 300.0,

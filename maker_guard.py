@@ -22,6 +22,7 @@ REASON_TWAP_SIGMA = "twap_sigma"
 REASON_DIRECTION_CONFLICT = "direction_conflict"
 REASON_MID_DROP = "mid_drop"
 REASON_TWAP_CROSS = "twap_cross"
+REASON_NO_TWAP_STRIKE = "no_twap_strike"
 
 REF_SPOT_FALLBACK = "spot_fallback"  # no TWAP strike yet -> legacy spot-strike z
 REF_SPOT = "spot"

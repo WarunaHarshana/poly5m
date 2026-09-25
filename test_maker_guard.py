@@ -109,12 +109,14 @@ class TestMakerGuardBotIntegration(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.temp_dir = Path(tempfile.mkdtemp())
         self.saved = {k: getattr(config, k) for k in (
-            "MODE", "STRATEGY", "MAKER_TWAP_GUARD", "MAKER_MIN_TWAP_SIGMA", "MAKER_MAX_MID_DROP_60S")}
+            "MODE", "STRATEGY", "MAKER_TWAP_GUARD", "MAKER_MIN_TWAP_SIGMA", "MAKER_MAX_MID_DROP_60S",
+            "MAKER_REQUIRE_TWAP")}
         config.MODE = "paper_live"
         config.STRATEGY = "JEV_DYNAMIC"
         config.MAKER_TWAP_GUARD = True
         config.MAKER_MIN_TWAP_SIGMA = 0.25
         config.MAKER_MAX_MID_DROP_60S = 0.15
+        config.MAKER_REQUIRE_TWAP = True
         self.bot = TWAPBot()
         self.bot.risk.state_dir = self.temp_dir
         self.bot.risk.bankroll = 50.0
@@ -131,7 +133,7 @@ class TestMakerGuardBotIntegration(unittest.IsolatedAsyncioTestCase):
             setattr(config, k, v)
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
-    async def _run(self, spot: float, price_to_beat, seed_high: float | None = None):
+    async def _run(self, spot: float, price_to_beat, seed_high: float | None = None, resting: bool = True):
         now = time.time()
         slot_start = now - 150.0
         slot = self.bot.slots["btc"]
@@ -156,7 +158,7 @@ class TestMakerGuardBotIntegration(unittest.IsolatedAsyncioTestCase):
         self.bot.book_stream._apply_update("tok_down", bid=0.50, ask=0.52, bid_sz=500, ask_sz=500)
         if seed_high is not None:
             self.bot._mid_hist.add("tok_up", now - 20.0, seed_high)
-        slot.resting_order = {
+        slot.resting_order = None if not resting else {
             "asset": "btc", "slot": slot.market["slug"], "side": "UP", "token_id": "tok_up",
             "price": 0.50, "shares": 6.0, "cost_usd": 3.0, "z_score": 1.2, "prob": 0.5,
             "rebate": 0.0, "placed_at": now - 30.0, "order_id": "maker_paper_test",
@@ -207,7 +209,49 @@ class TestMakerGuardBotIntegration(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(slot.maker_block_logged)
 
     async def test_no_twap_strike_falls_back(self):
-        # No priceToBeat and no pre-open ticks -> TWAP strike unavailable -> legacy fill.
+        # MAKER_REQUIRE_TWAP off: no priceToBeat / pre-open ticks -> TWAP strike unavailable -> legacy fill.
+        config.MAKER_REQUIRE_TWAP = False
         slot = await self._run(spot=84420.0, price_to_beat=None)
         self.assertIsNotNone(slot.position)
         self.assertIsNone(slot.position["maker_features"]["twap_sigma"])
+
+
+    # ------------------------------------------------ MAKER_REQUIRE_TWAP (restart gap)
+    def _maker_consults(self):
+        return [c for c in self.bot.jev.evaluate_dynamic.await_args_list
+                if c.kwargs.get("opportunity_type") == "MAKER_BID"]
+
+    async def test_require_twap_cancels_resting_bid_without_strike(self):
+        slot = await self._run(spot=84420.0, price_to_beat=None)
+        self.assertIsNone(slot.strike_twap)
+        self.assertIsNone(slot.position)
+        self.assertIsNone(slot.resting_order)
+        self.assertIn("resting:no_twap_strike", slot.maker_block_logged)
+
+    async def test_require_twap_no_quote_without_strike(self):
+        slot = await self._run(spot=84420.0, price_to_beat=None, resting=False)
+        self.assertIsNone(slot.strike_twap)
+        self.assertEqual(self._maker_consults(), [])
+        self.assertIsNone(slot.resting_order)
+        self.assertIn("quote:no_twap_strike", slot.maker_block_logged)
+
+    async def test_require_twap_block_logged_once_per_slot(self):
+        slot = await self._run(spot=84420.0, price_to_beat=None, resting=False)
+        with self.assertLogs("twap-bot", level="WARNING") as cm:
+            await self.bot._tick_asset(slot, time.time())
+            import logging
+            logging.getLogger("twap-bot").warning("sentinel")
+        self.assertFalse(any("no_twap_strike" in m for m in cm.output))
+
+    async def test_require_twap_with_strike_quotes_normally(self):
+        slot = await self._run(spot=84420.0, price_to_beat=STRIKE, resting=False)
+        self.assertEqual(slot.strike_twap, STRIKE)
+        self.assertNotIn("quote:no_twap_strike", slot.maker_block_logged)
+        self.assertEqual(len(self._maker_consults()), 1)
+
+    async def test_require_twap_off_quotes_legacy_without_strike(self):
+        config.MAKER_REQUIRE_TWAP = False
+        slot = await self._run(spot=84420.0, price_to_beat=None, resting=False)
+        self.assertIsNone(slot.strike_twap)
+        self.assertFalse(slot.maker_block_logged)
+        self.assertEqual(len(self._maker_consults()), 1)

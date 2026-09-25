@@ -103,6 +103,10 @@ SETTLEMENT_TWAP_WINDOW_S = float(os.getenv("SETTLEMENT_TWAP_WINDOW_S", "60"))
 # is cancelled on an adverse TWAP-strike cross. Falls back to legacy behaviour without a TWAP strike.
 MAKER_TWAP_GUARD = os.getenv("MAKER_TWAP_GUARD", "1").strip().lower() in ("yes", "y", "true", "1", "on")
 MAKER_MIN_TWAP_SIGMA = float(os.getenv("MAKER_MIN_TWAP_SIGMA", "0.25"))
+# With the guard on, require a TWAP strike for the maker leg: no maker bids in a slot whose TWAP
+# strike is unavailable (e.g. first slot after a restart) and cancel a resting bid if it goes missing.
+# Off = legacy spot-strike fallback. Only effective when MAKER_TWAP_GUARD is on. Momentum unaffected.
+MAKER_REQUIRE_TWAP = os.getenv("MAKER_REQUIRE_TWAP", "1").strip().lower() in ("yes", "y", "true", "1", "on")
 # Adverse-selection guard: skip quoting / cancel resting bid (blocking the fill) when the favoured
 # token's mid has dropped >= MAKER_MAX_MID_DROP_60S from its high over the last MAKER_MID_WINDOW_S.
 MAKER_MAX_MID_DROP_60S = float(os.getenv("MAKER_MAX_MID_DROP_60S", "0.15"))

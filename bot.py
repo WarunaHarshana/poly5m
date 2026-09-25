@@ -754,6 +754,7 @@ class TWAPBot:
             # Momentum entry move reference (spot strike vs settlement-TWAP strike).
             move_ref_mode = move_ref.normalize_mode(getattr(config, "MOMENTUM_MOVE_REF", "conservative"))
             maker_guard_on = bool(getattr(config, "MAKER_TWAP_GUARD", False))
+            maker_require_twap = maker_guard_on and bool(getattr(config, "MAKER_REQUIRE_TWAP", True))
             if move_ref_mode == move_ref.MODE_CONSERVATIVE or maker_guard_on:
                 self._ensure_twap_strike(slot, market, slot_start_ts, elapsed_s)
             gate_move_usd, move_ref_used = move_ref.entry_move(move_ref_mode, spot, strike, slot.strike_twap)
@@ -885,6 +886,15 @@ class TWAPBot:
                         and abs_z >= dyn_min_z
                     )
                     maker_feats = None
+                    if is_maker_candidate and maker_require_twap and not slot.strike_twap:
+                        # No settlement (TWAP) strike for this slot (e.g. first slot after a restart):
+                        # don't quote the maker leg at all. Logged once per slot.
+                        is_maker_candidate = False
+                        self._log_maker_block(
+                            slot, slot_key, maker_guard.REASON_NO_TWAP_STRIKE, stage="quote",
+                            side=favored_side, spot=spot, z_spot=signed_z_dyn, z_twap=None, mid=mid_px,
+                            elapsed_s=elapsed_s,
+                        )
                     if is_maker_candidate and maker_guard_on:
                         mk_ok, mk_reason, mk_z_used, mk_ref = maker_guard.check_quote(
                             favored_side, signed_z_dyn, z_twap_dyn,
@@ -1133,7 +1143,9 @@ class TWAPBot:
                 guard_reason = None
                 ro_z_twap = None
                 if maker_guard_on:
-                    if maker_guard.twap_cross_adverse(ro_side, spot, slot.strike_twap):
+                    if maker_require_twap and not slot.strike_twap:
+                        guard_reason = maker_guard.REASON_NO_TWAP_STRIKE
+                    elif maker_guard.twap_cross_adverse(ro_side, spot, slot.strike_twap):
                         guard_reason = maker_guard.REASON_TWAP_CROSS
                     elif maker_guard.mid_drop_blocked(
                         ro_drop, float(getattr(config, "MAKER_MAX_MID_DROP_60S", 0.15))
