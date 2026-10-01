@@ -90,6 +90,16 @@ DYNAMIC_ENTRY_COOLDOWN_S = float(os.getenv("DYNAMIC_ENTRY_COOLDOWN_S", "10.0"))
 DYNAMIC_MIN_ELAPSED_S = float(os.getenv("DYNAMIC_MIN_ELAPSED_S", "30.0"))
 # Momentum taker only — maker mid-band may still quote earlier in the window.
 DYNAMIC_MOMENTUM_MIN_ELAPSED_S = float(os.getenv("DYNAMIC_MOMENTUM_MIN_ELAPSED_S", "90.0"))
+# --- Entry dead zone (JEV_DYNAMIC) ---
+# No new entries / maker quotes for the listed legs while slot elapsed is in [LO, HI); resting maker bids
+# are cancelled when the slot enters the zone. /trades (120): 120-180s lost on both legs
+# (maker 13 tr -8.26, momentum 22 tr -11.92). Disable: ENTRY_BLOCK_ENABLED=0 or ENTRY_BLOCK_ELAPSED_HI=0.
+ENTRY_BLOCK_ENABLED = os.getenv("ENTRY_BLOCK_ENABLED", "1").strip().lower() in ("yes", "y", "true", "1", "on")
+ENTRY_BLOCK_ELAPSED_LO = float(os.getenv("ENTRY_BLOCK_ELAPSED_LO", "120"))
+ENTRY_BLOCK_ELAPSED_HI = float(os.getenv("ENTRY_BLOCK_ELAPSED_HI", "180"))
+ENTRY_BLOCK_LEGS = tuple(
+    x.strip().lower() for x in os.getenv("ENTRY_BLOCK_LEGS", "momentum,maker").split(",") if x.strip()
+)
 # Momentum entry move reference. Markets settle on Chainlink 60s-TWAP (finalPrice vs priceToBeat),
 # not the raw spot tick at slot open. "conservative" measures the entry move against both the spot
 # strike and a TWAP strike estimate and uses the smaller magnitude (0 if they disagree on direction).

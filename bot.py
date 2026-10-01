@@ -117,6 +117,7 @@ class CoinSlot:
     # Maker guard / momentum elapsed-gate logging (once per slot per reason)
     maker_block_logged: set = field(default_factory=set)
     momentum_gate_logged: bool = False
+    entry_zone_logged: set = field(default_factory=set)
 
 
 class TWAPBot:
@@ -565,6 +566,7 @@ class TWAPBot:
             slot.move_ref_block_logged = False
             slot.maker_block_logged = set()
             slot.momentum_gate_logged = False
+            slot.entry_zone_logged = set()
             market = self.pub_client.find_active_5m_slot(now_ts=now, asset=slot.asset)
             if not market:
                 logger.warning(f"[{slot.asset.upper()}] Could not discover market for slot {window_ts}")
@@ -804,8 +806,10 @@ class TWAPBot:
                         move_gate_ok = abs(move_usd) >= min_move_usd
                     else:
                         move_gate_ok = move_ref.gate_move_ok(gate_move_usd, min_move_usd, favored_side)
+                    momentum_zone_blocked = self._entry_zone_blocked(slot, slot_key, "momentum", elapsed_s)
                     is_momentum_candidate = (
-                        allowed_feas
+                        not momentum_zone_blocked
+                        and allowed_feas
                         and float(elapsed_s) >= momentum_min_elapsed
                         and directional_coherence
                         and move_gate_ok
@@ -887,6 +891,9 @@ class TWAPBot:
                         and abs_z >= dyn_min_z
                     )
                     maker_feats = None
+                    maker_zone_blocked = self._entry_zone_blocked(slot, slot_key, "maker", elapsed_s)
+                    if is_maker_candidate and maker_zone_blocked:
+                        is_maker_candidate = False
                     if is_maker_candidate and maker_require_twap and not slot.strike_twap:
                         # No settlement (TWAP) strike for this slot (e.g. first slot after a restart):
                         # don't quote the maker leg at all. Logged once per slot.
@@ -1163,7 +1170,13 @@ class TWAPBot:
                             guard_reason = g_reason
                 cancel = False
                 cancel_reason = "band/time"
-                if remaining_s < config.DYNAMIC_WINDOW_END_S:
+                if self._entry_zone_blocked(slot, slot_key, "maker", elapsed_s, stage="resting"):
+                    cancel = True
+                    cancel_reason = (
+                        f"entry_block_zone (t={float(elapsed_s):.0f}s in "
+                        f"[{config.ENTRY_BLOCK_ELAPSED_LO:.0f},{config.ENTRY_BLOCK_ELAPSED_HI:.0f}))"
+                    )
+                elif remaining_s < config.DYNAMIC_WINDOW_END_S:
                     cancel = True
                     cancel_reason = f"window_end ({remaining_s:.0f}s left)"
                 elif mid_now is not None and not (config.DYNAMIC_MIDBAND_LO <= mid_now <= config.DYNAMIC_MIDBAND_HI):
@@ -1735,6 +1748,37 @@ class TWAPBot:
                 f"[{tag}] MOVE_REF TWAP strike unavailable for {(market or {}).get('slug')} "
                 f"(insufficient pre-open ticks over {window_s:.0f}s); momentum gate falls back to spot strike"
             )
+
+    def _entry_zone_blocked(
+        self, slot: CoinSlot, slot_key: str | None, leg: str, elapsed_s, stage: str = "entry",
+    ) -> bool:
+        """True when `leg` is in the entry dead zone [ENTRY_BLOCK_ELAPSED_LO, HI). Logs once per slot/leg/stage."""
+        if not getattr(config, "ENTRY_BLOCK_ENABLED", True):
+            return False
+        lo = float(getattr(config, "ENTRY_BLOCK_ELAPSED_LO", 120.0))
+        hi = float(getattr(config, "ENTRY_BLOCK_ELAPSED_HI", 180.0))
+        legs = tuple(getattr(config, "ENTRY_BLOCK_LEGS", ("momentum", "maker")))
+        if hi <= lo or leg not in legs or elapsed_s is None:
+            return False
+        try:
+            e = float(elapsed_s)
+        except (TypeError, ValueError):
+            return False
+        if not (lo <= e < hi):
+            return False
+        key = f"{leg}:{stage}"
+        if key not in slot.entry_zone_logged:
+            slot.entry_zone_logged.add(key)
+            logger.info(
+                f"[{slot.asset.upper()}] ENTRY_BLOCK_ZONE leg={leg} stage={stage} t={e:.0f}s in [{lo:.0f},{hi:.0f}) "
+                f"slot={slot_key} -> no new {leg} entries until t={hi:.0f}s"
+                + (" (cancelling resting maker bid)" if stage == "resting" else "")
+            )
+            journal_write(
+                "entry_block_zone", asset=slot.asset, slot=slot_key, leg=leg, stage=stage,
+                elapsed_s=round(e, 1), lo=lo, hi=hi,
+            )
+        return True
 
     def _log_maker_block(self, slot: CoinSlot, slot_key: str, reason: str | None, stage: str, **kw) -> None:
         """MAKER_BLOCK log + journal; quote-stage blocks log once per slot per reason."""
