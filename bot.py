@@ -441,6 +441,11 @@ class TWAPBot:
                 logger.info("JEV_SHADOW=on: Jev is consulted and logged but NOT enforced (all consults proceed at 1.0x)")
             elif getattr(config, "JEV_SHADOW", False):
                 logger.info("JEV_SHADOW set but Jev is not active (disabled / no key / no SDK); shadow has no effect")
+            logger.info(
+                "MAKER_HOLD_TO_EXPIRY="
+                + ("on: maker positions hold to settlement (TP 0.95 only; no trailing/price stop/stop-loss/hard flatten/failsafe)"
+                   if getattr(config, "MAKER_HOLD_TO_EXPIRY", False) else "off (maker uses the normal exit stack)")
+            )
         elif config.STRATEGY in ("MIDBAND_MAKER", "MIDBAND", "H-006_MIDBAND_MAKER", "H-006"):
             logger.info(
                 f"Mid-band maker: band=[{config.MIDBAND_LO:.2f}..{config.MIDBAND_HI:.2f}] "
@@ -2208,6 +2213,17 @@ class TWAPBot:
             await self._exit_position_early(slot, market, exit_px, reason="take_profit")
             return
 
+        # MAKER_HOLD_TO_EXPIRY: after the take-profit check, maker positions hold to settlement
+        # (no trailing, price stop, adverse stop-loss / urgent / hard flatten, or failsafe flatten).
+        if self._maker_hold_to_expiry(pos):
+            if not pos.get("hold_to_expiry_logged"):
+                pos["hold_to_expiry_logged"] = True
+                logger.info(
+                    f"[{slot.asset.upper()}] MAKER_HOLD_TO_EXPIRY holding {pos.get('strategy')} {side} "
+                    f"entry={entry:.3f} to settlement (only TP >= {tp_target:.2f} exits early)"
+                )
+            return
+
         # 2) Dynamic Trailing Profit Stop (Target 3):
         # Optional: only active when TRAILING_PROFIT_ENABLED is explicitly enabled.
         # If enabled and peak_bid >= TRAILING_PROFIT_MIN_PEAK, trails peak bid by TRAILING_PROFIT_DISTANCE.
@@ -2463,6 +2479,13 @@ class TWAPBot:
             # Extreme conviction on our side (crowd piled in) -> tiny opposite hedge
             if main_ask is not None and main_ask >= float(config.MOMENTUM_HEDGE_TRIGGER_ASK):
                 await self._place_micro_hedge(slot, market, tokens, pos, main_ask)
+
+    @staticmethod
+    def _maker_hold_to_expiry(pos: dict | None) -> bool:
+        """True when MAKER_HOLD_TO_EXPIRY is on and the position is a maker-leg fill."""
+        if not pos or not getattr(config, "MAKER_HOLD_TO_EXPIRY", False):
+            return False
+        return "MAKER" in str(pos.get("strategy") or "").upper()
 
     def _real_best_bid(self, token_id: str) -> float | None:
         """Best bid from the token's OWN book only (no 1-opp_ask complement inference)."""

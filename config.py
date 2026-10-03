@@ -157,6 +157,14 @@ PRICE_STOP_ENABLED = os.getenv("PRICE_STOP_ENABLED", "no").strip().lower() in ("
 PRICE_STOP_FRACTION = float(os.getenv("PRICE_STOP_FRACTION", "0.50"))
 PRICE_STOP_PERSISTENCE_S = float(os.getenv("PRICE_STOP_PERSISTENCE_S", "5.0"))
 
+# --- Maker hold-to-expiry ---
+# When on, maker positions (strategy contains "MAKER") skip trailing profit, the price stop, the adverse
+# stop-loss / urgent / hard-flatten block and the failsafe orderbook flatten, and settle at expiry against the
+# official outcome. Take-profit (TAKE_PROFIT_BID/ASK, 0.95) still fires. Momentum is unchanged.
+# Replay (110 maker trades, both accounts): hold-to-expiry +$28.25 vs actual exits (weak evidence, paper only).
+# Rollback: unset MAKER_HOLD_TO_EXPIRY or set it to 0.
+MAKER_HOLD_TO_EXPIRY = os.getenv("MAKER_HOLD_TO_EXPIRY", "no").strip().lower() in ("yes", "y", "true", "1", "on")
+
 # --- Dynamic Trailing Profit Stop Parameters ---
 # Armed when peak bid reaches >= 0.83, trails by 0.08 to lock in profit before expiry
 TRAILING_PROFIT_ENABLED = os.getenv("TRAILING_PROFIT_ENABLED", os.getenv("TRAILING_BREAKEVEN_ENABLED", "yes")).strip().lower() in ("yes", "y", "true", "1")
