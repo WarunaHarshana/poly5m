@@ -124,9 +124,6 @@ def public_trade(row: dict) -> dict:
         "official": is_official_trade(row),
         "unofficial": not is_official_trade(row),
         "polymarket_url": f"https://polymarket.com/event/{slug}" if slug else None,
-        "jev": row.get("jev"),
-        "jev_shadow_verdict": _row_shadow_verdict(row),
-        "jev_shadow_conviction": row.get("jev_shadow_conviction"),
     }
 
 
@@ -238,6 +235,8 @@ def _group_resolved(resolved: list[dict], key_fn: Callable[[dict], str], order: 
 
 def build_stats(trades: list[dict], snapshot: dict[str, Any] | None = None) -> dict:
     rows = [public_trade(t) for t in trades]
+    # Jev shadow verdict is read from the raw row (legacy rows only; public trades carry no Jev fields).
+    shadow_verdicts = [_row_shadow_verdict(t) for t in trades]
     resolved = [r for r in rows if r.get("won") is not None and r.get("pnl") is not None]
     wins = sum(1 for r in resolved if r.get("won"))
     pnl = sum(float(r.get("pnl") or 0.0) for r in resolved)
@@ -248,7 +247,13 @@ def build_stats(trades: list[dict], snapshot: dict[str, Any] | None = None) -> d
     by_exit_reason = _group_resolved(resolved, lambda r: exit_reason_bucket(r.get("exit_reason")), EXIT_REASON_BUCKETS)
     by_entry_elapsed = _group_resolved(resolved, lambda r: entry_elapsed_bucket(r.get("entry_elapsed_s")), ENTRY_ELAPSED_BUCKETS)
     by_strategy_leg = _group_resolved(resolved, lambda r: strategy_leg_bucket(r.get("strategy")), STRATEGY_LEG_BUCKETS)
-    by_jev_shadow = _group_resolved(resolved, lambda r: jev_shadow_bucket(r.get("jev_shadow_verdict")), JEV_SHADOW_BUCKETS)
+    resolved_shadow = [
+        {**r, "_jev_shadow_verdict": v} for r, v in zip(rows, shadow_verdicts)
+        if r.get("won") is not None and r.get("pnl") is not None
+    ]
+    by_jev_shadow = _group_resolved(
+        resolved_shadow, lambda r: jev_shadow_bucket(r.get("_jev_shadow_verdict")), JEV_SHADOW_BUCKETS
+    )
     now = time.time()
     day_pnl = 0.0
     for raw in trades:

@@ -209,6 +209,31 @@ def parse_event_resolution(ev: dict | None, now_ts: float | None = None) -> dict
     return None
 
 
+def parse_clob_resolution(data: dict | None) -> dict | None:
+    """Map a CLOB /markets/{condition_id} payload to {side, source, official} once a winner is flagged."""
+    if not isinstance(data, dict):
+        return None
+    winners = []
+    for tok in data.get("tokens") or []:
+        if not isinstance(tok, dict) or tok.get("winner") is not True:
+            continue
+        o = str(tok.get("outcome") or "").strip().lower()
+        if o in ("up", "yes", "higher", "above"):
+            winners.append("UP")
+        elif o in ("down", "no", "lower", "below"):
+            winners.append("DOWN")
+    if len(winners) != 1:
+        return None
+    return {
+        "side": winners[0],
+        "source": "polymarket_clob_winner",
+        "confidence": 1.0,
+        "final_price": None,
+        "price_to_beat": None,
+        "official": True,
+    }
+
+
 class PolymarketPublicClient:
     """Read-only client for Gamma market discovery and CLOB REST quotes."""
 
@@ -292,9 +317,38 @@ class PolymarketPublicClient:
         except Exception:
             return None
 
-    def get_resolution(self, slug: str, now_ts: float | None = None) -> dict | None:
-        """Official (or post-close implied) Up/Down resolution from Gamma. None if still open."""
-        return parse_event_resolution(self.get_event(slug), now_ts=now_ts)
+    def get_clob_resolution(self, condition_id: str) -> dict | None:
+        """Official winner from the CLOB market (tokens[].winner). None until Polymarket marks a winner."""
+        if not condition_id:
+            return None
+        try:
+            r = self.session.get(f"{config.CLOB_HOST}/markets/{condition_id}", timeout=self.timeout)
+            data = r.json()
+        except Exception:
+            return None
+        return parse_clob_resolution(data)
+
+    def get_resolution(
+        self, slug: str, now_ts: float | None = None, condition_id: str | None = None
+    ) -> dict | None:
+        """Official Up/Down resolution: Gamma event first, then the CLOB winner flag. None if still open."""
+        ev = self.get_event(slug)
+        res = parse_event_resolution(ev, now_ts=now_ts)
+        if res is not None:
+            return res
+        cid = condition_id
+        if not cid and isinstance(ev, dict):
+            markets = ev.get("markets") or []
+            if markets and isinstance(markets[0], dict):
+                cid = markets[0].get("conditionId")
+        try:
+            end_ts = int(str(slug).rsplit("-", 1)[-1]) + int(config.SLOT_SECONDS)
+        except Exception:
+            end_ts = None
+        now = time.time() if now_ts is None else float(now_ts)
+        if cid and (end_ts is None or now >= end_ts + 1.0):
+            return self.get_clob_resolution(cid)
+        return None
 
     def get_order_book(self, token_id: str) -> dict | None:
         """Fetch REST snapshot of the order book for token_id."""

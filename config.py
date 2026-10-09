@@ -274,6 +274,12 @@ PAPER_FOK_REQUIRE_SIZE = os.getenv("PAPER_FOK_REQUIRE_SIZE", "yes").strip().lowe
 # Settle from Polymarket Gamma, not our local TWAP. Wait this long after the window.
 RESOLUTION_TIMEOUT_S = float(os.getenv("RESOLUTION_TIMEOUT_S", "180.0"))
 RESOLUTION_PRICE_MIN = float(os.getenv("RESOLUTION_PRICE_MIN", "0.99"))
+# After RESOLUTION_TIMEOUT_S keep polling (Gamma + CLOB winner flag) every RESOLUTION_POLL_INTERVAL_S
+# until RESOLUTION_MAX_WAIT_S; only then record the fill as unresolved (repaired on next startup).
+RESOLUTION_MAX_WAIT_S = float(os.getenv("RESOLUTION_MAX_WAIT_S", "900.0"))
+RESOLUTION_POLL_INTERVAL_S = float(os.getenv("RESOLUTION_POLL_INTERVAL_S", "15.0"))
+# On startup, re-check trades.json rows recorded as "unresolved" and book their official PnL.
+BACKFILL_UNRESOLVED_ON_START = os.getenv("BACKFILL_UNRESOLVED_ON_START", "yes").strip().lower() in ("yes", "y", "true", "1")
 # Cap how many coins can open new positions in a single 5-minute slot.
 # Increased to 3 for JEV_DYNAMIC mode to participate actively across coins.
 MAX_CONCURRENT_ENTRIES = int(os.getenv("MAX_CONCURRENT_ENTRIES", "1"))

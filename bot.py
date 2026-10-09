@@ -481,6 +481,11 @@ class TWAPBot:
             logger.info("Daily-loss / consecutive-loss kill switches: DISABLED (paper mode keeps filling)")
         else:
             logger.info(f"Daily loss limit: ${config.DAILY_LOSS_LIMIT_USD:.2f} | Max consecutive losses: {config.MAX_CONSECUTIVE_LOSSES}")
+        if config.BACKFILL_UNRESOLVED_ON_START:
+            try:
+                self._repair_unresolved_records()
+            except Exception as e:
+                logger.error(f"Unresolved backfill failed: {e}")
         self._reconcile_paper_blotter()
         if self._trades_log_path.exists():
             try:
@@ -2782,8 +2787,6 @@ class TWAPBot:
             "early_exit": True,
             "official": True,
             "settlement_source": f"early_exit_{reason}",
-            "jev": pos.get("jev"),
-            **self._jev_shadow_tags(pos.get("jev")),
             **{k: pos.get(k) for k in ("strike_spot", "strike_twap", "strike_twap_source", "move_ref_mode", "move_ref_used")},
             "maker_features": pos.get("maker_features"),
         }
@@ -2841,23 +2844,48 @@ class TWAPBot:
             return
         still: list[dict] = []
         for item in self._pending_settles:
-            slug = (item.get("market") or {}).get("slug")
+            market = item.get("market") or {}
+            slug = market.get("slug")
+            tag = str(item.get("asset") or "").upper()
             end_ts = float(item.get("end_ts") or 0.0)
             if end_ts and now < end_ts + 2.0:
                 still.append(item)
                 continue
-            resolution = self.pub_client.get_resolution(slug, now_ts=now) if slug else None
-            waited = now - float(item.get("queued_at") or now)
-            if resolution is None and waited < config.RESOLUTION_TIMEOUT_S:
+            next_check = item.get("next_check")
+            if next_check and now < float(next_check):
                 still.append(item)
                 continue
+            resolution = (
+                self.pub_client.get_resolution(slug, now_ts=now, condition_id=market.get("condition_id"))
+                if slug else None
+            )
+            waited = now - float(item.get("queued_at") or now)
             if resolution is None:
-                logger.warning(
-                    f"[{str(item.get('asset') or '').upper()}] No Polymarket resolution after "
-                    f"{waited:.0f}s for {slug}; recording unresolved (PnL not booked)"
+                if waited < config.RESOLUTION_TIMEOUT_S:
+                    still.append(item)
+                    continue
+                if slug and waited < config.RESOLUTION_MAX_WAIT_S:
+                    if not item.get("pending_warned"):
+                        logger.warning(
+                            f"[{tag}] Polymarket resolution still PENDING after {waited:.0f}s for {slug}; "
+                            f"polling every {config.RESOLUTION_POLL_INTERVAL_S:.0f}s up to "
+                            f"{config.RESOLUTION_MAX_WAIT_S:.0f}s before giving up"
+                        )
+                        item["pending_warned"] = True
+                    item["next_check"] = now + float(config.RESOLUTION_POLL_INTERVAL_S)
+                    still.append(item)
+                    continue
+                logger.error(
+                    f"[{tag}] No Polymarket resolution after {waited:.0f}s for {slug}; recording unresolved "
+                    f"(PnL not booked yet; will be re-checked and booked on next startup)"
                 )
                 self._record_unresolved(item)
                 continue
+            if item.get("pending_warned"):
+                logger.info(
+                    f"[{tag}] Late Polymarket resolution for {slug} after {waited:.0f}s "
+                    f"({resolution.get('source')}): {resolution.get('side')} -> booking PnL now"
+                )
             self._settle_filled(item, resolution)
         self._pending_settles = still
 
@@ -2881,6 +2909,12 @@ class TWAPBot:
             "bankroll": round(self.risk.bankroll, 2),
             "settlement_source": "unresolved",
             "early_exit": False,
+            "fee": pos.get("fee", 0.0),
+            "rebate": pos.get("rebate", 0.0),
+            "entry_time_utc": pos.get("entry_time_utc"),
+            "entry_elapsed_s": pos.get("entry_elapsed_s"),
+            "entry_window_time": pos.get("entry_window_time"),
+            "maker_features": pos.get("maker_features"),
         }
         journal_write(
             "settlement",
@@ -2984,8 +3018,6 @@ class TWAPBot:
             "settlement_source": resolution.get("source"),
             "official": bool(resolution.get("official")),
             "early_exit": False,
-            "jev": pos.get("jev"),
-            **self._jev_shadow_tags(pos.get("jev")),
             **{k: pos.get(k) for k in ("strike_spot", "strike_twap", "strike_twap_source", "move_ref_mode", "move_ref_used")},
             "maker_features": pos.get("maker_features"),
         }
@@ -3018,7 +3050,103 @@ class TWAPBot:
         )
         self._save_trade_record(record)
 
+    def _repair_unresolved_records(self) -> dict:
+        """Book official PnL for trades.json rows previously recorded as unresolved ($0, won=None).
+
+        Idempotent: rows are only rewritten once Polymarket reports an official winner. Paper bankroll
+        follows via _reconcile_paper_blotter; in live mode the PnL is applied to the risk bankroll.
+        """
+        summary = {"found": 0, "booked": 0, "wins": 0, "losses": 0, "pnl": 0.0, "still_unresolved": 0}
+        if not self._trades_log_path.exists():
+            return summary
+        try:
+            with open(self._trades_log_path, "r") as f:
+                trades = json.load(f)
+        except Exception as e:
+            logger.error(f"Unresolved backfill: cannot read trades.json ({e}); skipping")
+            return summary
+        if not isinstance(trades, list):
+            return summary
+        changed = False
+        for i, row in enumerate(trades):
+            if not isinstance(row, dict):
+                continue
+            if row.get("settlement_source") != "unresolved" or row.get("won") is not None:
+                continue
+            summary["found"] += 1
+            slug = row.get("slot") or row.get("slug")
+            try:
+                res = self.pub_client.get_resolution(slug, now_ts=time.time()) if slug else None
+            except Exception:
+                res = None
+            if not res or not res.get("official") or res.get("side") not in ("UP", "DOWN"):
+                summary["still_unresolved"] += 1
+                logger.warning(f"Unresolved backfill: {slug} still has no official Polymarket result; left as-is")
+                continue
+            shares = float(row.get("shares") or 0.0)
+            cost = float(row.get("cost_usd") or 0.0) or round(shares * float(row.get("price") or 0.0), 4)
+            fee = float(row.get("fee") or 0.0)
+            rebate = float(row.get("rebate") or 0.0)
+            won = row.get("side") == res["side"]
+            pnl = (shares - cost - fee + rebate) if won else (-cost - fee + rebate)
+            exit_time = row.get("exit_time_utc") or row.get("timestamp")
+            new = dict(row)
+            new.update({
+                "outcome": res["side"],
+                "won": won,
+                "pnl": round(pnl, 2),
+                "exit_price": 1.0 if won else 0.0,
+                "exit_reason": "settlement_won" if won else "settlement_lost",
+                "exit_time_utc": exit_time,
+                "exit_elapsed_s": 300.0,
+                "exit_window_time": "t=300s (05:00 - expiry)",
+                "cost_usd": cost,
+                "total_cost": round(cost + fee, 4),
+                "final_twap": res.get("final_price"),
+                "strike": res.get("price_to_beat") if res.get("price_to_beat") is not None else row.get("strike"),
+                "settlement_source": res.get("source"),
+                "official": True,
+                "early_exit": False,
+                "backfilled": True,
+                "backfilled_at": datetime.now(timezone.utc).isoformat(),
+            })
+            trades[i] = new
+            changed = True
+            summary["booked"] += 1
+            summary["wins" if won else "losses"] += 1
+            summary["pnl"] = round(summary["pnl"] + pnl, 2)
+            if config.MODE == "live":
+                self.risk.bankroll += pnl
+            logger.info(
+                f"Unresolved backfill: {slug} {row.get('side')} -> official {res['side']} "
+                f"({'WON' if won else 'LOST'}) PnL ${pnl:+.2f} [{res.get('source')}]"
+            )
+        if changed:
+            tmp = self._trades_log_path.with_suffix(".json.tmp")
+            try:
+                with open(tmp, "w") as f:
+                    json.dump(trades, f, indent=2)
+                os.replace(tmp, self._trades_log_path)
+            except Exception as e:
+                logger.error(f"Unresolved backfill: failed to write trades.json ({e}); nothing changed")
+                return {**summary, "booked": 0}
+            if config.MODE == "live":
+                self.risk.save_state()
+        if summary["found"]:
+            logger.info(
+                f"Unresolved backfill: {summary['found']} unresolved rows | booked {summary['booked']} "
+                f"({summary['wins']}W / {summary['losses']}L, PnL ${summary['pnl']:+.2f}) | "
+                f"still unresolved {summary['still_unresolved']}"
+            )
+        return summary
+
+    @staticmethod
+    def _strip_jev_fields(record: dict) -> dict:
+        """Trade records carry no Jev blobs (jev, jev_shadow_*, any jev_* key)."""
+        return {k: v for k, v in record.items() if not str(k).lower().startswith("jev")}
+
     def _save_trade_record(self, record: dict) -> None:
+        record = self._strip_jev_fields(record)
         trades = []
         if self._trades_log_path.exists():
             try:

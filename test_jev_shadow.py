@@ -191,12 +191,11 @@ class TestJevShadowBot(unittest.IsolatedAsyncioTestCase):
         self.bot._settle_filled({"position": pos, "market": market, "asset": "btc"},
                                 {"side": "UP", "source": "polymarket_test", "official": True})
         trades = json.loads(self.bot._trades_log_path.read_text())
-        self.assertEqual(trades[-1]["jev_shadow_verdict"], "veto")
-        self.assertAlmostEqual(trades[-1]["jev_shadow_conviction"], 1.2)
+        # trade records no longer carry Jev blobs; the journal settlement event still does
+        self.assertFalse([k for k in trades[-1] if k.startswith("jev")])
         self.assertEqual(self._events("settlement")[-1]["jev_shadow_verdict"], "veto")
         stats = build_stats(trades)
-        self.assertEqual(stats["by_jev_shadow"]["veto"]["trades"], 1)
-        self.assertEqual(stats["by_jev_shadow"]["veto"]["wins"], 1)
+        self.assertEqual(stats["by_jev_shadow"]["none"]["trades"], 1)
 
     async def test_enforced_decision_has_no_shadow_tag(self):
         adv = JevAdvisor(enabled=False)
