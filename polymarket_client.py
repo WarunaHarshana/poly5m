@@ -362,6 +362,7 @@ class PolymarketPublicClient:
 
 _FILLED_STATUSES = {"matched", "filled", "closed"}
 _OPEN_STATUSES = {"live", "open", "delayed", "unmatched"}
+_CANCELED_STATUSES = {"canceled", "cancelled", "canceled_market_resolved", "invalid", "expired"}
 
 
 def _as_dict(obj) -> dict:
@@ -405,15 +406,25 @@ def is_fill_confirmed(payload) -> bool:
 class PolymarketLiveClient:
     """Authenticated trading client for Polymarket CLOB (MODE=live)."""
 
-    def __init__(self):
+    def __init__(self, client=None):
         if not config.PRIVATE_KEY or not config.FUNDER_ADDRESS:
-            raise ValueError("MODE=live requires PRIVATE_KEY and FUNDER_ADDRESS in .env")
-        self.signature_type = int(config.SIGNATURE_TYPE)
+            raise ValueError("MODE=live requires PRIVATE_KEY and FUNDER_ADDRESS")
+        sig = config.SIGNATURE_TYPE
+        if sig is None or int(sig) not in config.VALID_SIGNATURE_TYPES:
+            raise ValueError(
+                "MODE=live requires an explicit SIGNATURE_TYPE (0=EOA, 1=proxy, 2=Gnosis Safe, 3=deposit wallet); "
+                f"got {sig!r}"
+            )
+        self.signature_type = int(sig)
+        if client is not None:  # injected (tests)
+            self.client = client
+            self.clob_version = 2
+            return
         self.client = self._build_client(self.signature_type)
         try:
-            self.client.set_api_creds(self.client.create_or_derive_api_creds())
+            self.client.set_api_creds(self._derive_creds())
         except Exception as e:
-            raise RuntimeError(f"Failed to initialize py_clob_client: {e}")
+            raise RuntimeError(f"Failed to initialize py_clob_client: {type(e).__name__}")
 
     def _clean_key(self) -> str:
         pk = str(config.PRIVATE_KEY).strip()
@@ -422,7 +433,15 @@ class PolymarketLiveClient:
         return pk
 
     def _build_client(self, signature_type: int):
-        from py_clob_client.client import ClobClient
+        """CLOB V2 client (py_clob_client_v2) when installed; V1 only for types 0-2 if V2 is missing."""
+        try:
+            from py_clob_client_v2.client import ClobClient
+            self.clob_version = 2
+        except ImportError:
+            if int(signature_type) == 3:
+                raise ValueError("SIGNATURE_TYPE=3 (deposit wallet) requires py-clob-client-v2")
+            from py_clob_client.client import ClobClient
+            self.clob_version = 1
         return ClobClient(
             host=config.CLOB_HOST,
             key=self._clean_key(),
@@ -431,107 +450,148 @@ class PolymarketLiveClient:
             funder=config.FUNDER_ADDRESS,
         )
 
-    def place_order(self, token_id: str, side: str, price: float, size: float, order_type: str = "GTC") -> dict:
-        """Place an order via CLOB API. Post success != fill — check size_matched/status."""
-        from py_clob_client.clob_types import OrderArgs, OrderType
-        order_args = OrderArgs(
-            token_id=token_id,
-            price=round(price, 2),
-            size=round(size, 2),
-            side=side.upper(),
-        )
-        ot_str = str(order_type).upper()
-        if ot_str == "GTC":
-            ot = OrderType.GTC
-        elif ot_str == "FAK":
-            ot = OrderType.FAK
-        elif ot_str == "GTD":
-            ot = OrderType.GTD
-        else:
-            ot = OrderType.FOK
+    def _derive_creds(self):
+        c = self.client
+        if hasattr(c, "create_or_derive_api_key"):
+            return c.create_or_derive_api_key()
+        return c.create_or_derive_api_creds()
 
-        def _submit():
-            signed_order = self.client.create_order(order_args)
-            return self.client.post_order(signed_order, ot)
+    def _types(self):
+        if getattr(self, "clob_version", 2) == 2:
+            try:
+                from py_clob_client_v2 import clob_types as ct
+                return ct
+            except ImportError:
+                pass
+        from py_clob_client import clob_types as ct
+        return ct
 
-        try:
-            resp = _submit()
-        except Exception as initial_err:
-            err_str = str(initial_err).lower()
-            if ("order version" in err_str or "signature" in err_str or "invalid order inputs" in err_str):
-                logger.warning(f"CLOB signature error ({initial_err}). Retrying fallback signature types...")
-                resp = None
-                for fallback_sig in (3, 1, 2, 0):
-                    if fallback_sig == self.signature_type:
-                        continue
-                    try:
-                        logger.info(f"Retrying order with Signature Type {fallback_sig}...")
-                        self.client = self._build_client(fallback_sig)
-                        self.client.set_api_creds(self.client.create_or_derive_api_creds())
-                        self.signature_type = fallback_sig
-                        resp = _submit()
-                        logger.info(f"Fallback to Signature Type {fallback_sig} SUCCEEDED!")
-                        break
-                    except Exception as fb_err:
-                        logger.warning(f"Fallback Signature Type {fallback_sig} failed: {fb_err}")
-                if resp is None:
-                    logger.error(f"Live order placement failed: {initial_err}")
-                    return {
-                        "success": False,
-                        "filled": False,
-                        "error": str(initial_err),
-                        "order_id": None,
-                        "status": "",
-                        "shares": 0.0,
-                        "response": None,
-                    }
-            else:
-                logger.error(f"Live order placement failed: {initial_err}")
-                return {
-                    "success": False,
-                    "filled": False,
-                    "error": str(initial_err),
-                    "order_id": None,
-                    "status": "",
-                    "shares": 0.0,
-                    "response": None,
-                }
-
+    @staticmethod
+    def _matched_from_post(resp: dict, side: str) -> tuple[float, float | None]:
+        """(filled_shares, avg_price) from a post_order response. BUY: takingAmount = shares;
+        SELL: makingAmount = shares. Falls back to size_matched."""
         data = _as_dict(resp)
+        if isinstance(resp, dict):
+            data = {**data, **resp}
+        shares = extract_filled_shares(data)
+        usd = None
+        try:
+            making = float(data.get("makingAmount") or 0.0)
+            taking = float(data.get("takingAmount") or 0.0)
+        except (TypeError, ValueError):
+            making = taking = 0.0
+        if side.upper() == "SELL" and making > 0:
+            shares, usd = making, taking
+        elif side.upper() == "BUY" and taking > 0:
+            shares, usd = taking, making
+        avg = (usd / shares) if (usd and shares) else None
+        return float(shares), avg
+
+    def place_order(self, token_id: str, side: str, price: float, size: float, order_type: str = "GTC") -> dict:
+        """Place an order via CLOB API. Post success != fill: 'shares' is the MATCHED size only (0 if none).
+        No signature-type fallback: a signing error is returned as a failure."""
+        ct = self._types()
+        OrderArgs, OrderType = ct.OrderArgs, ct.OrderType
+        order_args = OrderArgs(token_id=token_id, price=round(price, 2), size=round(size, 2), side=side.upper())
+        ot = {"GTC": OrderType.GTC, "FAK": OrderType.FAK, "GTD": OrderType.GTD}.get(
+            str(order_type).upper(), OrderType.FOK
+        )
+        try:
+            signed_order = self.client.create_order(order_args)
+            resp = self.client.post_order(signed_order, ot)
+        except Exception as e:
+            logger.error(f"Live order placement failed ({side} {order_type}): {e}")
+            return {"success": False, "filled": False, "error": str(e), "order_id": None,
+                    "status": "", "shares": 0.0, "avg_price": None, "response": None}
+        data = _as_dict(resp)
+        if isinstance(resp, dict):
+            data = {**data, **resp}
         order_id = data.get("orderID") or data.get("order_id") or data.get("id")
-        status = extract_order_status(resp)
-        filled_shares = extract_filled_shares(resp)
-        filled = is_fill_confirmed(resp)
-        # GTC resting bids are "posted" even when unmatched; FOK must be filled
-        posted_ok = bool(order_id) or filled or status in _OPEN_STATUSES or status in _FILLED_STATUSES
+        status = extract_order_status(data)
+        filled_shares, avg_price = self._matched_from_post(data, side)
+        filled = filled_shares > 0 or status in _FILLED_STATUSES
+        ok_flag = data.get("success")
+        posted_ok = (ok_flag is not False) and (bool(order_id) or filled or status in _OPEN_STATUSES)
+        if data.get("errorMsg"):
+            logger.warning(f"Live order response errorMsg: {data.get('errorMsg')}")
         return {
             "success": bool(posted_ok),
-            "filled": filled,
+            "filled": bool(filled and filled_shares > 0),
             "status": status or ("matched" if filled else "live"),
             "order_id": order_id,
-            "shares": filled_shares if filled_shares > 0 else float(size),
-            "response": resp if isinstance(resp, dict) else data,
+            "shares": round(filled_shares, 6),
+            "avg_price": avg_price,
+            "response": data,
+        }
+
+    def get_order_state(self, order_id: str) -> dict | None:
+        """Exchange view of one order: {status, size_matched, original_size, price}. None on error."""
+        try:
+            o = self.client.get_order(order_id)
+        except Exception as e:
+            logger.warning(f"get_order {order_id} failed: {e}")
+            return None
+        d = _as_dict(o)
+        if isinstance(o, dict):
+            d = {**d, **o}
+        if not d:
+            return None
+
+        def _f(*keys):
+            for k in keys:
+                if d.get(k) is not None:
+                    try:
+                        return float(d[k])
+                    except (TypeError, ValueError):
+                        pass
+            return None
+        return {
+            "status": extract_order_status(d),
+            "size_matched": _f("size_matched", "sizeMatched") or 0.0,
+            "original_size": _f("original_size", "originalSize", "size"),
+            "price": _f("price"),
         }
 
     def cancel_order(self, order_id: str) -> dict:
-        """Cancel an open resting limit order."""
+        """Cancel a resting order. Returns the raw response; {} on error (use cancel_and_confirm)."""
         try:
-            return self.client.cancel(order_id)
+            if hasattr(self.client, "cancel_order"):  # CLOB V2
+                payload_cls = getattr(self._types(), "OrderPayload", None)
+                if payload_cls is not None:
+                    return self.client.cancel_order(payload_cls(orderID=str(order_id))) or {}
+            return self.client.cancel(order_id) or {}
         except Exception as e:
             logger.error(f"Error cancelling order {order_id}: {e}")
             return {}
 
-    def get_collateral_balance(self) -> float:
-        """Fetch on-chain USDC/collateral balance from Polymarket CLOB."""
-        try:
-            from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
-            params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL, signature_type=self.signature_type)
-            resp = self.client.get_balance_allowance(params)
-            balance = float(resp.get("balance", 0.0))
-            if balance > 10000.0:
-                balance = balance / 1e6
-            return balance
-        except Exception as e:
-            logger.error(f"Error fetching balance: {e}")
-            return 0.0
+    def cancel_and_confirm(self, order_id: str) -> dict:
+        """Cancel, then read the order back. Returns {confirmed, size_matched, status}.
+        confirmed=True only when the exchange shows the order is no longer resting
+        (canceled / matched / filled); size_matched is what actually filled before the cancel."""
+        resp = self.cancel_order(order_id)
+        state = self.get_order_state(order_id)
+        if state is None:
+            canceled = order_id in ((resp or {}).get("canceled") or [])
+            return {"confirmed": False, "size_matched": 0.0, "status": "cancel_ack" if canceled else "unknown"}
+        status = state["status"]
+        terminal = status in _FILLED_STATUSES or status in _CANCELED_STATUSES
+        return {"confirmed": bool(terminal), "size_matched": float(state["size_matched"] or 0.0), "status": status}
 
+    def get_wallet_balance(self) -> float | None:
+        """USDC collateral balance of the funder wallet as seen by the CLOB. None on error (never 0.0)."""
+        try:
+            ct = self._types()
+            AssetType, BalanceAllowanceParams = ct.AssetType, ct.BalanceAllowanceParams
+            params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL, signature_type=self.signature_type)
+            resp = self.client.get_balance_allowance(params) or {}
+            raw = resp.get("balance")
+            if raw is None:
+                return None
+            return float(raw) / 1e6  # CLOB reports 6-decimal base units
+        except Exception as e:
+            logger.error(f"Error fetching wallet balance: {e}")
+            return None
+
+    def get_collateral_balance(self) -> float:
+        bal = self.get_wallet_balance()
+        return 0.0 if bal is None else bal

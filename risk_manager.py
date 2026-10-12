@@ -43,6 +43,16 @@ class RiskManager:
             if self.daily_pnl <= -config.DAILY_LOSS_LIMIT_USD:
                 return False, f"daily loss limit hit (-${abs(self.daily_pnl):.2f} <= -${config.DAILY_LOSS_LIMIT_USD:.2f})"
 
+            # Exposure-aware: today's realized PnL minus capital already at risk minus this trade's
+            # worst case must stay within the daily limit (a held 5-min position can lose its full cost).
+            worst = float(self.daily_pnl) - max(0.0, float(open_notional)) - float(config.BASE_STAKE_USD)
+            if worst < -config.DAILY_LOSS_LIMIT_USD - 1e-9:
+                return False, (
+                    f"daily loss limit (exposure-aware): ${float(self.daily_pnl):+.2f} realized, "
+                    f"${float(open_notional):.2f} open, ${config.BASE_STAKE_USD:.2f} new > "
+                    f"-${config.DAILY_LOSS_LIMIT_USD:.2f}"
+                )
+
             # Consecutive loss check (live only)
             if self.consecutive_losses >= config.MAX_CONSECUTIVE_LOSSES:
                 return False, f"hit {self.consecutive_losses} consecutive losses (max {config.MAX_CONSECUTIVE_LOSSES})"

@@ -13,3 +13,12 @@ import config
 def _entry_block_zone_off_by_default(monkeypatch):
     monkeypatch.setattr(config, "ENTRY_BLOCK_ENABLED", False, raising=False)
     yield
+
+
+@pytest.fixture(autouse=True)
+def _isolated_state_dir(monkeypatch, tmp_path):
+    """Bot side files (pending_settlements.json, redeem_queue.json, live_orphans.json, ...) go to a temp dir."""
+    d = tmp_path / "state"
+    d.mkdir()
+    monkeypatch.setattr(config, "STATE_DIR", d, raising=False)
+    yield

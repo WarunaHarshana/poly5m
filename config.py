@@ -51,15 +51,23 @@ ASSET = _asset_env if _asset_env in ASSETS else ASSETS[0]
 CHAINLINK_RTDS_URL = os.getenv("CHAINLINK_RTDS_URL", "wss://ws-live-data.polymarket.com").strip()
 CLOB_WS_URL = os.getenv("CLOB_WS_URL", "wss://ws-subscriptions-clob.polymarket.com/ws/market").strip()
 GAMMA_HOST = os.getenv("GAMMA_HOST", "https://gamma-api.polymarket.com").strip()
-CLOB_HOST = os.getenv("CLOB_HOST", "https://clob.polymarket.com").strip()
+CLOB_HOST = os.getenv("CLOB_HOST", os.getenv("POLYMARKET_CLOB_HOST", "https://clob.polymarket.com")).strip()
 HTTP_HOST = os.getenv("HTTP_HOST", "0.0.0.0").strip() or "0.0.0.0"
 HTTP_PORT = int(os.getenv("PORT") or os.getenv("HTTP_PORT") or "8080")
-CHAIN_ID = int(os.getenv("CHAIN_ID", "137"))  # Polygon PoS
+CHAIN_ID = int(os.getenv("CHAIN_ID", os.getenv("POLYMARKET_CHAIN_ID", "137")))  # Polygon PoS
 
 # --- Polymarket Authentication (for MODE=live) ---
 PRIVATE_KEY = os.getenv("PRIVATE_KEY", os.getenv("POLYMARKET_PRIVATE_KEY", "")).strip()
 FUNDER_ADDRESS = os.getenv("FUNDER_ADDRESS", os.getenv("POLYMARKET_FUNDER_ADDRESS", "")).strip()
-SIGNATURE_TYPE = int(os.getenv("SIGNATURE_TYPE", os.getenv("POLYMARKET_SIGNATURE_TYPE", "3")))  # 3 = Polymarket Proxy Wallet
+# Must be set explicitly for MODE=live: 0 = EOA, 1 = Polymarket proxy (email/Magic), 2 = Gnosis Safe,
+# 3 = POLY_1271 deposit wallet (CLOB V2; needs py-clob-client-v2 - the 1c bot's wallet uses 3).
+# No default and no silent fallback; the live client refuses to start without a valid value.
+_SIG_RAW = os.getenv("SIGNATURE_TYPE", os.getenv("POLYMARKET_SIGNATURE_TYPE", "")).strip()
+try:
+    SIGNATURE_TYPE = int(_SIG_RAW) if _SIG_RAW != "" else None
+except ValueError:
+    SIGNATURE_TYPE = None
+VALID_SIGNATURE_TYPES = (0, 1, 2, 3)
 
 # --- Strategy Selection ---
 STRATEGY = os.getenv("STRATEGY", "JEV_DYNAMIC").strip().upper()
@@ -266,9 +274,11 @@ MAKER_REBATE_SHARE = float(os.getenv("MAKER_REBATE_SHARE", "0.20"))
 STARTING_BANKROLL = float(os.getenv("STARTING_BANKROLL", "50.0"))
 BASE_STAKE_USD = float(os.getenv("BASE_STAKE_USD", "3.0"))
 MAX_STAKE_USD = float(os.getenv("MAX_STAKE_USD", "6.0"))
-DAILY_LOSS_LIMIT_USD = float(os.getenv("DAILY_LOSS_LIMIT_USD", "15.0"))
+DAILY_LOSS_LIMIT_USD = float(os.getenv("DAILY_LOSS_LIMIT_USD", os.getenv("MAX_DAILY_LOSS_USD", "15.0")))
 MAX_CONSECUTIVE_LOSSES = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "4"))
-MIN_ORDER_SHARES = float(os.getenv("MIN_ORDER_SHARES", "5.0"))
+MIN_ORDER_SHARES = float(os.getenv("MIN_ORDER_SHARES", os.getenv("POLYMARKET_MIN_SHARES", "5.0")))
+# Live: USDC kept untouched in the (possibly shared) wallet; bankroll = wallet balance - reserve.
+WALLET_RESERVE_USD = float(os.getenv("WALLET_RESERVE_USD", "0.0"))
 # Paper FOK must be fully fillable from the live book (no phantom size).
 PAPER_FOK_REQUIRE_SIZE = os.getenv("PAPER_FOK_REQUIRE_SIZE", "yes").strip().lower() in ("yes", "y", "true", "1")
 # Settle from Polymarket Gamma, not our local TWAP. Wait this long after the window.
@@ -280,6 +290,15 @@ RESOLUTION_MAX_WAIT_S = float(os.getenv("RESOLUTION_MAX_WAIT_S", "900.0"))
 RESOLUTION_POLL_INTERVAL_S = float(os.getenv("RESOLUTION_POLL_INTERVAL_S", "15.0"))
 # On startup, re-check trades.json rows recorded as "unresolved" and book their official PnL.
 BACKFILL_UNRESOLVED_ON_START = os.getenv("BACKFILL_UNRESOLVED_ON_START", "yes").strip().lower() in ("yes", "y", "true", "1")
+# --- live-mode safety (no effect in paper) ---
+# Poll the exchange for resting-order status (fills / partials) at most this often.
+LIVE_ORDER_POLL_S = float(os.getenv("LIVE_ORDER_POLL_S", "2.0"))
+# Live: sell a held position this many seconds before expiry when its bid is >= LIVE_PRE_EXPIRY_MIN_BID,
+# so winners are cashed on the CLOB instead of needing an on-chain redeem. Losers (low bid) settle at 0.
+LIVE_PRE_EXPIRY_EXIT_S = float(os.getenv("LIVE_PRE_EXPIRY_EXIT_S", "20.0"))
+LIVE_PRE_EXPIRY_MIN_BID = float(os.getenv("LIVE_PRE_EXPIRY_MIN_BID", "0.50"))
+# Live: refresh bankroll from the wallet's CLOB collateral balance this often (only while flat).
+LIVE_BANKROLL_REFRESH_S = float(os.getenv("LIVE_BANKROLL_REFRESH_S", "60.0"))
 # Cap how many coins can open new positions in a single 5-minute slot.
 # Increased to 3 for JEV_DYNAMIC mode to participate actively across coins.
 MAX_CONCURRENT_ENTRIES = int(os.getenv("MAX_CONCURRENT_ENTRIES", "1"))

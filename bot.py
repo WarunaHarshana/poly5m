@@ -149,6 +149,9 @@ class TWAPBot:
         self._slot_done: set[str] = set()  # slugs we already traded/exited this process
         self._pending_settles: list[dict] = []
         self._trades_log_path = config.STATE_DIR / "trades.json"
+        self._pending_path = config.STATE_DIR / "pending_settlements.json"
+        self._pending_settles = self._load_pending()
+        self._last_bankroll_refresh = 0.0
         for _slug in (self._load_slot_state().get("slot_done") or []):
             if _slug:
                 self._slot_done.add(str(_slug))
@@ -312,8 +315,13 @@ class TWAPBot:
         ghost = len(trades) - len(official)
         pnl = sum(float(t.get("pnl") or 0.0) for t in official if t.get("won") is not None)
         self.risk.bankroll = round(config.STARTING_BANKROLL + pnl, 2)
+        # daily_pnl = today's (UTC risk day) booked PnL only, not the all-time total
+        self.risk._check_day_rollover()
         self.risk.daily_pnl = round(
-            sum(float(t.get("pnl") or 0.0) for t in official if t.get("won") is not None),
+            sum(
+                float(t.get("pnl") or 0.0) for t in official
+                if t.get("won") is not None and _trade_day(t) == int(self.risk.day_timestamp)
+            ),
             2,
         )
         self.risk.save_state()
@@ -487,6 +495,7 @@ class TWAPBot:
             except Exception as e:
                 logger.error(f"Unresolved backfill failed: {e}")
         self._reconcile_paper_blotter()
+        self._refresh_live_bankroll(time.time(), force=True)
         if self._trades_log_path.exists():
             try:
                 all_trades = load_trades(self._trades_log_path)
@@ -547,12 +556,14 @@ class TWAPBot:
                 if active_slot_ts != current_window:
                     if active_slot_ts is not None:
                         for slot in self.slots.values():
+                            self._live_finalize_resting(slot, "window_rollover")
                             self._queue_settlement(slot)
                             slot.resting_order = None
                     active_slot_ts = current_window
                     await self._discover_slot(current_window, now)
 
                 await self._flush_pending_settlements(now)
+                self._refresh_live_bankroll(now)
 
                 for slot in self.slots.values():
                     await self._tick_asset(slot, now)
@@ -627,6 +638,7 @@ class TWAPBot:
 
             if remaining_s <= 0.0:
                 if slot.resting_order:
+                    self._live_finalize_resting(slot, "expiry")
                     slot.resting_order = None
                 if slot.position:
                     self._queue_settlement(slot)
@@ -1123,6 +1135,14 @@ class TWAPBot:
                 cur_ask = cur_ask or 1.0
                 elapsed_resting = time.time() - ro.get("placed_at", time.time())
                 is_clob_fill = (cur_ask <= ro["price"])
+                # Live: a fill is what the EXCHANGE reports (order status / size_matched), never book inference.
+                live_state = self._live_poll_order(ro, now) if config.MODE == "live" else None
+                live_matched = float((live_state or {}).get("size_matched") or ro.get("live_matched") or 0.0)
+                is_live_fill = bool(
+                    config.MODE == "live" and live_state is not None
+                    and (live_matched >= float(ro["shares"]) - 1e-6
+                         or (live_state.get("status") in ("matched", "filled") and live_matched > 0))
+                )
 
                 # Adverse price move: spot crossed strike against resting order
                 adverse_cross = (
@@ -1169,8 +1189,8 @@ class TWAPBot:
                         ro_drop, float(getattr(config, "MAKER_MAX_MID_DROP_60S", 0.15))
                     ):
                         guard_reason = maker_guard.REASON_MID_DROP
-                    elif is_paper_fill or (config.MODE == "live" and is_clob_fill):
-                        # Re-check the settlement-strike z before counting a fill.
+                    elif is_paper_fill:
+                        # Re-check the settlement-strike z before counting a (paper) fill.
                         ro_z_twap = z_twap_dyn
                         g_ok, g_reason, _, _ = maker_guard.check_quote(
                             ro_side, signed_z_dyn, ro_z_twap,
@@ -1199,7 +1219,7 @@ class TWAPBot:
                         slot, slot_key, guard_reason, stage="resting", side=ro_side, spot=spot,
                         z_spot=signed_z_dyn, z_twap=z_twap_dyn, mid=mid_now, mid_high=ro_hi,
                         mid_drop=ro_drop, elapsed_s=elapsed_s, bid=ro.get("price"),
-                        would_fill=bool(is_paper_fill or (config.MODE == "live" and is_clob_fill)),
+                        would_fill=bool(is_paper_fill or is_live_fill),
                     )
                 elif adverse_cross:
                     cancel = True
@@ -1208,15 +1228,29 @@ class TWAPBot:
                     cancel = True
                     cancel_reason = f"adverse_z_flip (z={signed_z_dyn:.2f})"
 
-                if cancel:
+                if ro.get("cancel_pending") and not is_live_fill:
+                    cancel = True
+                    cancel_reason = ro.get("cancel_reason") or cancel_reason
+                if is_live_fill:
+                    cancel = False  # the exchange already filled it: adopt, never forget
+                adopt_live = False
+                if cancel and config.MODE == "live":
+                    # cancel -> read back -> adopt any fill; unconfirmed cancels stay tracked and are retried
+                    outcome, ro_after = self._live_cancel_resting(tag, ro, cancel_reason, live_matched)
+                    slot.resting_order = ro_after
+                    if outcome == "adopt":
+                        ro = ro_after
+                        adopt_live = True
+                        cancel = False
+                if cancel and config.MODE == "live":
+                    pass  # "gone" (cleared) or "pending" (kept with cancel_pending, retried next tick)
+                elif cancel:
                     logger.info(f"[{tag}] JEV_DYNAMIC cancel resting @{ro['price']:.2f} ({cancel_reason})")
-                    if config.MODE == "live" and ro.get("order_id"):
-                        try:
-                            self.live_client.cancel_order(ro["order_id"])
-                        except Exception as e:
-                            logger.warning(f"[{tag}] Failed to cancel live order {ro['order_id']}: {e}")
                     slot.resting_order = None
-                elif is_paper_fill or (config.MODE == "live" and is_clob_fill):
+                elif is_paper_fill or is_live_fill or adopt_live:
+                    if is_live_fill and live_matched > 0 and abs(live_matched - float(ro["shares"])) > 1e-6:
+                        ro = {**ro, "shares": round(live_matched, 4),
+                              "cost_usd": round(live_matched * float(ro["price"]), 4)}
                     st_ts = _extract_slot_start_ts(market, ro.get("slot"))
                     now_fill = time.time()
                     el_s = max(0.0, min(300.0, round(now_fill - st_ts, 1))) if st_ts else None
@@ -2098,11 +2132,14 @@ class TWAPBot:
         if config.MODE == "live" and self.live_client:
             try:
                 resp = self.live_client.place_order(token_id, "BUY", signal.target_bid, shares, order_type="GTC")
-                order_id = resp.get("order_id") or resp.get("orderID") or order_id
-                logger.info(f"Live limit order placed: {resp}")
-                if not resp.get("success"):
-                    logger.warning(f"Live GTC post failed: {resp}")
+                live_id = resp.get("order_id") or resp.get("orderID")
+                if not resp.get("success") or not live_id:
+                    logger.warning(f"Live GTC post failed (no order id / not accepted): status={resp.get('status')} "
+                                   f"error={resp.get('error')}")
                     return
+                order_id = live_id
+                logger.info(f"Live limit order placed: id={order_id} status={resp.get('status')} "
+                            f"matched_now={resp.get('shares')}")
             except Exception as e:
                 logger.error(f"Live limit order placement failed: {e}")
                 return
@@ -2221,6 +2258,18 @@ class TWAPBot:
         # MAKER_HOLD_TO_EXPIRY: after the take-profit check, maker positions hold to settlement
         # (no trailing, price stop, adverse stop-loss / urgent / hard flatten, or failsafe flatten).
         if self._maker_hold_to_expiry(pos):
+            # Live: cash a likely winner on the CLOB shortly before expiry so it never needs an on-chain redeem.
+            if (
+                config.MODE == "live"
+                and remaining_s is not None and float(remaining_s) <= float(config.LIVE_PRE_EXPIRY_EXIT_S)
+                and best_bid is not None and float(best_bid) >= float(config.LIVE_PRE_EXPIRY_MIN_BID)
+            ):
+                logger.info(
+                    f"[{slot.asset.upper()}] LIVE pre-expiry exit: bid={float(best_bid):.3f} >= "
+                    f"{config.LIVE_PRE_EXPIRY_MIN_BID:.2f} with {float(remaining_s):.0f}s left (avoid redeem)"
+                )
+                await self._exit_position_early(slot, market, float(best_bid), reason="live_pre_expiry_exit")
+                return
             if not pos.get("hold_to_expiry_logged"):
                 pos["hold_to_expiry_logged"] = True
                 logger.info(
@@ -2629,14 +2678,18 @@ class TWAPBot:
         rebate = float(pos.get("rebate", 0.0))
         exit_price = float(exit_price)
 
-        # Cancel any resting maker orders on this slot to prevent orphan fills
+        # Cancel any resting maker orders on this slot to prevent orphan fills (live: confirm + report)
         if slot.resting_order:
             ro = slot.resting_order
             if config.MODE == "live" and self.live_client and ro.get("order_id"):
-                try:
-                    self.live_client.cancel_order(ro["order_id"])
-                except Exception as e:
-                    logger.error(f"Error cancelling resting order during early exit: {e}")
+                res = self.live_client.cancel_and_confirm(ro["order_id"])
+                if not res.get("confirmed") or float(res.get("size_matched") or 0.0) > 0:
+                    logger.error(
+                        f"[{slot.asset.upper()}] Resting order {ro['order_id']} during early exit: "
+                        f"cancel confirmed={res.get('confirmed')} matched={res.get('size_matched')} "
+                        f"status={res.get('status')} - CHECK WALLET (extra shares not managed)"
+                    )
+                    self._record_orphan(slot.asset, ro, res, "early_exit")
             slot.resting_order = None
 
         # Paper / live flatten of main
@@ -2654,6 +2707,8 @@ class TWAPBot:
                     return
 
                 filled_shares = float(resp.get("shares", 0.0))
+                if resp.get("avg_price"):
+                    exit_price = float(resp["avg_price"])
                 if not resp.get("filled") or filled_shares <= 0:
                     pos["exiting"] = False
                     logger.error(f"Live early exit SELL not filled ({reason}), retaining position for retry")
@@ -2819,6 +2874,167 @@ class TWAPBot:
         )
         self._save_trade_record(record)
 
+    # ------------------------------------------------------------------ live order helpers
+    def _live_poll_order(self, ro: dict, now: float) -> dict | None:
+        """Throttled exchange read of a resting order (status + size_matched). Live only."""
+        if config.MODE != "live" or not self.live_client or not ro.get("order_id"):
+            return None
+        last = float(ro.get("_last_poll") or 0.0)
+        if now - last < float(config.LIVE_ORDER_POLL_S) and ro.get("_last_state") is not None:
+            return ro["_last_state"]
+        state = self.live_client.get_order_state(ro["order_id"])
+        ro["_last_poll"] = now
+        if state is not None:
+            ro["_last_state"] = state
+            matched = float(state.get("size_matched") or 0.0)
+            if matched > float(ro.get("live_matched") or 0.0) + 1e-9:
+                logger.info(
+                    f"[{str(ro.get('asset') or '').upper()}] Live order {ro['order_id']} matched "
+                    f"{matched:.2f}/{float(ro['shares']):.2f} (status={state.get('status')})"
+                )
+            ro["live_matched"] = matched
+        return state
+
+    def _live_cancel_resting(self, tag: str, ro: dict, reason: str, known_matched: float = 0.0):
+        """Cancel a live resting order and read it back.
+        Returns (outcome, ro): "gone" (cancelled, nothing filled; ro None), "adopt" (some/all filled;
+        ro carries the matched shares), "pending" (cancel not confirmed; ro kept with cancel_pending)."""
+        if not self.live_client or not ro.get("order_id"):
+            return "gone", None
+        res = self.live_client.cancel_and_confirm(ro["order_id"])
+        matched = max(float(res.get("size_matched") or 0.0), float(known_matched or 0.0))
+        if not res.get("confirmed"):
+            tries = int(ro.get("cancel_tries") or 0) + 1
+            logger.warning(
+                f"[{tag}] Live cancel NOT confirmed for {ro['order_id']} ({reason}); status={res.get('status')} "
+                f"try {tries} - keeping order tracked and retrying"
+            )
+            return "pending", {**ro, "cancel_pending": True, "cancel_reason": reason, "cancel_tries": tries,
+                               "live_matched": matched}
+        if matched > 1e-9:
+            logger.warning(
+                f"[{tag}] Live order {ro['order_id']} filled {matched:.2f}/{float(ro['shares']):.2f} before cancel "
+                f"({reason}); adopting as position"
+            )
+            return "adopt", {**ro, "shares": round(matched, 4), "cost_usd": round(matched * float(ro["price"]), 4),
+                             "cancel_pending": False}
+        logger.info(f"[{tag}] JEV_DYNAMIC cancel resting @{ro['price']:.2f} ({reason}) - confirmed, 0 filled")
+        return "gone", None
+
+    def _live_finalize_resting(self, slot: CoinSlot, reason: str) -> None:
+        """Before forgetting a resting order at window end: live cancel + adopt any fill into slot.position."""
+        ro = slot.resting_order
+        if config.MODE != "live" or not ro or not ro.get("order_id"):
+            return
+        outcome, ro_after = "pending", ro
+        for _ in range(3):
+            outcome, ro_after = self._live_cancel_resting(
+                slot.asset.upper(), ro_after or ro, reason, float((ro_after or ro).get("live_matched") or 0.0)
+            )
+            if outcome != "pending":
+                break
+        if outcome == "adopt" and not slot.position:
+            slot.position = {
+                "asset": slot.asset, "slot": ro_after["slot"], "strategy": "JEV_DYNAMIC_MAKER",
+                "side": ro_after["side"], "token_id": ro_after["token_id"], "price": ro_after["price"],
+                "shares": ro_after["shares"], "cost_usd": ro_after["cost_usd"], "fee": 0.0,
+                "rebate": 0.0, "order_id": ro_after.get("order_id"), "entry_time": time.time(),
+                "entry_time_utc": datetime.now(timezone.utc).isoformat(), "strike": slot.strike,
+                "official": False, "adopted_at": reason,
+            }
+        elif outcome != "gone":
+            self._record_orphan(slot.asset, ro_after or ro, {"status": outcome}, reason)
+        slot.resting_order = None
+
+    def _record_redeem_needed(self, record: dict, pos: dict) -> None:
+        """Live winner held through settlement: tokens must be redeemed (claimed) on Polymarket."""
+        path = config.STATE_DIR / "redeem_queue.json"
+        try:
+            rows = json.loads(path.read_text()) if path.exists() else []
+        except Exception:
+            rows = []
+        rows.append({"ts": record.get("timestamp"), "slot": record.get("slot"), "side": record.get("side"),
+                     "token_id": pos.get("token_id"), "shares": record.get("shares"), "redeemed": False})
+        try:
+            path.write_text(json.dumps(rows, indent=2, default=_json_default))
+        except Exception as e:
+            logger.error(f"Failed to write redeem_queue.json: {e}")
+        logger.warning(
+            f"LIVE REDEEM NEEDED: {record.get('slot')} {record.get('side')} x{record.get('shares')} won at settlement; "
+            f"claim it on Polymarket (bot does not redeem on-chain). Logged to redeem_queue.json"
+        )
+
+    def _record_orphan(self, asset: str, ro: dict, res: dict, reason: str) -> None:
+        """Persist an order we could not reconcile so a human can check the wallet."""
+        path = config.STATE_DIR / "live_orphans.json"
+        try:
+            rows = json.loads(path.read_text()) if path.exists() else []
+        except Exception:
+            rows = []
+        rows.append({"ts": datetime.now(timezone.utc).isoformat(), "asset": asset, "reason": reason,
+                     "order_id": ro.get("order_id"), "slot": ro.get("slot"), "side": ro.get("side"),
+                     "price": ro.get("price"), "shares": ro.get("shares"), "result": res})
+        try:
+            path.write_text(json.dumps(rows, indent=2, default=str))
+        except Exception as e:
+            logger.error(f"Failed to write live_orphans.json: {e}")
+        logger.error(f"[{asset.upper()}] LIVE ORPHAN recorded ({reason}): order {ro.get('order_id')} - check wallet")
+
+    def _load_pending(self) -> list[dict]:
+        """Restore positions awaiting Polymarket resolution (survives redeploys)."""
+        path = getattr(self, "_pending_path", None)
+        if not path or not path.exists():
+            return []
+        try:
+            rows = json.loads(path.read_text())
+        except Exception as e:
+            logger.error(f"pending_settlements.json unreadable ({e}); starting with an empty queue")
+            return []
+        rows = [r for r in rows if isinstance(r, dict) and (r.get("market") or {}).get("slug")]
+        for r in rows:
+            r.pop("next_check", None)
+        if rows:
+            logger.warning(
+                f"Restored {len(rows)} pending settlement(s) from disk: "
+                + ", ".join(str((r.get('market') or {}).get('slug')) for r in rows)
+            )
+        return rows
+
+    def _save_pending(self) -> None:
+        path = getattr(self, "_pending_path", None)
+        if not path:
+            return
+        try:
+            tmp = path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(self._pending_settles, default=_json_default))
+            os.replace(tmp, path)
+        except Exception as e:
+            logger.error(f"Failed to persist pending settlements: {e}")
+
+    def _refresh_live_bankroll(self, now: float, force: bool = False) -> None:
+        """Live: bankroll = wallet USDC collateral (CLOB view). Only while flat unless forced."""
+        if config.MODE != "live" or not self.live_client:
+            return
+        if not force:
+            if now - self._last_bankroll_refresh < float(config.LIVE_BANKROLL_REFRESH_S):
+                return
+            if self._pending_settles or any(sl.position or sl.resting_order for sl in self.slots.values()):
+                return
+        self._last_bankroll_refresh = now
+        bal = self.live_client.get_wallet_balance()
+        if bal is None:
+            if force:
+                self.risk.bankroll = 0.0
+                self.risk.save_state()
+                logger.error("LIVE: wallet balance unreadable at startup - bankroll set to $0 (no new entries)")
+            else:
+                logger.warning("LIVE: wallet balance refresh failed; keeping last bankroll")
+            return
+        if abs(float(self.risk.bankroll) - bal) >= 0.01:
+            logger.info(f"LIVE bankroll from wallet: ${bal:.2f} (was ${float(self.risk.bankroll):.2f})")
+        self.risk.bankroll = round(max(0.0, bal - float(config.WALLET_RESERVE_USD)), 2)
+        self.risk.save_state()
+
     def _queue_settlement(self, slot: CoinSlot) -> None:
         """Hold a fill until Polymarket posts the official Up/Down result."""
         if not slot.position or not slot.market:
@@ -2833,6 +3049,7 @@ class TWAPBot:
             "end_ts": slot.market.get("end_ts"),
         }
         self._pending_settles.append(item)
+        self._save_pending()
         logger.info(
             f"[{slot.asset.upper()}] Queued for Polymarket resolution: {slot.market.get('slug')} "
             f"(do not book PnL yet)"
@@ -2887,7 +3104,15 @@ class TWAPBot:
                     f"({resolution.get('source')}): {resolution.get('side')} -> booking PnL now"
                 )
             self._settle_filled(item, resolution)
+        changed = [id(x) for x in still] != [id(x) for x in self._pending_settles] or any(
+            x.get("pending_warned") and not x.get("_persisted_warned") for x in still
+        )
         self._pending_settles = still
+        if changed:
+            for x in still:
+                if x.get("pending_warned"):
+                    x["_persisted_warned"] = True
+            self._save_pending()
 
     def _record_unresolved(self, item: dict) -> None:
         pos = item.get("position") or {}
@@ -3021,6 +3246,9 @@ class TWAPBot:
             **{k: pos.get(k) for k in ("strike_spot", "strike_twap", "strike_twap_source", "move_ref_mode", "move_ref_used")},
             "maker_features": pos.get("maker_features"),
         }
+        if config.MODE == "live" and won:
+            record["redeem_required"] = True
+            self._record_redeem_needed(record, pos)
         journal_write(
             "settlement",
             slot=market.get("slug"),
@@ -3160,6 +3388,26 @@ class TWAPBot:
                 json.dump(trades, f, indent=2)
         except Exception as e:
             logger.error(f"Failed to save trade record: {e}")
+
+
+def _trade_day(row: dict) -> int | None:
+    """UTC day index (epoch // 86400) of a trade's exit/settlement time."""
+    for key in ("exit_time_utc", "timestamp"):
+        raw = row.get(key)
+        if not raw:
+            continue
+        try:
+            return int(datetime.fromisoformat(str(raw).replace("Z", "+00:00")).timestamp() // 86400)
+        except Exception:
+            continue
+    return None
+
+
+def _json_default(o):
+    try:
+        return float(o)
+    except Exception:
+        return str(o)
 
 
 def main():
