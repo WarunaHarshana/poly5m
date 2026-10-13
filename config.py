@@ -129,6 +129,12 @@ MAKER_REQUIRE_TWAP = os.getenv("MAKER_REQUIRE_TWAP", "1").strip().lower() in ("y
 # token's mid has dropped >= MAKER_MAX_MID_DROP_60S from its high over the last MAKER_MID_WINDOW_S.
 MAKER_MAX_MID_DROP_60S = float(os.getenv("MAKER_MAX_MID_DROP_60S", "0.15"))
 MAKER_MID_WINDOW_S = float(os.getenv("MAKER_MID_WINDOW_S", "60"))
+# Pre-post falling-mid gate (default OFF = live behaviour unchanged). Before posting a NEW maker bid:
+# block if the favoured mid is >= MAKER_POST_MAX_MID_DROP below its MAKER_MID_WINDOW_S high (0 = off),
+# or if its range over the last MAKER_POST_STABLE_S seconds exceeds MAKER_POST_STABLE_MAX_RANGE (0 = off).
+MAKER_POST_MAX_MID_DROP = float(os.getenv("MAKER_POST_MAX_MID_DROP", "0"))
+MAKER_POST_STABLE_S = float(os.getenv("MAKER_POST_STABLE_S", "3"))
+MAKER_POST_STABLE_MAX_RANGE = float(os.getenv("MAKER_POST_STABLE_MAX_RANGE", "0"))
 DYNAMIC_MAX_ELAPSED_S = float(os.getenv("DYNAMIC_MAX_ELAPSED_S", "240.0"))
 
 # --- AVN-MAS Take-Profit & Adverse Stop-Loss Parameters ---

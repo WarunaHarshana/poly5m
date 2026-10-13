@@ -935,6 +935,15 @@ class TWAPBot:
                             mk_drop, float(getattr(config, "MAKER_MAX_MID_DROP_60S", 0.15))
                         ):
                             mk_ok, mk_reason = False, maker_guard.REASON_MID_DROP
+                        if mk_ok and maker_guard.post_falling_mid_blocked(
+                            mk_drop,
+                            self._mid_hist.range_over(
+                                fav_token, now, float(getattr(config, "MAKER_POST_STABLE_S", 3.0)), mid_px
+                            ),
+                            float(getattr(config, "MAKER_POST_MAX_MID_DROP", 0.0)),
+                            float(getattr(config, "MAKER_POST_STABLE_MAX_RANGE", 0.0)),
+                        ):
+                            mk_ok, mk_reason = False, maker_guard.REASON_POST_FALLING_MID
                         if not mk_ok:
                             is_maker_candidate = False
                             self._log_maker_block(

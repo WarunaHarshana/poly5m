@@ -21,6 +21,7 @@ from typing import Any
 REASON_TWAP_SIGMA = "twap_sigma"
 REASON_DIRECTION_CONFLICT = "direction_conflict"
 REASON_MID_DROP = "mid_drop"
+REASON_POST_FALLING_MID = "post_falling_mid"
 REASON_TWAP_CROSS = "twap_cross"
 REASON_NO_TWAP_STRIKE = "no_twap_strike"
 
@@ -117,6 +118,16 @@ class MidHistory:
         vals = [m for ts, m in dq if ts >= cutoff]
         return max(vals) if vals else None
 
+    def range_over(self, token: str | None, now: float, lookback_s: float, mid: float | None = None) -> float | None:
+        """max-min of mids within the last lookback_s (plus current mid). None if no history in that span."""
+        dq = self._h.get(token or "")
+        cutoff = float(now) - float(lookback_s)
+        vals = [m for ts, m in (dq or ()) if ts >= cutoff]
+        m = _finite(mid)
+        if m is not None:
+            vals.append(m)
+        return (max(vals) - min(vals)) if len(vals) >= 2 else None
+
     def drop(self, token: str | None, now: float, mid: float | None) -> tuple[float | None, float | None]:
         """Return (window_high, drop_from_high); (None, None) when there is no history."""
         hi = self.high(token, now)
@@ -134,3 +145,23 @@ def mid_drop_blocked(drop: float | None, max_drop: float) -> bool:
     if d is None or float(max_drop) <= 0:
         return False
     return d >= float(max_drop) - 1e-9
+
+
+def post_falling_mid_blocked(
+    drop: float | None,
+    recent_range: float | None,
+    max_drop: float,
+    stable_max_range: float,
+) -> bool:
+    """Pre-post gate (option 1): don't post a maker bid into a falling/unstable mid.
+    max_drop <= 0 disables the drop check; stable_max_range <= 0 disables the stability check.
+    Missing data does not block (fail-open, matching mid_drop_blocked)."""
+    if float(max_drop) > 0:
+        d = _finite(drop)
+        if d is not None and d >= float(max_drop) - 1e-9:
+            return True
+    if float(stable_max_range) > 0:
+        r = _finite(recent_range)
+        if r is not None and r > float(stable_max_range) + 1e-9:
+            return True
+    return False
