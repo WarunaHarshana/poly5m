@@ -1309,6 +1309,7 @@ class TWAPBot:
                         "maker_fill",
                         asset=asset,
                         slot=ro.get("slot"),
+                        order_id=ro.get("order_id"),
                         side=ro["side"],
                         price=ro["price"],
                         shares=ro["shares"],
@@ -2107,6 +2108,19 @@ class TWAPBot:
             **self._strike_meta(slot),
         }
 
+    def _log_maker_post_shadow(self, slot, market, side, token_id, bid, shares, order_id) -> None:
+        """Shadow-only pre-post gate log (MAKER_POST_GATE_SHADOW). Never raises, never blocks."""
+        if not bool(getattr(config, "MAKER_POST_GATE_SHADOW", False)):
+            return
+        try:
+            rec = maker_guard.post_shadow_record(self._mid_hist, token_id, time.time())
+            journal_write(
+                "maker_post_shadow", slot=market.get("slug"), asset=slot.asset, side=side, bid=bid,
+                shares=shares, order_id=order_id, mode=config.MODE, **rec,
+            )
+        except Exception as e:
+            logger.warning(f"[{slot.asset.upper()}] maker_post_shadow log failed: {e}")
+
     async def _place_maker_bid(
         self,
         slot: CoinSlot,
@@ -2161,6 +2175,7 @@ class TWAPBot:
                 logger.error(f"Live limit order placement failed: {e}")
                 return
 
+        self._log_maker_post_shadow(slot, market, signal.side, token_id, signal.target_bid, shares, order_id)
         slot.resting_order = {
             "asset": slot.asset,
             "slot": market["slug"],
@@ -2866,6 +2881,7 @@ class TWAPBot:
             "settlement",
             slot=record.get("slot"),
             asset=slot.asset,
+            order_id=record.get("order_id"),
             strategy=record.get("strategy"),
             side=record.get("side"),
             outcome=f"EARLY_EXIT_{reason}",
@@ -3271,6 +3287,7 @@ class TWAPBot:
             slot=market.get("slug"),
             asset=asset,
             strategy=strategy_name,
+            order_id=pos.get("order_id"),
             side=pos.get("side"),
             outcome=resolved_side,
             won=won,

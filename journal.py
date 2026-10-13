@@ -21,6 +21,8 @@ _STDOUT_EVENTS = {
     "round_end",
     "strike",
     "risk_block",
+    "maker_post_shadow",
+    "maker_fill",
 }
 
 

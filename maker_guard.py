@@ -118,6 +118,10 @@ class MidHistory:
         vals = [m for ts, m in dq if ts >= cutoff]
         return max(vals) if vals else None
 
+    def latest(self, token: str | None) -> float | None:
+        dq = self._h.get(token or "")
+        return dq[-1][1] if dq else None
+
     def range_over(self, token: str | None, now: float, lookback_s: float, mid: float | None = None) -> float | None:
         """max-min of mids within the last lookback_s (plus current mid). None if no history in that span."""
         dq = self._h.get(token or "")
@@ -165,3 +169,26 @@ def post_falling_mid_blocked(
         if r is not None and r > float(stable_max_range) + 1e-9:
             return True
     return False
+
+
+SHADOW_DROP_THRESHOLDS = (0.03, 0.05, 0.08)
+SHADOW_STABLE_MAX_RANGE = 0.02
+
+
+def post_shadow_record(hist: "MidHistory", token: str | None, now: float, mid: float | None = None) -> dict:
+    """Shadow evaluation of the pre-post gate. Pure; never blocks anything."""
+    m = _finite(mid)
+    if m is None:
+        m = hist.latest(token)
+    hi, drop = hist.drop(token, now, m)
+    r3 = hist.range_over(token, now, 3.0, m)
+    r5 = hist.range_over(token, now, 5.0, m)
+    rd = lambda v: round(v, 4) if v is not None else None
+    wb = {
+        "stable3s_gt_0.02": bool(r3 is not None and r3 > SHADOW_STABLE_MAX_RANGE + 1e-9),
+        "stable5s_gt_0.02": bool(r5 is not None and r5 > SHADOW_STABLE_MAX_RANGE + 1e-9),
+    }
+    for th in SHADOW_DROP_THRESHOLDS:
+        wb[f"drop_ge_{th:.2f}"] = bool(drop is not None and drop >= th - 1e-9)
+    return {"mid": rd(m), "mid_60s_high": rd(hi), "drop": rd(drop), "range_3s": rd(r3), "range_5s": rd(r5),
+            "would_block": wb}

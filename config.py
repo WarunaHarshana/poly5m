@@ -135,6 +135,8 @@ MAKER_MID_WINDOW_S = float(os.getenv("MAKER_MID_WINDOW_S", "60"))
 MAKER_POST_MAX_MID_DROP = float(os.getenv("MAKER_POST_MAX_MID_DROP", "0"))
 MAKER_POST_STABLE_S = float(os.getenv("MAKER_POST_STABLE_S", "3"))
 MAKER_POST_STABLE_MAX_RANGE = float(os.getenv("MAKER_POST_STABLE_MAX_RANGE", "0"))
+# Shadow-only logging of the pre-post gate (never blocks): journal event maker_post_shadow on each maker bid post.
+MAKER_POST_GATE_SHADOW = os.getenv("MAKER_POST_GATE_SHADOW", "0").strip().lower() in ("yes", "y", "true", "1", "on")
 DYNAMIC_MAX_ELAPSED_S = float(os.getenv("DYNAMIC_MAX_ELAPSED_S", "240.0"))
 
 # --- AVN-MAS Take-Profit & Adverse Stop-Loss Parameters ---
