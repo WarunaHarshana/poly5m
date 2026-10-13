@@ -31,7 +31,7 @@ from polymarket_client import (
     extract_best_bid_ask,
     extract_market_top,
 )
-from risk_manager import RiskManager
+from risk_manager import RiskManager, cap_order_shares
 from journal import configure as journal_configure
 from journal import write as journal_write
 from http_api import StatusServer, is_official_trade, load_trades
@@ -1969,6 +1969,10 @@ class TWAPBot:
             logger.warning(f"[{slot.asset.upper()}] Stake ${stake_usd:.2f} below allowed minimum (${min_allowed_stake:.2f}); skip")
             return
         shares = max(config.MIN_ORDER_SHARES, round(stake_usd / ask, 2))
+        shares = cap_order_shares(shares, ask)
+        if shares is None:
+            logger.warning(f"[{slot.asset.upper()}] {config.MIN_ORDER_SHARES:.0f} sh @ {ask:.3f} exceeds MAX_TRADE_USD ${config.MAX_TRADE_USD:.2f}; skip")
+            return
         cost_usd = round(shares * ask, 2)
         fee_usd = round(signal.fee_taker * shares, 4)
         is_paper = config.MODE != "live"
@@ -2117,6 +2121,10 @@ class TWAPBot:
             logger.warning(f"[{slot.asset.upper()}] Stake ${stake_usd:.2f} below allowed minimum (${min_allowed_stake:.2f}); skip maker")
             return
         shares = max(config.MIN_ORDER_SHARES, round(stake_usd / signal.target_bid, 2))
+        shares = cap_order_shares(shares, signal.target_bid)
+        if shares is None:
+            logger.warning(f"[{slot.asset.upper()}] {config.MIN_ORDER_SHARES:.0f} sh @ {signal.target_bid:.3f} exceeds MAX_TRADE_USD ${config.MAX_TRADE_USD:.2f}; skip maker")
+            return
         cost_usd = round(shares * signal.target_bid, 2)
         total_rebate = round(signal.maker_rebate * shares, 4)
 

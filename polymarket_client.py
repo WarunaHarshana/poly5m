@@ -490,6 +490,11 @@ class PolymarketLiveClient:
     def place_order(self, token_id: str, side: str, price: float, size: float, order_type: str = "GTC") -> dict:
         """Place an order via CLOB API. Post success != fill: 'shares' is the MATCHED size only (0 if none).
         No signature-type fallback: a signing error is returned as a failure."""
+        cap = float(getattr(config, "MAX_TRADE_USD", 0.0) or 0.0)
+        if cap > 0 and side.upper() == "BUY" and round(price, 2) * round(size, 2) > cap + 1e-9:
+            logger.error(f"BUY blocked: {size:.2f} sh @ {price:.2f} exceeds MAX_TRADE_USD ${cap:.2f}")
+            return {"success": False, "filled": False, "error": "exceeds MAX_TRADE_USD", "order_id": None,
+                    "status": "", "shares": 0.0, "avg_price": None, "response": None}
         ct = self._types()
         OrderArgs, OrderType = ct.OrderArgs, ct.OrderType
         order_args = OrderArgs(token_id=token_id, price=round(price, 2), size=round(size, 2), side=side.upper())
@@ -575,6 +580,16 @@ class PolymarketLiveClient:
             return {"confirmed": False, "size_matched": 0.0, "status": "cancel_ack" if canceled else "unknown"}
         status = state["status"]
         terminal = status in _FILLED_STATUSES or status in _CANCELED_STATUSES
+        # Exchange read-back can lag the cancel ack by ~1s (observed live): re-poll briefly.
+        tries = int(getattr(config, "CANCEL_CONFIRM_RETRIES", 6))
+        while not terminal and tries > 0:
+            tries -= 1
+            time.sleep(float(getattr(config, "CANCEL_CONFIRM_POLL_S", 0.5)))
+            s2 = self.get_order_state(order_id)
+            if s2 is None:
+                continue
+            state, status = s2, s2["status"]
+            terminal = status in _FILLED_STATUSES or status in _CANCELED_STATUSES
         return {"confirmed": bool(terminal), "size_matched": float(state["size_matched"] or 0.0), "status": status}
 
     def get_wallet_balance(self) -> float | None:

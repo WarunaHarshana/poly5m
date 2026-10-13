@@ -135,3 +135,20 @@ class RiskManager:
             except Exception as e:
                 logger.error(f"Failed to load risk state: {e}")
 
+
+
+def cap_order_shares(shares: float, price: float) -> float | None:
+    """Apply MAX_TRADE_USD: returns shares (possibly reduced, floored to whole shares) or None to skip.
+    Never returns a size whose cost exceeds the cap or that is below MIN_ORDER_SHARES."""
+    cap = float(getattr(config, "MAX_TRADE_USD", 0.0) or 0.0)
+    if cap <= 0 or not price or price <= 0:
+        return shares
+    min_sh = float(config.MIN_ORDER_SHARES)
+    if min_sh * float(price) > cap + 1e-9:
+        return None
+    if float(shares) * float(price) > cap + 1e-9:
+        import math
+        shares = float(math.floor(cap / float(price) + 1e-9))
+        if shares < min_sh or shares * float(price) > cap + 1e-9:
+            return None
+    return shares

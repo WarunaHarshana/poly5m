@@ -279,6 +279,10 @@ MAX_CONSECUTIVE_LOSSES = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "4"))
 MIN_ORDER_SHARES = float(os.getenv("MIN_ORDER_SHARES", os.getenv("POLYMARKET_MIN_SHARES", "5.0")))
 # Live: USDC kept untouched in the (possibly shared) wallet; bankroll = wallet balance - reserve.
 WALLET_RESERVE_USD = float(os.getenv("WALLET_RESERVE_USD", "0.0"))
+# Hard per-order USD cap for BUYs (0 = disabled). If MIN_ORDER_SHARES x price exceeds it, the trade is skipped.
+CANCEL_CONFIRM_RETRIES = int(os.getenv("CANCEL_CONFIRM_RETRIES", "6"))
+CANCEL_CONFIRM_POLL_S = float(os.getenv("CANCEL_CONFIRM_POLL_S", "0.5"))
+MAX_TRADE_USD = float(os.getenv("MAX_TRADE_USD", "0.0"))
 # Paper FOK must be fully fillable from the live book (no phantom size).
 PAPER_FOK_REQUIRE_SIZE = os.getenv("PAPER_FOK_REQUIRE_SIZE", "yes").strip().lower() in ("yes", "y", "true", "1")
 # Settle from Polymarket Gamma, not our local TWAP. Wait this long after the window.
