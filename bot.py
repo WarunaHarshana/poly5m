@@ -366,10 +366,10 @@ class TWAPBot:
         return total
 
     def _slot_entries_count(self) -> int:
-        """Count how many coins already have open positions in this window."""
+        """Count coins with an open position OR a resting maker bid (both can fill on the same move)."""
         count = 0
         for slot in self.slots.values():
-            if slot.position:
+            if slot.position or getattr(slot, "resting_order", None):
                 count += 1
         return count
 
