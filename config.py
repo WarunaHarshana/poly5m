@@ -106,6 +106,9 @@ ENTRY_BLOCK_ENABLED = os.getenv("ENTRY_BLOCK_ENABLED", "1").strip().lower() in (
 # 2026-10-15: live default 70-300s (block all entries from 70s). Roll back: ENTRY_BLOCK_ELAPSED_LO=120 ENTRY_BLOCK_ELAPSED_HI=180, or git tag pre-70s-cutoff.
 ENTRY_BLOCK_ELAPSED_LO = float(os.getenv("ENTRY_BLOCK_ELAPSED_LO", "70"))
 ENTRY_BLOCK_ELAPSED_HI = float(os.getenv("ENTRY_BLOCK_ELAPSED_HI", "300"))
+# 2026-10-15: no entry block during these UTC windows (18:30-00:30 UTC = 00:00-06:00 SLT, where late fills did better).
+# Comma-separated HH:MM-HH:MM in UTC; wraps past midnight. Roll back (block all day): ENTRY_BLOCK_OFF_UTC=""
+ENTRY_BLOCK_OFF_UTC = os.getenv("ENTRY_BLOCK_OFF_UTC", "18:30-00:30").strip()
 ENTRY_BLOCK_LEGS = tuple(
     x.strip().lower() for x in os.getenv("ENTRY_BLOCK_LEGS", "momentum,maker").split(",") if x.strip()
 )

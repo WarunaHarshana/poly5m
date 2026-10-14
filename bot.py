@@ -97,6 +97,25 @@ def _format_window_time(elapsed_s: float | None) -> str | None:
 
 
 @dataclass
+
+def _in_utc_windows(spec: str, ts: float) -> bool:
+    """True if UTC time-of-day of ts falls in any 'HH:MM-HH:MM' window in spec (windows may wrap midnight)."""
+    if not spec:
+        return False
+    g = time.gmtime(ts)
+    m = g.tm_hour * 60 + g.tm_min
+    for part in spec.split(","):
+        part = part.strip()
+        if "-" not in part:
+            continue
+        try:
+            a, b = (int(x.split(":")[0]) * 60 + int(x.split(":")[1]) for x in part.split("-", 1))
+        except (ValueError, IndexError):
+            continue
+        if (a <= m < b) if a < b else (m >= a or m < b):
+            return True
+    return False
+
 class CoinSlot:
     """Per-coin state for one 5-minute window."""
 
@@ -1813,6 +1832,8 @@ class TWAPBot:
         hi = float(getattr(config, "ENTRY_BLOCK_ELAPSED_HI", 180.0))
         legs = tuple(getattr(config, "ENTRY_BLOCK_LEGS", ("momentum", "maker")))
         if hi <= lo or leg not in legs or elapsed_s is None:
+            return False
+        if _in_utc_windows(getattr(config, "ENTRY_BLOCK_OFF_UTC", ""), time.time()):
             return False
         try:
             e = float(elapsed_s)
