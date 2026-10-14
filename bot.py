@@ -96,7 +96,6 @@ def _format_window_time(elapsed_s: float | None) -> str | None:
     return f"t={int(el)}s ({m:02d}:{s:02d})"
 
 
-@dataclass
 
 def _in_utc_windows(spec: str, ts: float) -> bool:
     """True if UTC time-of-day of ts falls in any 'HH:MM-HH:MM' window in spec (windows may wrap midnight)."""
@@ -115,6 +114,9 @@ def _in_utc_windows(spec: str, ts: float) -> bool:
         if (a <= m < b) if a < b else (m >= a or m < b):
             return True
     return False
+
+
+@dataclass
 
 class CoinSlot:
     """Per-coin state for one 5-minute window."""
