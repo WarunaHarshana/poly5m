@@ -103,8 +103,9 @@ DYNAMIC_MOMENTUM_MIN_ELAPSED_S = float(os.getenv("DYNAMIC_MOMENTUM_MIN_ELAPSED_S
 # are cancelled when the slot enters the zone. /trades (120): 120-180s lost on both legs
 # (maker 13 tr -8.26, momentum 22 tr -11.92). Disable: ENTRY_BLOCK_ENABLED=0 or ENTRY_BLOCK_ELAPSED_HI=0.
 ENTRY_BLOCK_ENABLED = os.getenv("ENTRY_BLOCK_ENABLED", "1").strip().lower() in ("yes", "y", "true", "1", "on")
-ENTRY_BLOCK_ELAPSED_LO = float(os.getenv("ENTRY_BLOCK_ELAPSED_LO", "120"))
-ENTRY_BLOCK_ELAPSED_HI = float(os.getenv("ENTRY_BLOCK_ELAPSED_HI", "180"))
+# 2026-10-15: live default 70-300s (block all entries from 70s). Roll back: ENTRY_BLOCK_ELAPSED_LO=120 ENTRY_BLOCK_ELAPSED_HI=180, or git tag pre-70s-cutoff.
+ENTRY_BLOCK_ELAPSED_LO = float(os.getenv("ENTRY_BLOCK_ELAPSED_LO", "70"))
+ENTRY_BLOCK_ELAPSED_HI = float(os.getenv("ENTRY_BLOCK_ELAPSED_HI", "300"))
 ENTRY_BLOCK_LEGS = tuple(
     x.strip().lower() for x in os.getenv("ENTRY_BLOCK_LEGS", "momentum,maker").split(",") if x.strip()
 )
@@ -136,7 +137,7 @@ MAKER_POST_MAX_MID_DROP = float(os.getenv("MAKER_POST_MAX_MID_DROP", "0"))
 MAKER_POST_STABLE_S = float(os.getenv("MAKER_POST_STABLE_S", "3"))
 MAKER_POST_STABLE_MAX_RANGE = float(os.getenv("MAKER_POST_STABLE_MAX_RANGE", "0"))
 # Shadow-only logging of the pre-post gate (never blocks): journal event maker_post_shadow on each maker bid post.
-MAKER_POST_GATE_SHADOW = os.getenv("MAKER_POST_GATE_SHADOW", "0").strip().lower() in ("yes", "y", "true", "1", "on")
+MAKER_POST_GATE_SHADOW = os.getenv("MAKER_POST_GATE_SHADOW", "1").strip().lower() in ("yes", "y", "true", "1", "on")
 DYNAMIC_MAX_ELAPSED_S = float(os.getenv("DYNAMIC_MAX_ELAPSED_S", "240.0"))
 
 # --- AVN-MAS Take-Profit & Adverse Stop-Loss Parameters ---
@@ -281,16 +282,16 @@ MAKER_REBATE_SHARE = float(os.getenv("MAKER_REBATE_SHARE", "0.20"))
 # --- Risk & Sizing Parameters ---
 STARTING_BANKROLL = float(os.getenv("STARTING_BANKROLL", "50.0"))
 BASE_STAKE_USD = float(os.getenv("BASE_STAKE_USD", "3.0"))
-MAX_STAKE_USD = float(os.getenv("MAX_STAKE_USD", "6.0"))
-DAILY_LOSS_LIMIT_USD = float(os.getenv("DAILY_LOSS_LIMIT_USD", os.getenv("MAX_DAILY_LOSS_USD", "15.0")))
-MAX_CONSECUTIVE_LOSSES = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "4"))
+MAX_STAKE_USD = float(os.getenv("MAX_STAKE_USD", "3.0"))
+DAILY_LOSS_LIMIT_USD = float(os.getenv("DAILY_LOSS_LIMIT_USD", os.getenv("MAX_DAILY_LOSS_USD", "1000.0")))
+MAX_CONSECUTIVE_LOSSES = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "1000"))
 MIN_ORDER_SHARES = float(os.getenv("MIN_ORDER_SHARES", os.getenv("POLYMARKET_MIN_SHARES", "5.0")))
 # Live: USDC kept untouched in the (possibly shared) wallet; bankroll = wallet balance - reserve.
-WALLET_RESERVE_USD = float(os.getenv("WALLET_RESERVE_USD", "0.0"))
+WALLET_RESERVE_USD = float(os.getenv("WALLET_RESERVE_USD", "12.8"))
 # Hard per-order USD cap for BUYs (0 = disabled). If MIN_ORDER_SHARES x price exceeds it, the trade is skipped.
 CANCEL_CONFIRM_RETRIES = int(os.getenv("CANCEL_CONFIRM_RETRIES", "6"))
 CANCEL_CONFIRM_POLL_S = float(os.getenv("CANCEL_CONFIRM_POLL_S", "0.5"))
-MAX_TRADE_USD = float(os.getenv("MAX_TRADE_USD", "0.0"))
+MAX_TRADE_USD = float(os.getenv("MAX_TRADE_USD", "3.0"))
 # Paper FOK must be fully fillable from the live book (no phantom size).
 PAPER_FOK_REQUIRE_SIZE = os.getenv("PAPER_FOK_REQUIRE_SIZE", "yes").strip().lower() in ("yes", "y", "true", "1")
 # Settle from Polymarket Gamma, not our local TWAP. Wait this long after the window.
@@ -308,7 +309,7 @@ LIVE_ORDER_POLL_S = float(os.getenv("LIVE_ORDER_POLL_S", "2.0"))
 # Live: sell a held position this many seconds before expiry when its bid is >= LIVE_PRE_EXPIRY_MIN_BID,
 # so winners are cashed on the CLOB instead of needing an on-chain redeem. Losers (low bid) settle at 0.
 LIVE_PRE_EXPIRY_EXIT_S = float(os.getenv("LIVE_PRE_EXPIRY_EXIT_S", "20.0"))
-LIVE_PRE_EXPIRY_MIN_BID = float(os.getenv("LIVE_PRE_EXPIRY_MIN_BID", "0.50"))
+LIVE_PRE_EXPIRY_MIN_BID = float(os.getenv("LIVE_PRE_EXPIRY_MIN_BID", "0.90"))
 # Live: refresh bankroll from the wallet's CLOB collateral balance this often (only while flat).
 LIVE_BANKROLL_REFRESH_S = float(os.getenv("LIVE_BANKROLL_REFRESH_S", "60.0"))
 # Cap how many coins can open new positions in a single 5-minute slot.
