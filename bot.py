@@ -647,6 +647,7 @@ class TWAPBot:
         # open positions with real capital at risk MUST be managed every second.
         # ---------------------------------------------------------------------
         if slot.position:
+            self._log_post_fill_tick(slot, now)
             spot_pos = self.cl_stream.price(asset)
             strike_pos = slot.strike or (float(slot.position["strike"]) if slot.position.get("strike") else None)
             twap_pos = None
@@ -813,7 +814,6 @@ class TWAPBot:
             if mid_px is not None:
                 self._mid_hist.add(fav_token, now, mid_px)
                 self._mid_hist.add(opp_token, now, 1.0 - mid_px)
-            self._log_post_fill_tick(slot, now, fav_token, q_bid, q_ask)
             z_twap_dyn = None
             if maker_guard_on and slot.strike_twap:
                 try:
@@ -2162,7 +2162,7 @@ class TWAPBot:
             journal_write(
                 "maker_rest_tick", order_id=oid, asset=slot.asset, slot=ro.get("slot"), side=ro.get("side"),
                 bid_price=px, elapsed_s=(round(float(elapsed_s), 1) if elapsed_s is not None else None),
-                resting_s=round(now - float(ro.get("placed_at", now)), 1),
+                resting_s=round(max(0.0, now - float(ro.get("placed_at", now))), 1),
                 mid=(round(mid, 4) if mid is not None else None), best_bid=bid, best_ask=ask,
                 best_bid_size=bsz, best_bid_is_our_price=at_px, size_at_our_price=(bsz if at_px else None),
                 drop_60s=(round(drop, 4) if drop is not None else None),
@@ -2177,8 +2177,9 @@ class TWAPBot:
         except Exception as e:
             logger.warning(f"post_fill start failed: {e}")
 
-    def _log_post_fill_tick(self, slot, now, fav_token, q_bid, q_ask) -> None:
-        """maker_post_fill at +5/+15/+30/+60s (first tick at/after each). LOG-ONLY, never raises."""
+    def _log_post_fill_tick(self, slot, now) -> None:
+        """maker_post_fill at +5/+15/+30/+60s (first tick at/after each). LOG-ONLY, never raises.
+        Reads only the in-memory book stream cache (no API calls)."""
         try:
             if not bool(getattr(config, "MAKER_POST_FILL_TRACE", True)):
                 return
@@ -2192,15 +2193,13 @@ class TWAPBot:
             if not due:
                 return
             tok = pos.get("token_id")
-            mid = self._mid_hist.latest(tok)
-            bid = None
-            if tok and tok == fav_token:
-                bid = q_bid
-            elif q_ask is not None:
-                bid = round(1.0 - float(q_ask), 4)
+            top = self.book_stream.get_top(tok, opp_token_id=pos.get("opp_token_id")) if tok else None
+            bid = (top or {}).get("bid")
+            ask = (top or {}).get("ask")
+            mid = 0.5 * (float(bid) + float(ask)) if (bid is not None and ask is not None) else None
             for off in due:
                 journal_write("maker_post_fill", asset=slot.asset, slot=pos.get("slot"), side=pos.get("side"),
-                              **self._post_fill.record(oid, off, now, mid, bid))
+                              best_ask=ask, **self._post_fill.record(oid, off, now, mid, bid))
         except Exception as e:
             logger.warning(f"maker_post_fill log failed: {e}")
 

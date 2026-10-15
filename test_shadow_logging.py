@@ -92,16 +92,27 @@ class TestBotHooks(unittest.IsolatedAsyncioTestCase):
             self.bot._log_rest_tick(self.slot, {"order_id": "o3", "price": 0.5}, 300.0, 1, 0.5, 0.5, 0.5, None, None)
 
     def test_post_fill_events(self):
-        self.slot.position = {"order_id": "o9", "token_id": "tok_up", "slot": "s", "side": "UP"}
+        self.slot.position = {"order_id": "o9", "token_id": "tok_up", "opp_token_id": "tok_down", "slot": "s", "side": "UP"}
         self.bot._start_post_fill({"order_id": "o9", "price": 0.5}, 1000.0, 0.5, 0.5)
-        self.bot._mid_hist.add("tok_up", 1006.0, 0.6)
-        with mock.patch("bot.journal_write") as jw:
-            self.bot._log_post_fill_tick(self.slot, 1006.0, "tok_up", 0.59, 0.61)
-            self.bot._log_post_fill_tick(self.slot, 1007.0, "tok_up", 0.59, 0.61)
-            self.bot._log_post_fill_tick(self.slot, 1007.0, "tok_down", 0.39, 0.41)
+        with mock.patch.object(self.bot.book_stream, "get_top", return_value={"bid": 0.59, "ask": 0.61}) as gt, \
+                mock.patch("bot.journal_write") as jw:
+            self.bot._log_post_fill_tick(self.slot, 1003.0)
+            self.bot._log_post_fill_tick(self.slot, 1006.0)
+            self.bot._log_post_fill_tick(self.slot, 1007.0)
         kws = [c.kwargs for c in jw.call_args_list if c.args[0] == "maker_post_fill"]
         self.assertEqual(len(kws), 1)
         self.assertEqual(kws[0]["offset_s"], 5)
         self.assertEqual(kws[0]["mid_move"], 0.1)
+        self.assertEqual(kws[0]["bid_vs_fill"], 0.09)
+        gt.assert_called_with("tok_up", opp_token_id="tok_down")
         self.slot.position = None
-        self.bot._log_post_fill_tick(self.slot, 2000.0, None, None, None)  # no position: no-op
+        self.bot._log_post_fill_tick(self.slot, 2000.0)  # no position: no-op
+
+    async def test_post_fill_hook_runs_while_position_open(self):
+        """Regression: hook must be inside the open-position branch (which returns before entry logic)."""
+        import inspect, bot
+        src = inspect.getsource(bot.TWAPBot._tick_asset)
+        i_pos = src.index("if slot.position:")
+        i_hook = src.index("self._log_post_fill_tick(slot, now)")
+        i_manage = src.index("_manage_open_momentum_position")
+        self.assertTrue(i_pos < i_hook < i_manage)
