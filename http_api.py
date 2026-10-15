@@ -295,7 +295,72 @@ def build_stats(trades: list[dict], snapshot: dict[str, Any] | None = None) -> d
     }
 
 
-def _make_handler(bot_snapshot: SnapshotFn, trades_path: Path):
+# ---- GET /journal (read-only, redacted) ----
+import re as _re
+from collections import deque as _deque
+
+JOURNAL_DEFAULT_LIMIT = 5000
+JOURNAL_MAX_LIMIT = 50000
+_SECRET_KEY_RE = _re.compile(
+    r"(secret|private|passphrase|password|api_?key|apikey|signature|^sig$|_sig$|auth|cred|mnemonic|seed|bearer|cookie|session)",
+    _re.I,
+)
+_LONG_HEX_RE = _re.compile(r"^(0x)?[0-9a-fA-F]{100,}$")  # signatures / raw keys (order ids are 66 chars)
+_KEYISH_RE = _re.compile(r"^[A-Za-z0-9+/=_-]{120,}$")  # long base64-ish blobs
+
+
+def redact(obj: Any) -> Any:
+    """Recursively drop secret-looking keys and blank secret-looking string values."""
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            if _SECRET_KEY_RE.search(str(k)):
+                continue
+            out[k] = redact(v)
+        return out
+    if isinstance(obj, list):
+        return [redact(v) for v in obj]
+    if isinstance(obj, str) and (_LONG_HEX_RE.match(obj) or _KEYISH_RE.match(obj)):
+        return "[redacted]"
+    return obj
+
+
+def read_journal(path: Path | str | None, since: float | None = None, events: set[str] | None = None,
+                 limit: int = JOURNAL_DEFAULT_LIMIT) -> list[dict]:
+    """Return the newest `limit` matching journal records (oldest-first). Streams the file line by line."""
+    limit = max(1, min(int(limit), JOURNAL_MAX_LIMIT))
+    if not path:
+        return []
+    p = Path(path)
+    if not p.exists():
+        return []
+    needles = [f'"event": "{e}"' for e in events] + [f'"event":"{e}"' for e in events] if events else None
+    buf: _deque = _deque(maxlen=limit)
+    with p.open("r", encoding="utf-8", errors="replace") as fh:
+        for i, line in enumerate(fh):
+            if needles and not any(n in line for n in needles):
+                continue
+            try:
+                rec = json.loads(line)
+            except Exception:
+                continue
+            if not isinstance(rec, dict):
+                continue
+            if events and rec.get("event") not in events:
+                continue
+            if since is not None:
+                try:
+                    if float(rec.get("ts") or 0) < since:
+                        continue
+                except (TypeError, ValueError):
+                    continue
+            buf.append(rec)
+            if i % 20000 == 0:
+                time.sleep(0)  # yield GIL to the trading loop
+    return [redact(r) for r in buf]
+
+
+def _make_handler(bot_snapshot: SnapshotFn, trades_path: Path, journal_path: Any = None):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt: str, *args) -> None:
             logger.debug("%s - " + fmt, self.address_string(), *args)
@@ -309,6 +374,40 @@ def _make_handler(bot_snapshot: SnapshotFn, trades_path: Path):
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self.wfile.write(body)
+
+        def _send_journal(self, qs) -> None:
+            """NDJSON, newest-last. Never raises."""
+            try:
+                since_raw = (qs.get("since") or [""])[0].strip()
+                since = float(since_raw) if since_raw else None
+                ev_raw = (qs.get("events") or [""])[0].strip()
+                events = {e.strip() for e in ev_raw.split(",") if e.strip()} or None
+                lim_raw = (qs.get("limit") or [""])[0].strip()
+                limit = int(lim_raw) if lim_raw else JOURNAL_DEFAULT_LIMIT
+            except (TypeError, ValueError) as e:
+                self._send(400, {"error": f"bad query: {e}"})
+                return
+            try:
+                if journal_path is not None:
+                    jp = journal_path
+                else:
+                    import journal as _journal
+                    jp = getattr(_journal, "_path", None) or getattr(config, "JOURNAL_PATH", None)
+                rows = read_journal(jp, since=since, events=events, limit=limit)
+                body = "".join(json.dumps(r, default=str, separators=(",", ":")) + "\n" for r in rows).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/x-ndjson")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("X-Journal-Count", str(len(rows)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
+            except Exception as e:
+                logger.error("journal endpoint failed: %s", e)
+                try:
+                    self._send(500, {"error": "journal read failed"})
+                except Exception:
+                    pass
 
         def do_GET(self) -> None:  # noqa: N802
             parsed = urlparse(self.path)
@@ -326,6 +425,9 @@ def _make_handler(bot_snapshot: SnapshotFn, trades_path: Path):
                             "jev",
                         )},
                     })
+                    return
+                if path == "/journal":
+                    self._send_journal(qs)
                     return
                 trades = load_trades(trades_path)
                 asset_filter = (qs.get("asset") or [""])[0].strip().lower()
@@ -351,7 +453,7 @@ def _make_handler(bot_snapshot: SnapshotFn, trades_path: Path):
                         ]
                     self._send(200, build_stats(filtered, snap))
                     return
-                self._send(404, {"error": "not found", "paths": ["/", "/health", "/stats", "/trades"]})
+                self._send(404, {"error": "not found", "paths": ["/", "/health", "/stats", "/trades", "/journal"]})
             except Exception as e:
                 logger.error("http handler failed: %s", e)
                 self._send(500, {"error": str(e)})
@@ -380,7 +482,7 @@ class StatusServer:
         self._httpd = ThreadingHTTPServer((self.host, self.port), handler)
         self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True, name="status-http")
         self._thread.start()
-        logger.info("Status HTTP listening on %s:%s  (/trades /stats /health)", self.host, self.port)
+        logger.info("Status HTTP listening on %s:%s  (/trades /stats /health /journal)", self.host, self.port)
 
     def stop(self) -> None:
         if self._httpd:
