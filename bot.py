@@ -38,6 +38,7 @@ from http_api import StatusServer, is_official_trade, load_trades
 from jev_advisor import JevAdvisor, JevDecision
 import move_ref
 import maker_guard
+import shadow_log
 
 logging.basicConfig(
     level=logging.INFO,
@@ -157,6 +158,8 @@ class TWAPBot:
         self.risk = RiskManager()
         self.jev = JevAdvisor()
         self._mid_hist = maker_guard.MidHistory(float(getattr(config, "MAKER_MID_WINDOW_S", 60.0)))
+        self._rest_throttle = shadow_log.Throttle(1.0)
+        self._post_fill = shadow_log.PostFillTracer()
         self.live_client = None
         if config.MODE == "live":
             if config.LIVE_CONFIRM not in ("yes", "y", "true", "1"):
@@ -810,6 +813,7 @@ class TWAPBot:
             if mid_px is not None:
                 self._mid_hist.add(fav_token, now, mid_px)
                 self._mid_hist.add(opp_token, now, 1.0 - mid_px)
+            self._log_post_fill_tick(slot, now, fav_token, q_bid, q_ask)
             z_twap_dyn = None
             if maker_guard_on and slot.strike_twap:
                 try:
@@ -1208,6 +1212,7 @@ class TWAPBot:
                     if ro_opp_token:
                         self._mid_hist.add(ro_opp_token, now, 1.0 - mid_now)
                 ro_hi, ro_drop = self._mid_hist.drop(ro_token, now, mid_now)
+                self._log_rest_tick(slot, ro, now, elapsed_s, mid_now, cur_bid, cur_ask, ro_top, ro_drop)
                 guard_reason = None
                 ro_z_twap = None
                 if maker_guard_on:
@@ -1336,7 +1341,9 @@ class TWAPBot:
                         shares=ro["shares"],
                         **self._jev_shadow_tags(ro.get("jev")),
                         **feats,
+                        **self._twapdist_shadow(feats.get("spot"), feats.get("strike_twap"), ro["side"]),
                     )
+                    self._start_post_fill(ro, now, mid_now, cur_bid)
 
         elif is_momentum:
             can_trade_now, risk_reason_now = self.risk.can_trade(open_notional=open_notional)
@@ -2131,12 +2138,85 @@ class TWAPBot:
             **self._strike_meta(slot),
         }
 
-    def _log_maker_post_shadow(self, slot, market, side, token_id, bid, shares, order_id) -> None:
+    def _twapdist_shadow(self, spot, strike_twap, side) -> dict:
+        """Rule A shadow fields (LOG-ONLY). Never raises."""
+        if not bool(getattr(config, "MAKER_TWAPDIST_SHADOW", True)):
+            return {}
+        try:
+            return shadow_log.twapdist_fields(spot, strike_twap, side)
+        except Exception as e:
+            logger.warning(f"twapdist shadow failed: {e}")
+            return {}
+
+    def _log_rest_tick(self, slot, ro, now, elapsed_s, mid, bid, ask, top, drop) -> None:
+        """~1/s resting-path trace (LOG-ONLY). Uses only data already fetched. Never raises."""
+        try:
+            if not bool(getattr(config, "MAKER_REST_TRACE", True)):
+                return
+            oid = ro.get("order_id")
+            if not oid or not self._rest_throttle.ready(oid, now):
+                return
+            px = ro.get("price")
+            bsz = (top or {}).get("bid_size")
+            at_px = bool(bid is not None and px is not None and abs(float(bid) - float(px)) < 1e-6)
+            journal_write(
+                "maker_rest_tick", order_id=oid, asset=slot.asset, slot=ro.get("slot"), side=ro.get("side"),
+                bid_price=px, elapsed_s=(round(float(elapsed_s), 1) if elapsed_s is not None else None),
+                resting_s=round(now - float(ro.get("placed_at", now)), 1),
+                mid=(round(mid, 4) if mid is not None else None), best_bid=bid, best_ask=ask,
+                best_bid_size=bsz, best_bid_is_our_price=at_px, size_at_our_price=(bsz if at_px else None),
+                drop_60s=(round(drop, 4) if drop is not None else None),
+            )
+        except Exception as e:
+            logger.warning(f"maker_rest_tick log failed: {e}")
+
+    def _start_post_fill(self, ro, now, mid, bid) -> None:
+        try:
+            if bool(getattr(config, "MAKER_POST_FILL_TRACE", True)):
+                self._post_fill.start(ro.get("order_id"), now, mid, bid, ro.get("price"))
+        except Exception as e:
+            logger.warning(f"post_fill start failed: {e}")
+
+    def _log_post_fill_tick(self, slot, now, fav_token, q_bid, q_ask) -> None:
+        """maker_post_fill at +5/+15/+30/+60s (first tick at/after each). LOG-ONLY, never raises."""
+        try:
+            if not bool(getattr(config, "MAKER_POST_FILL_TRACE", True)):
+                return
+            pos = slot.position
+            if not pos:
+                return
+            oid = pos.get("order_id")
+            if not oid or not self._post_fill.snapshot(oid):
+                return
+            due = self._post_fill.due(oid, now)
+            if not due:
+                return
+            tok = pos.get("token_id")
+            mid = self._mid_hist.latest(tok)
+            bid = None
+            if tok and tok == fav_token:
+                bid = q_bid
+            elif q_ask is not None:
+                bid = round(1.0 - float(q_ask), 4)
+            for off in due:
+                journal_write("maker_post_fill", asset=slot.asset, slot=pos.get("slot"), side=pos.get("side"),
+                              **self._post_fill.record(oid, off, now, mid, bid))
+        except Exception as e:
+            logger.warning(f"maker_post_fill log failed: {e}")
+
+    def _log_maker_post_shadow(self, slot, market, side, token_id, bid, shares, order_id, spot=None) -> None:
         """Shadow-only pre-post gate log (MAKER_POST_GATE_SHADOW). Never raises, never blocks."""
         if not bool(getattr(config, "MAKER_POST_GATE_SHADOW", False)):
             return
         try:
             rec = maker_guard.post_shadow_record(self._mid_hist, token_id, time.time())
+            try:
+                if bool(getattr(config, "MAKER_TWAPDIST_SHADOW", True)):
+                    td = shadow_log.twapdist_fields(spot, slot.strike_twap, side)
+                    rec.update(td)
+                    rec["alt_bid_047"] = shadow_log.alt_bid_047(rec.get("range_5s"), td.get("twapdist_bps"))
+            except Exception as e:
+                logger.warning(f"[{slot.asset.upper()}] twapdist post shadow failed: {e}")
             journal_write(
                 "maker_post_shadow", slot=market.get("slug"), asset=slot.asset, side=side, bid=bid,
                 shares=shares, order_id=order_id, mode=config.MODE, **rec,
@@ -2198,7 +2278,8 @@ class TWAPBot:
                 logger.error(f"Live limit order placement failed: {e}")
                 return
 
-        self._log_maker_post_shadow(slot, market, signal.side, token_id, signal.target_bid, shares, order_id)
+        self._log_maker_post_shadow(slot, market, signal.side, token_id, signal.target_bid, shares, order_id,
+                                    spot=getattr(signal, "spot", None))
         slot.resting_order = {
             "asset": slot.asset,
             "slot": market["slug"],
@@ -2662,7 +2743,7 @@ class TWAPBot:
             f"remaining={remaining_s:.1f}s"
         )
         journal_write(
-            "price_stop", asset=slot.asset, slot=pos.get("slot"), strategy=pos.get("strategy"),
+            "price_stop", asset=slot.asset, slot=pos.get("slot"), order_id=pos.get("order_id"), strategy=pos.get("strategy"),
             side=pos.get("side"), entry=entry, bid=bid, threshold=thr, fraction=frac, held_s=round(held, 2),
             exit_price=exit_px, exit_price_source=src, shares=shares, remaining_s=round(remaining_s, 1),
         )
@@ -2897,6 +2978,7 @@ class TWAPBot:
             "early_exit": True,
             "official": True,
             "settlement_source": f"early_exit_{reason}",
+            "order_id": pos.get("order_id"),
             **{k: pos.get(k) for k in ("strike_spot", "strike_twap", "strike_twap_source", "move_ref_mode", "move_ref_used")},
             "maker_features": pos.get("maker_features"),
         }
@@ -3201,6 +3283,7 @@ class TWAPBot:
             "settlement",
             slot=market.get("slug"),
             asset=item.get("asset"),
+            order_id=pos.get("order_id"),
             won=None,
             pnl=0.0,
             settlement_source="unresolved",
