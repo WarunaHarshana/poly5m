@@ -7,6 +7,7 @@ TWAPDIST_BLOCK_BPS = 2.0
 ALT_BID_RANGE5 = 0.05
 ALT_BID_TWAPDIST_LO = 1.5
 POST_FILL_OFFSETS = (5, 15, 30, 60)
+POST_FILL_STEP_S = 10  # after the last fixed offset, keep sampling every 10s (caller stops at slot end / exit)
 
 
 def _f(v):
@@ -77,6 +78,11 @@ class PostFillTracer:
         if not st:
             return []
         out = [o for o in self.offsets if o not in st["done"] and now - st["ts"] >= o]
+        last = max(self.offsets)
+        if now - st["ts"] >= last + POST_FILL_STEP_S:  # continuation: latest due 10s step only
+            o = last + POST_FILL_STEP_S * int((now - st["ts"] - last) // POST_FILL_STEP_S)
+            if o not in st["done"]:
+                out.append(o)
         st["done"].update(out)
         return out
 
@@ -84,12 +90,13 @@ class PostFillTracer:
         st = self._f.get(order_id) or {}
         m, b = _f(mid), _f(bid)
         fm, fb = st.get("mid"), st.get("price")
-        if st and len(st.get("done", ())) == len(self.offsets) and offset == max(self.offsets):
-            self._f.pop(order_id, None)
         return {"order_id": order_id, "offset_s": offset, "actual_s": round(now - st.get("ts", now), 2) if st else None,
                 "mid": m, "best_bid": b, "fill_mid": fm, "fill_price": fb,
                 "mid_move": round(m - fm, 4) if (m is not None and fm is not None) else None,
                 "bid_vs_fill": round(b - fb, 4) if (b is not None and fb is not None) else None}
+
+    def stop(self, order_id) -> None:
+        self._f.pop(order_id, None)
 
     def snapshot(self, order_id):
         return self._f.get(order_id)

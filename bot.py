@@ -2209,7 +2209,7 @@ class TWAPBot:
             logger.warning(f"post_fill start failed: {e}")
 
     def _log_post_fill_tick(self, slot, now) -> None:
-        """maker_post_fill at +5/+15/+30/+60s (first tick at/after each). LOG-ONLY, never raises.
+        """maker_post_fill at +5/+15/+30/+60s, then every 10s until slot end (300s) or exit. LOG-ONLY, never raises.
         Reads only the in-memory book stream cache (no API calls)."""
         try:
             if not bool(getattr(config, "MAKER_POST_FILL_TRACE", True)):
@@ -2219,6 +2219,11 @@ class TWAPBot:
                 return
             oid = pos.get("order_id")
             if not oid or not self._post_fill.snapshot(oid):
+                return
+            st_ts = (getattr(slot, "market", None) or {}).get("slot_start_ts")
+            slot_el = round(now - float(st_ts), 1) if st_ts else None
+            if slot_el is not None and slot_el >= 300:
+                self._post_fill.stop(oid)
                 return
             due = self._post_fill.due(oid, now)
             if not due:
@@ -2239,7 +2244,7 @@ class TWAPBot:
                 src = "mid_hist" if mid is not None else "none"
             for off in due:
                 journal_write("maker_post_fill", asset=slot.asset, slot=pos.get("slot"), side=pos.get("side"),
-                              best_ask=ask, price_source=src, **self._post_fill.record(oid, off, now, mid, bid))
+                              best_ask=ask, price_source=src, slot_elapsed_s=slot_el, **self._post_fill.record(oid, off, now, mid, bid))
         except Exception as e:
             logger.warning(f"maker_post_fill log failed: {e}")
 

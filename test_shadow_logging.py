@@ -36,8 +36,11 @@ def test_post_fill_tracer_checkpoints():
     assert p.due("o", 131) == [15, 30]
     r = p.record("o", 30, 131, 0.6, 0.58)
     assert r["mid_move"] == 0.1 and r["bid_vs_fill"] == 0.08
-    assert p.due("o", 170) == [60]
-    p.record("o", 60, 170, 0.7, 0.7)
+    assert p.due("o", 165) == [60]
+    p.record("o", 60, 165, 0.7, 0.7)
+    assert p.due("o", 172) == [70] and p.due("o", 175) == []
+    assert p.due("o", 205) == [100] and p.due("o", 209) == []
+    p.stop("o")
     assert p.snapshot("o") is None
     assert p.due("missing", 1e9) == []
 
