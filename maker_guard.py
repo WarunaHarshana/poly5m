@@ -24,6 +24,7 @@ REASON_MID_DROP = "mid_drop"
 REASON_POST_FALLING_MID = "post_falling_mid"
 REASON_TWAP_CROSS = "twap_cross"
 REASON_NO_TWAP_STRIKE = "no_twap_strike"
+REASON_TWAPDIST_MIDSLOT = "twapdist_midslot"
 
 REF_SPOT_FALLBACK = "spot_fallback"  # no TWAP strike yet -> legacy spot-strike z
 REF_SPOT = "spot"

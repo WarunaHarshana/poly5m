@@ -93,3 +93,9 @@ class PostFillTracer:
 
     def snapshot(self, order_id):
         return self._f.get(order_id)
+
+
+def midslot_condition(elapsed_s, twapdist, lo=40.0, hi=60.0, bps=2.0) -> bool:
+    """True when lo <= elapsed_s < hi and twapdist >= bps. Fail-open (False) on missing inputs."""
+    e, d = _f(elapsed_s), _f(twapdist)
+    return bool(e is not None and d is not None and float(lo) <= e < float(hi) and d >= float(bps))

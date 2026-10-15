@@ -969,6 +969,8 @@ class TWAPBot:
                             float(getattr(config, "MAKER_POST_STABLE_MAX_RANGE", 0.0)),
                         ):
                             mk_ok, mk_reason = False, maker_guard.REASON_POST_FALLING_MID
+                        if mk_ok and self._midslot_block_active(elapsed_s, spot, slot.strike_twap, favored_side):
+                            mk_ok, mk_reason = False, maker_guard.REASON_TWAPDIST_MIDSLOT
                         if not mk_ok:
                             is_maker_candidate = False
                             self._log_maker_block(
@@ -1212,7 +1214,7 @@ class TWAPBot:
                     if ro_opp_token:
                         self._mid_hist.add(ro_opp_token, now, 1.0 - mid_now)
                 ro_hi, ro_drop = self._mid_hist.drop(ro_token, now, mid_now)
-                self._log_rest_tick(slot, ro, now, elapsed_s, mid_now, cur_bid, cur_ask, ro_top, ro_drop)
+                self._log_rest_tick(slot, ro, now, elapsed_s, mid_now, cur_bid, cur_ask, ro_top, ro_drop, spot=spot)
                 guard_reason = None
                 ro_z_twap = None
                 if maker_guard_on:
@@ -1224,6 +1226,8 @@ class TWAPBot:
                         ro_drop, float(getattr(config, "MAKER_MAX_MID_DROP_60S", 0.15))
                     ):
                         guard_reason = maker_guard.REASON_MID_DROP
+                    elif self._midslot_block_active(elapsed_s, spot, slot.strike_twap, ro_side):
+                        guard_reason = maker_guard.REASON_TWAPDIST_MIDSLOT
                     elif is_paper_fill:
                         # Re-check the settlement-strike z before counting a (paper) fill.
                         ro_z_twap = z_twap_dyn
@@ -1342,6 +1346,8 @@ class TWAPBot:
                         **self._jev_shadow_tags(ro.get("jev")),
                         **feats,
                         **self._twapdist_shadow(feats.get("spot"), feats.get("strike_twap"), ro["side"]),
+                        would_block_twapdist_midslot=self._midslot_would_block(
+                            el_s, feats.get("spot"), feats.get("strike_twap"), ro["side"]),
                     )
                     self._start_post_fill(ro, now, mid_now, cur_bid)
 
@@ -2138,6 +2144,23 @@ class TWAPBot:
             **self._strike_meta(slot),
         }
 
+    def _midslot_would_block(self, elapsed_s, spot, strike_twap, side) -> bool:
+        """Pure evaluation of the twapdist-midslot condition (no side effects). Never raises."""
+        try:
+            return shadow_log.midslot_condition(
+                elapsed_s, shadow_log.twapdist_bps(spot, strike_twap, side),
+                float(getattr(config, "MIDSLOT_LO", 40.0)), float(getattr(config, "MIDSLOT_HI", 60.0)),
+                float(getattr(config, "MIDSLOT_TWAPDIST_BPS", 2.0)),
+            )
+        except Exception:
+            return False
+
+    def _midslot_block_active(self, elapsed_s, spot, strike_twap, side) -> bool:
+        """Trading gate. Always False unless MAKER_SKIP_TWAPDIST_MIDSLOT is ON."""
+        if not bool(getattr(config, "MAKER_SKIP_TWAPDIST_MIDSLOT", False)):
+            return False
+        return self._midslot_would_block(elapsed_s, spot, strike_twap, side)
+
     def _twapdist_shadow(self, spot, strike_twap, side) -> dict:
         """Rule A shadow fields (LOG-ONLY). Never raises."""
         if not bool(getattr(config, "MAKER_TWAPDIST_SHADOW", True)):
@@ -2148,7 +2171,7 @@ class TWAPBot:
             logger.warning(f"twapdist shadow failed: {e}")
             return {}
 
-    def _log_rest_tick(self, slot, ro, now, elapsed_s, mid, bid, ask, top, drop) -> None:
+    def _log_rest_tick(self, slot, ro, now, elapsed_s, mid, bid, ask, top, drop, spot=None) -> None:
         """~1/s resting-path trace (LOG-ONLY). Uses only data already fetched. Never raises."""
         try:
             if not bool(getattr(config, "MAKER_REST_TRACE", True)):
@@ -2166,9 +2189,17 @@ class TWAPBot:
                 mid=(round(mid, 4) if mid is not None else None), best_bid=bid, best_ask=ask,
                 best_bid_size=bsz, best_bid_is_our_price=at_px, size_at_our_price=(bsz if at_px else None),
                 drop_60s=(round(drop, 4) if drop is not None else None),
+                **self._midslot_tick_fields(elapsed_s, spot, slot.strike_twap, ro.get("side")),
             )
         except Exception as e:
             logger.warning(f"maker_rest_tick log failed: {e}")
+
+    def _midslot_tick_fields(self, elapsed_s, spot, strike_twap, side) -> dict:
+        try:
+            return {"twapdist_bps": shadow_log.twapdist_bps(spot, strike_twap, side),
+                    "would_block_twapdist_midslot": self._midslot_would_block(elapsed_s, spot, strike_twap, side)}
+        except Exception:
+            return {}
 
     def _start_post_fill(self, ro, now, mid, bid) -> None:
         try:
@@ -2196,10 +2227,19 @@ class TWAPBot:
             top = self.book_stream.get_top(tok, opp_token_id=pos.get("opp_token_id")) if tok else None
             bid = (top or {}).get("bid")
             ask = (top or {}).get("ask")
+            src = "book_stream"
+            if bid is None or ask is None:
+                # Fallback: the book the TP check used on the previous tick (cached on the position).
+                bid = pos.get("_trace_last_bid") if bid is None else bid
+                ask = pos.get("_trace_last_ask") if ask is None else ask
+                src = "tp_check_cache"
             mid = 0.5 * (float(bid) + float(ask)) if (bid is not None and ask is not None) else None
+            if mid is None:
+                mid = self._mid_hist.latest(tok)
+                src = "mid_hist" if mid is not None else "none"
             for off in due:
                 journal_write("maker_post_fill", asset=slot.asset, slot=pos.get("slot"), side=pos.get("side"),
-                              best_ask=ask, **self._post_fill.record(oid, off, now, mid, bid))
+                              best_ask=ask, price_source=src, **self._post_fill.record(oid, off, now, mid, bid))
         except Exception as e:
             logger.warning(f"maker_post_fill log failed: {e}")
 
@@ -2214,6 +2254,12 @@ class TWAPBot:
                     td = shadow_log.twapdist_fields(spot, slot.strike_twap, side)
                     rec.update(td)
                     rec["alt_bid_047"] = shadow_log.alt_bid_047(rec.get("range_5s"), td.get("twapdist_bps"))
+                el_post = None
+                st0 = market.get("slot_start_ts")
+                if st0:
+                    el_post = round(time.time() - float(st0), 1)
+                rec["elapsed_s"] = el_post
+                rec["would_block_twapdist_midslot"] = self._midslot_would_block(el_post, spot, slot.strike_twap, side)
             except Exception as e:
                 logger.warning(f"[{slot.asset.upper()}] twapdist post shadow failed: {e}")
             journal_write(
@@ -2333,6 +2379,12 @@ class TWAPBot:
                     best_bid = r_bid
                 if best_ask is None:
                     best_ask = r_ask
+        try:  # LOG-ONLY: cache the book used by the TP check for maker_post_fill tracing
+            if isinstance(slot.position, dict):
+                slot.position["_trace_last_bid"] = best_bid
+                slot.position["_trace_last_ask"] = best_ask
+        except Exception:
+            pass
 
         entry = float(pos["price"])
 
