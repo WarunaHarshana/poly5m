@@ -3,9 +3,6 @@ from __future__ import annotations
 
 import math
 
-TWAPDIST_BLOCK_BPS = 2.0
-ALT_BID_RANGE5 = 0.05
-ALT_BID_TWAPDIST_LO = 1.5
 POST_FILL_OFFSETS = (5, 15, 30, 60)
 POST_FILL_STEP_S = 10  # after the last fixed offset, keep sampling every 10s (caller stops at slot end / exit)
 
@@ -16,26 +13,6 @@ def _f(v):
     except (TypeError, ValueError):
         return None
     return x if math.isfinite(x) else None
-
-
-def twapdist_bps(spot, strike_twap, side) -> float | None:
-    """(spot - strike_twap) * side_sign / spot * 1e4; +1 UP, -1 DOWN. None if inputs missing."""
-    s, k = _f(spot), _f(strike_twap)
-    if s is None or k is None or s <= 0 or k <= 0:
-        return None
-    sgn = 1.0 if str(side).upper() == "UP" else -1.0
-    return round((s - k) * sgn / s * 1e4, 3)
-
-
-def twapdist_fields(spot, strike_twap, side) -> dict:
-    d = twapdist_bps(spot, strike_twap, side)
-    return {"twapdist_bps": d, "would_block_twapdist": bool(d is not None and d >= TWAPDIST_BLOCK_BPS)}
-
-
-def alt_bid_047(range_5s, twapdist) -> bool:
-    r5, d = _f(range_5s), _f(twapdist)
-    return bool((r5 is not None and r5 > ALT_BID_RANGE5) or
-                (d is not None and ALT_BID_TWAPDIST_LO <= d < TWAPDIST_BLOCK_BPS))
 
 
 class Throttle:
@@ -100,9 +77,3 @@ class PostFillTracer:
 
     def snapshot(self, order_id):
         return self._f.get(order_id)
-
-
-def midslot_condition(elapsed_s, twapdist, lo=40.0, hi=60.0, bps=2.0) -> bool:
-    """True when lo <= elapsed_s < hi and twapdist >= bps. Fail-open (False) on missing inputs."""
-    e, d = _f(elapsed_s), _f(twapdist)
-    return bool(e is not None and d is not None and float(lo) <= e < float(hi) and d >= float(bps))

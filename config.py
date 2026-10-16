@@ -141,15 +141,9 @@ MAKER_POST_STABLE_S = float(os.getenv("MAKER_POST_STABLE_S", "3"))
 MAKER_POST_STABLE_MAX_RANGE = float(os.getenv("MAKER_POST_STABLE_MAX_RANGE", "0"))
 # Shadow-only logging of the pre-post gate (never blocks): journal event maker_post_shadow on each maker bid post.
 MAKER_POST_GATE_SHADOW = os.getenv("MAKER_POST_GATE_SHADOW", "1").strip().lower() in ("yes", "y", "true", "1", "on")
-# inv12 LOG-ONLY shadows (never change trading): Rule A/B fields, resting-path ticks, post-fill path.
-MAKER_TWAPDIST_SHADOW = os.getenv("MAKER_TWAPDIST_SHADOW", "1").strip().lower() in ("yes", "y", "true", "1", "on")
+# inv12 LOG-ONLY traces (never change trading): resting-path ticks, post-fill path.
 MAKER_REST_TRACE = os.getenv("MAKER_REST_TRACE", "1").strip().lower() in ("yes", "y", "true", "1", "on")
 MAKER_POST_FILL_TRACE = os.getenv("MAKER_POST_FILL_TRACE", "1").strip().lower() in ("yes", "y", "true", "1", "on")
-# inv13 candidate (default OFF): skip/cancel maker bids when 40<=elapsed<60 and twapdist_bps>=2.0.
-MAKER_SKIP_TWAPDIST_MIDSLOT = os.getenv("MAKER_SKIP_TWAPDIST_MIDSLOT", "0").strip().lower() in ("yes", "y", "true", "1", "on")
-MIDSLOT_LO = float(os.getenv("MIDSLOT_LO", "40"))
-MIDSLOT_HI = float(os.getenv("MIDSLOT_HI", "60"))
-MIDSLOT_TWAPDIST_BPS = float(os.getenv("MIDSLOT_TWAPDIST_BPS", "2.0"))
 DYNAMIC_MAX_ELAPSED_S = float(os.getenv("DYNAMIC_MAX_ELAPSED_S", "240.0"))
 
 # --- AVN-MAS Take-Profit & Adverse Stop-Loss Parameters ---

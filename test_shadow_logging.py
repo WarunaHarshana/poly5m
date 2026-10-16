@@ -8,21 +8,6 @@ import config
 import shadow_log as sl
 
 
-def test_twapdist_sign_and_threshold():
-    assert sl.twapdist_bps(100_000, 99_980, "UP") == 2.0
-    assert sl.twapdist_bps(100_000, 99_980, "DOWN") == -2.0
-    assert sl.twapdist_fields(100_000, 99_980, "UP")["would_block_twapdist"] is True
-    assert sl.twapdist_fields(100_000, 99_990, "UP")["would_block_twapdist"] is False
-    assert sl.twapdist_fields(None, 1, "UP") == {"twapdist_bps": None, "would_block_twapdist": False}
-    assert sl.twapdist_bps("x", 1, "UP") is None
-
-
-def test_alt_bid():
-    assert sl.alt_bid_047(0.06, None)
-    assert sl.alt_bid_047(0.01, 1.5) and sl.alt_bid_047(None, 1.99)
-    assert not sl.alt_bid_047(0.05, 2.0) and not sl.alt_bid_047(None, None)
-
-
 def test_throttle():
     t = sl.Throttle(1.0)
     assert t.ready("a", 0.0) and not t.ready("a", 0.5) and t.ready("a", 1.0) and t.ready("b", 0.5)
@@ -46,7 +31,7 @@ def test_post_fill_tracer_checkpoints():
 
 
 def test_flags_default_on():
-    assert config.MAKER_TWAPDIST_SHADOW and config.MAKER_REST_TRACE and config.MAKER_POST_FILL_TRACE
+    assert config.MAKER_REST_TRACE and config.MAKER_POST_FILL_TRACE
 
 
 class TestBotHooks(unittest.IsolatedAsyncioTestCase):
@@ -65,7 +50,7 @@ class TestBotHooks(unittest.IsolatedAsyncioTestCase):
             setattr(config, k, v)
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    async def test_post_shadow_has_rule_a_b_and_still_posts(self):
+    async def test_post_shadow_still_posts(self):
         config.MAKER_POST_GATE_SHADOW = True
         self.slot.resting_order = None
         self.slot.strike_twap = 99_980.0
@@ -76,9 +61,8 @@ class TestBotHooks(unittest.IsolatedAsyncioTestCase):
             await self.bot._place_maker_bid(self.slot, market, sig, strategy_tag="JEV_DYNAMIC_MAKER")
         self.assertIsNotNone(self.slot.resting_order)
         kw = [c for c in jw.call_args_list if c.args[0] == "maker_post_shadow"][0].kwargs
-        self.assertEqual(kw["twapdist_bps"], 2.0)
-        self.assertTrue(kw["would_block_twapdist"])
-        self.assertIn("alt_bid_047", kw)
+        self.assertNotIn("would_block_twapdist", kw)
+        self.assertNotIn("alt_bid_047", kw)
 
     def test_rest_tick_throttled_and_never_raises(self):
         ro = {"order_id": "o1", "slot": "s", "side": "UP", "price": 0.5, "placed_at": 100.0}
