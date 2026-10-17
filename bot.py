@@ -160,6 +160,7 @@ class TWAPBot:
         self._mid_hist = maker_guard.MidHistory(float(getattr(config, "MAKER_MID_WINDOW_S", 60.0)))
         self._rest_throttle = shadow_log.Throttle(1.0)
         self._post_fill = shadow_log.PostFillTracer()
+        self._slot_trace = shadow_log.SlotTracer()
         self.live_client = None
         if config.MODE == "live":
             if config.LIVE_CONFIRM not in ("yes", "y", "true", "1"):
@@ -640,6 +641,7 @@ class TWAPBot:
         elapsed_s = max(0.0, now - slot_start_ts)
 
         tokens = market.get("tokens") or {}
+        self._log_slot_trace(slot, now)
 
         # ---------------------------------------------------------------------
         # 1. PRIORITY POSITION MANAGEMENT: NEVER SKIP OPEN POSITIONS!
@@ -2206,6 +2208,49 @@ class TWAPBot:
         except Exception as e:
             logger.warning(f"maker_post_fill log failed: {e}")
 
+    def _log_slot_trace(self, slot, now) -> None:
+        """inv14 LOG-ONLY: slot_trace every ~5s to slot end + one chase_shadow per slot. In-memory book only.
+        Never places orders, never raises."""
+        try:
+            trace_on = bool(getattr(config, "SLOT_TRACE", True))
+            chase_on = bool(getattr(config, "CHASE_SHADOW", True))
+            if not (trace_on or chase_on):
+                return
+            st = self._slot_trace.get(slot.asset, (slot.market or {}).get("slug"))
+            if not st:
+                return
+            slot_el = round(now - st["start_ts"], 1) if st.get("start_ts") else None
+            if slot_el is not None and slot_el >= 300:
+                self._slot_trace.stop(slot.asset)
+                return
+            oid, pos, ro = st.get("order_id"), slot.position, slot.resting_order
+            if isinstance(pos, dict) and pos.get("order_id") == oid:
+                st["filled"] = True
+            state = "filled" if st["filled"] else ("resting" if isinstance(ro, dict) and ro.get("order_id") == oid
+                                                   else "cancelled")
+            tok = st.get("token_id")
+            top = self.book_stream.get_top(tok, opp_token_id=st.get("opp_token_id")) if tok else None
+            bid, ask, src = (top or {}).get("bid"), (top or {}).get("ask"), "book_stream"
+            if (bid is None or ask is None) and isinstance(pos, dict) and pos.get("order_id") == oid:
+                bid = pos.get("_trace_last_bid") if bid is None else bid
+                ask = pos.get("_trace_last_ask") if ask is None else ask
+                src = "tp_check_cache"
+            mid = round(0.5 * (float(bid) + float(ask)), 4) if (bid is not None and ask is not None) else None
+            if mid is None and tok:
+                mid = self._mid_hist.latest(tok)
+                src = "mid_hist" if mid is not None else "none"
+            base = dict(asset=slot.asset, slot=st["slot"], side=st.get("side"), order_id=oid, slot_elapsed_s=slot_el)
+            if chase_on:
+                rec = self._slot_trace.chase(st, slot_el, bid, ask)
+                if rec:
+                    journal_write("chase_shadow", **base, **rec, order_state=state)
+            if trace_on and self._slot_trace.trace_due(st, now):
+                journal_write("slot_trace", **base, best_bid=bid, best_ask=ask, mid=mid, order_state=state,
+                              position_open=bool(isinstance(pos, dict) and pos.get("order_id") == oid),
+                              price_source=src)
+        except Exception as e:
+            logger.warning(f"slot_trace log failed: {e}")
+
     def _log_maker_post_shadow(self, slot, market, side, token_id, bid, shares, order_id, spot=None) -> None:
         """Shadow-only pre-post gate log (MAKER_POST_GATE_SHADOW). Never raises, never blocks."""
         if not bool(getattr(config, "MAKER_POST_GATE_SHADOW", False)):
@@ -2294,6 +2339,12 @@ class TWAPBot:
             **self._jev_shadow_tags(jev_decision.to_dict() if jev_decision else None),
             **self._strike_meta(slot),
         }
+        try:  # inv14 LOG-ONLY: start slot_trace / chase_shadow tracking for this slot
+            self._slot_trace.start(slot.asset, market["slug"], signal.side, token_id,
+                                   (market.get("tokens") or {}).get("DOWN" if signal.side == "UP" else "UP"),
+                                   order_id, market.get("slot_start_ts"))
+        except Exception as e:
+            logger.warning(f"slot_trace start failed: {e}")
 
 
     async def _manage_open_momentum_position(

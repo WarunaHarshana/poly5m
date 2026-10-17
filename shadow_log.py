@@ -77,3 +77,46 @@ class PostFillTracer:
 
     def snapshot(self, order_id):
         return self._f.get(order_id)
+
+
+class SlotTracer:
+    """inv14 LOG-ONLY: per-asset trace of our posted side's book until slot end + one-shot chase trigger.
+    Holds only the current slot per asset (memory capped by number of assets)."""
+
+    def __init__(self, step_s: float = 5.0, lo: float = 0.55, hi: float = 0.65, max_el: float = 70.0,
+                 usd: float = 3.0) -> None:
+        self.step_s, self.lo, self.hi, self.max_el, self.usd = float(step_s), lo, hi, max_el, usd
+        self._s: dict = {}
+
+    def start(self, asset, slot, side, token_id, opp_token_id, order_id, slot_start_ts) -> None:
+        st = self._s.get(asset)
+        if not st or st["slot"] != slot:
+            st = self._s[asset] = {"slot": slot, "last": None, "chased": False, "filled": False}
+        st.update(side=side, token_id=token_id, opp_token_id=opp_token_id, order_id=order_id,
+                  start_ts=_f(slot_start_ts))
+
+    def get(self, asset, slot):
+        st = self._s.get(asset)
+        if st and st["slot"] != slot:
+            self._s.pop(asset, None)
+            return None
+        return st
+
+    def stop(self, asset) -> None:
+        self._s.pop(asset, None)
+
+    def trace_due(self, st, now: float) -> bool:
+        if st["last"] is not None and now - st["last"] < self.step_s:
+            return False
+        st["last"] = now
+        return True
+
+    def chase(self, st, slot_el, bid, ask):
+        """Return a chase_shadow record the first time ask is in [lo, hi] before max_el, else None."""
+        a = _f(ask)
+        if st["chased"] or a is None or slot_el is None or slot_el >= self.max_el or not (self.lo <= a <= self.hi):
+            return None
+        st["chased"] = True
+        b = _f(bid)
+        return {"ask": a, "bid": b, "mid": round(0.5 * (a + b), 4) if b is not None else None,
+                "shares_at_3usd": round(self.usd / a, 4), "maker_filled": bool(st["filled"])}

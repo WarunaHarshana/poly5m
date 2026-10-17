@@ -144,6 +144,9 @@ MAKER_POST_GATE_SHADOW = os.getenv("MAKER_POST_GATE_SHADOW", "1").strip().lower(
 # inv12 LOG-ONLY traces (never change trading): resting-path ticks, post-fill path.
 MAKER_REST_TRACE = os.getenv("MAKER_REST_TRACE", "1").strip().lower() in ("yes", "y", "true", "1", "on")
 MAKER_POST_FILL_TRACE = os.getenv("MAKER_POST_FILL_TRACE", "1").strip().lower() in ("yes", "y", "true", "1", "on")
+# inv14 LOG-ONLY: slot_trace (our side book every 5s to slot end) + chase_shadow (first ask in [.55,.65] <70s).
+SLOT_TRACE = os.getenv("SLOT_TRACE", "1").strip().lower() in ("yes", "y", "true", "1", "on")
+CHASE_SHADOW = os.getenv("CHASE_SHADOW", "1").strip().lower() in ("yes", "y", "true", "1", "on")
 DYNAMIC_MAX_ELAPSED_S = float(os.getenv("DYNAMIC_MAX_ELAPSED_S", "240.0"))
 
 # --- AVN-MAS Take-Profit & Adverse Stop-Loss Parameters ---
