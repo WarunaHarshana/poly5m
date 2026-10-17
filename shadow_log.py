@@ -120,3 +120,54 @@ class SlotTracer:
         b = _f(bid)
         return {"ask": a, "bid": b, "mid": round(0.5 * (a + b), 4) if b is not None else None,
                 "shares_at_3usd": round(self.usd / a, 4), "maker_filled": bool(st["filled"])}
+
+
+class RestTopCache:
+    """inv14 LOG-ONLY: per-asset REST top-of-book cache for slot_trace/chase_shadow.
+
+    fetch_fn(token_id, opp_token_id) -> (bid, ask) runs in a daemon thread so the trading loop
+    never blocks. At most one fetch per `min_interval_s` per asset; results older than `max_age_s`
+    are ignored. Never raises.
+    """
+
+    def __init__(self, fetch_fn, min_interval_s: float = 5.0, max_age_s: float = 12.0):
+        import threading
+        self._fetch = fetch_fn
+        self._min = float(min_interval_s)
+        self._max_age = float(max_age_s)
+        self._lock = threading.Lock()
+        self._st: dict = {}  # asset -> {tok, ts, bid, ask, last_req, inflight}
+
+    def _run(self, asset, tok, opp):
+        bid = ask = None
+        try:
+            bid, ask = self._fetch(tok, opp)
+        except Exception:
+            pass
+        import time as _t
+        with self._lock:
+            s = self._st.setdefault(asset, {})
+            s["inflight"] = False
+            if s.get("tok") == tok and (bid is not None or ask is not None):
+                s.update(ts=_t.time(), bid=bid, ask=ask)
+
+    def get(self, asset, tok, opp, now):
+        """Return (bid, ask) from a fresh cached fetch (or (None, None)); schedule a refresh if due."""
+        try:
+            import threading
+            with self._lock:
+                s = self._st.setdefault(asset, {})
+                if s.get("tok") != tok:
+                    s.clear()
+                    s["tok"] = tok
+                start = (not s.get("inflight")) and (now - float(s.get("last_req", 0.0)) >= self._min)
+                if start:
+                    s["inflight"] = True
+                    s["last_req"] = now
+                fresh = s.get("ts") is not None and (now - float(s["ts"])) <= self._max_age
+                out = (s.get("bid"), s.get("ask")) if fresh else (None, None)
+            if start:
+                threading.Thread(target=self._run, args=(asset, tok, opp), daemon=True).start()
+            return out
+        except Exception:
+            return (None, None)

@@ -161,6 +161,7 @@ class TWAPBot:
         self._rest_throttle = shadow_log.Throttle(1.0)
         self._post_fill = shadow_log.PostFillTracer()
         self._slot_trace = shadow_log.SlotTracer()
+        self._slot_trace_rest = shadow_log.RestTopCache(self._slot_trace_rest_fetch)
         self.live_client = None
         if config.MODE == "live":
             if config.LIVE_CONFIRM not in ("yes", "y", "true", "1"):
@@ -2208,6 +2209,13 @@ class TWAPBot:
         except Exception as e:
             logger.warning(f"maker_post_fill log failed: {e}")
 
+    def _slot_trace_rest_fetch(self, tok, opp):
+        """Blocking REST top fetch (runs in RestTopCache thread). LOG-ONLY."""
+        bk = self.pub_client.get_order_book(tok)
+        bk_opp = self.pub_client.get_order_book(opp) if opp else None
+        r_bid, r_ask, _ = extract_market_top(bk, bk_opp)
+        return r_bid, r_ask
+
     def _log_slot_trace(self, slot, now) -> None:
         """inv14 LOG-ONLY: slot_trace every ~5s to slot end + one chase_shadow per slot. In-memory book only.
         Never places orders, never raises."""
@@ -2235,6 +2243,14 @@ class TWAPBot:
                 bid = pos.get("_trace_last_bid") if bid is None else bid
                 ask = pos.get("_trace_last_ask") if ask is None else ask
                 src = "tp_check_cache"
+            rest_cache = getattr(self, "_slot_trace_rest", None)
+            if (bid is None or ask is None) and tok and rest_cache is not None:
+                # Same source maker_rest_tick falls back to: REST order book (async, 1/5s/asset).
+                r_bid, r_ask = rest_cache.get(slot.asset, tok, st.get("opp_token_id"), now)
+                if r_bid is not None or r_ask is not None:
+                    bid = r_bid if bid is None else bid
+                    ask = r_ask if ask is None else ask
+                    src = "rest_book"
             mid = round(0.5 * (float(bid) + float(ask)), 4) if (bid is not None and ask is not None) else None
             if mid is None and tok:
                 mid = self._mid_hist.latest(tok)
