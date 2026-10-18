@@ -115,3 +115,39 @@ def gate_move_ok(move: float, min_move: float, side: str | None = None) -> bool:
     if float(move) == 0.0:
         return False
     return (float(move) > 0) == (str(side).upper() == "UP")
+
+
+def settle_rule_z(
+    spot: float,
+    strike_twap: float,
+    elapsed_s: float,
+    daily_vol: float,
+    min_sigma_usd: float = 0.0,
+    slot_s: float = 300.0,
+    end_window_s: float = 60.0,
+) -> float | None:
+    """LOG-ONLY (inv15). Signed z under the actual settlement rule: the 60s TWAP ending at slot end vs
+    strike_twap (the 60s TWAP before slot start / official priceToBeat). Brownian approximation with the
+    current spot as the expected path: Var(end TWAP) = v*spot^2*(gap + w/3) while the end window has not
+    started (gap = seconds until it starts); inside the end window the unrealized part is treated likewise
+    (realized part of the end window is ignored, so late-slot values are approximate)."""
+    try:
+        s = float(spot)
+        k = float(strike_twap)
+        e = max(0.0, min(float(slot_s), float(elapsed_s)))
+        if s <= 0 or k <= 0:
+            return None
+        v = float(daily_vol) ** 2 / 86400.0
+        w = float(end_window_s)
+        win_start = float(slot_s) - w
+        if e < win_start:
+            t_eff = (win_start - e) + w / 3.0
+        else:
+            rem = max(1.0, float(slot_s) - e)
+            t_eff = rem ** 3 / (3.0 * w * w)
+        sigma = max(float(min_sigma_usd), s * math.sqrt(v * max(t_eff, 1e-9)))
+        if sigma <= 0:
+            return None
+        return (s - k) / sigma
+    except (TypeError, ValueError):
+        return None

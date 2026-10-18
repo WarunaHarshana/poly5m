@@ -147,6 +147,8 @@ MAKER_POST_FILL_TRACE = os.getenv("MAKER_POST_FILL_TRACE", "1").strip().lower() 
 # inv14 LOG-ONLY: slot_trace (our side book every 5s to slot end) + chase_shadow (first ask in [.55,.65] <70s).
 SLOT_TRACE = os.getenv("SLOT_TRACE", "1").strip().lower() in ("yes", "y", "true", "1", "on")
 CHASE_SHADOW = os.getenv("CHASE_SHADOW", "1").strip().lower() in ("yes", "y", "true", "1", "on")
+# inv15 LOG-ONLY: settle_z_shadow (z under the real settlement rule: 60s TWAP at end vs 60s TWAP before start), 1/slot/asset at ~60s.
+SETTLE_Z_SHADOW = os.getenv("SETTLE_Z_SHADOW", "1").strip().lower() in ("yes", "y", "true", "1", "on")
 DYNAMIC_MAX_ELAPSED_S = float(os.getenv("DYNAMIC_MAX_ELAPSED_S", "240.0"))
 
 # --- AVN-MAS Take-Profit & Adverse Stop-Loss Parameters ---

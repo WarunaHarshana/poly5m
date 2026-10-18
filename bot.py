@@ -140,6 +140,9 @@ class CoinSlot:
     maker_block_logged: set = field(default_factory=set)
     momentum_gate_logged: bool = False
     entry_zone_logged: set = field(default_factory=set)
+    # inv15 LOG-ONLY settle_z_shadow state (once per slot)
+    settle_z_logged: bool = False
+    maker_posted: bool = False
 
 
 class TWAPBot:
@@ -614,6 +617,8 @@ class TWAPBot:
             slot.maker_block_logged = set()
             slot.momentum_gate_logged = False
             slot.entry_zone_logged = set()
+            slot.settle_z_logged = False
+            slot.maker_posted = False
             market = self.pub_client.find_active_5m_slot(now_ts=now, asset=slot.asset)
             if not market:
                 logger.warning(f"[{slot.asset.upper()}] Could not discover market for slot {window_ts}")
@@ -827,6 +832,7 @@ class TWAPBot:
                 except Exception:
                     z_twap_dyn = None
 
+            self._maybe_log_settle_z_shadow(slot, market, elapsed_s, spot, signed_z_dyn, favored_side, mid_px)
             allowed_feas, min_move_usd, max_allowed_ask, sigma_t = config.compute_dynamic_feasibility(
                 elapsed_s=elapsed_s, spot=spot, daily_vol=params.daily_vol
             )
@@ -2267,6 +2273,52 @@ class TWAPBot:
         except Exception as e:
             logger.warning(f"slot_trace log failed: {e}")
 
+    def _settle_z_now(self, slot, elapsed_s, spot=None):
+        """inv15 LOG-ONLY: (signed settlement-rule z, strike ref used). Never raises."""
+        try:
+            if elapsed_s is None:
+                return None
+            sp = spot if spot is not None else self.cl_stream.price(slot.asset)
+            if slot.strike_twap:
+                k = slot.strike_twap
+            elif slot.strike:
+                k = slot.strike  # approximation: spot strike when no 60s pre-open TWAP / priceToBeat
+            else:
+                return None
+            z = move_ref.settle_rule_z(sp, k, float(elapsed_s), slot.params.daily_vol,
+                                       min_sigma_usd=slot.params.min_sigma_usd(sp) if sp else 0.0)
+            return round(z, 4) if z is not None else None
+        except Exception:
+            return None
+
+    def _maybe_log_settle_z_shadow(self, slot, market, elapsed_s, spot, bot_z, bot_side, mid_fav) -> None:
+        """inv15 LOG-ONLY: one settle_z_shadow event per slot per asset at the first tick >= 60s elapsed."""
+        if slot.settle_z_logged or not bool(getattr(config, "SETTLE_Z_SHADOW", True)):
+            return
+        try:
+            if elapsed_s is None or float(elapsed_s) < 60.0:
+                return
+            slot.settle_z_logged = True
+            if float(elapsed_s) > 90.0:
+                return  # joined mid-slot (e.g. restart): skip rather than log a late snapshot
+            z = self._settle_z_now(slot, elapsed_s, spot)
+            mid_up = None
+            if mid_fav is not None:
+                mid_up = float(mid_fav) if bot_side == "UP" else 1.0 - float(mid_fav)
+            journal_write(
+                "settle_z_shadow", slot=(market or {}).get("slug"), asset=slot.asset,
+                elapsed_s=round(float(elapsed_s), 1),
+                settle_z=z, bot_z=round(float(bot_z), 4),
+                settle_side=(None if z is None else ("UP" if z >= 0 else "DOWN")), bot_side=bot_side,
+                mid_up=(round(mid_up, 4) if mid_up is not None else None),
+                mid_down=(round(1.0 - mid_up, 4) if mid_up is not None else None),
+                strike_ref=("strike_twap" if slot.strike_twap else "spot_strike"),
+                strike_twap_source=slot.strike_twap_source,
+                posted=bool(slot.maker_posted),
+            )
+        except Exception as e:
+            logger.warning(f"[{slot.asset.upper()}] settle_z_shadow log failed: {e}")
+
     def _log_maker_post_shadow(self, slot, market, side, token_id, bid, shares, order_id, spot=None) -> None:
         """Shadow-only pre-post gate log (MAKER_POST_GATE_SHADOW). Never raises, never blocks."""
         if not bool(getattr(config, "MAKER_POST_GATE_SHADOW", False)):
@@ -2275,6 +2327,8 @@ class TWAPBot:
             rec = maker_guard.post_shadow_record(self._mid_hist, token_id, time.time())
             st0 = market.get("slot_start_ts")
             rec["elapsed_s"] = round(time.time() - float(st0), 1) if st0 else None
+            if bool(getattr(config, "SETTLE_Z_SHADOW", True)):
+                rec["settle_z"] = self._settle_z_now(slot, rec.get("elapsed_s"))
             journal_write(
                 "maker_post_shadow", slot=market.get("slug"), asset=slot.asset, side=side, bid=bid,
                 shares=shares, order_id=order_id, mode=config.MODE, **rec,
@@ -2336,6 +2390,7 @@ class TWAPBot:
                 logger.error(f"Live limit order placement failed: {e}")
                 return
 
+        slot.maker_posted = True
         self._log_maker_post_shadow(slot, market, signal.side, token_id, signal.target_bid, shares, order_id,
                                     spot=getattr(signal, "spot", None))
         slot.resting_order = {
