@@ -143,6 +143,9 @@ class CoinSlot:
     # inv15 LOG-ONLY settle_z_shadow state (once per slot)
     settle_z_logged: bool = False
     maker_posted: bool = False
+    # inv17 LOG-ONLY late_window_shadow virtual bid (once per slot)
+    late_shadow: dict | None = None
+    late_shadow_started: bool = False
 
 
 class TWAPBot:
@@ -619,6 +622,9 @@ class TWAPBot:
             slot.entry_zone_logged = set()
             slot.settle_z_logged = False
             slot.maker_posted = False
+            self._finish_late_shadow(slot, "slot_end")
+            slot.late_shadow = None
+            slot.late_shadow_started = False
             market = self.pub_client.find_active_5m_slot(now_ts=now, asset=slot.asset)
             if not market:
                 logger.warning(f"[{slot.asset.upper()}] Could not discover market for slot {window_ts}")
@@ -833,6 +839,7 @@ class TWAPBot:
                     z_twap_dyn = None
 
             self._maybe_log_settle_z_shadow(slot, market, elapsed_s, spot, signed_z_dyn, favored_side, mid_px)
+            self._tick_late_shadow(slot, elapsed_s, remaining_s, spot, strike, signed_z_dyn, now)
             allowed_feas, min_move_usd, max_allowed_ask, sigma_t = config.compute_dynamic_feasibility(
                 elapsed_s=elapsed_s, spot=spot, daily_vol=params.daily_vol
             )
@@ -948,8 +955,14 @@ class TWAPBot:
                     )
                     maker_feats = None
                     maker_zone_blocked = self._entry_zone_blocked(slot, slot_key, "maker", elapsed_s)
+                    late_cand = bool(is_maker_candidate and maker_zone_blocked)
                     if is_maker_candidate and maker_zone_blocked:
                         is_maker_candidate = False
+                    if late_cand:
+                        self._maybe_start_late_shadow(
+                            slot, market, elapsed_s, favored_side, fav_token, mid_px, q_ask, signed_z_dyn,
+                            z_twap_dyn, spot, now, maker_require_twap, maker_guard_on,
+                        )
                     if is_maker_candidate and maker_require_twap and not slot.strike_twap:
                         # No settlement (TWAP) strike for this slot (e.g. first slot after a restart):
                         # don't quote the maker leg at all. Logged once per slot.
@@ -2272,6 +2285,101 @@ class TWAPBot:
                               price_source=src)
         except Exception as e:
             logger.warning(f"slot_trace log failed: {e}")
+
+    def _maybe_start_late_shadow(self, slot, market, elapsed_s, side, token, mid, ask, z, z_twap, spot, now,
+                                 require_twap, guard_on) -> None:
+        """inv17 LOG-ONLY: start ONE virtual maker bid when only the entry block zone stopped a 70-120s entry.
+        Re-runs the live maker quote checks without their block logging; never places or changes orders."""
+        if slot.late_shadow_started or not bool(getattr(config, "LATE_WINDOW_SHADOW", True)):
+            return
+        try:
+            e = float(elapsed_s)
+            if not (70.0 <= e < 120.0) or slot.position or slot.resting_order or mid is None or ask is None:
+                return
+            if require_twap and not slot.strike_twap:
+                return
+            if guard_on:
+                ok, _, _, _ = maker_guard.check_quote(side, z, z_twap, float(getattr(config, "MAKER_MIN_TWAP_SIGMA", 0.25)))
+                _, drop = self._mid_hist.drop(token, now, mid)
+                if ok and maker_guard.mid_drop_blocked(drop, float(getattr(config, "MAKER_MAX_MID_DROP_60S", 0.15))):
+                    ok = False
+                if ok and maker_guard.post_falling_mid_blocked(
+                    drop, self._mid_hist.range_over(token, now, float(getattr(config, "MAKER_POST_STABLE_S", 3.0)), mid),
+                    float(getattr(config, "MAKER_POST_MAX_MID_DROP", 0.0)),
+                    float(getattr(config, "MAKER_POST_STABLE_MAX_RANGE", 0.0)),
+                ):
+                    ok = False
+                if not ok:
+                    return
+            bid = round(float(mid) - config.DYNAMIC_HALF_SPREAD, 2)
+            bid = max(config.DYNAMIC_MIDBAND_LO, min(config.DYNAMIC_MIDBAND_HI, bid))
+            bid = min(0.50, bid, round(float(ask) - 0.01, 2))
+            if bid >= float(ask):
+                return
+            tokens = (market or {}).get("tokens") or {}
+            slot.late_shadow_started = True
+            slot.late_shadow = {"slot": (market or {}).get("slug"), "side": side, "token": token,
+                                "opp": tokens.get("DOWN" if side == "UP" else "UP"), "bid": bid,
+                                "filled": False, "fill_elapsed_s": None, "ask_through": False, "max_bid": None}
+            journal_write("late_window_shadow", slot=slot.late_shadow["slot"], asset=slot.asset, side=side, bid=bid,
+                          mid=round(float(mid), 4), ask=float(ask), elapsed_s=round(e, 1), bot_z=round(float(z), 4),
+                          settle_z=self._settle_z_now(slot, e, spot))
+        except Exception as ex:
+            logger.warning(f"[{slot.asset.upper()}] late_window_shadow start failed: {ex}")
+
+    def _tick_late_shadow(self, slot, elapsed_s, remaining_s, spot, strike, signed_z, now) -> None:
+        """inv17 LOG-ONLY: track the virtual bid with the in-memory book. Unfilled: fill when ask <= bid, cancel on
+        the live resting-maker cancel rules (except the entry block zone). Filled: track max best bid to slot end."""
+        vb = slot.late_shadow
+        if not vb or vb.get("done"):
+            return
+        try:
+            top = self.book_stream.get_top(vb["token"], opp_token_id=vb.get("opp"))
+            bid_now = (top or {}).get("bid"); ask_now = (top or {}).get("ask")
+            if vb["filled"]:
+                if bid_now is not None:
+                    vb["max_bid"] = max(float(bid_now), vb["max_bid"] or 0.0)
+                return
+            if ask_now is not None and float(ask_now) <= vb["bid"]:
+                vb["filled"] = True
+                vb["fill_elapsed_s"] = round(float(elapsed_s), 1)
+                vb["ask_through"] = float(ask_now) < vb["bid"]
+                if bid_now is not None:
+                    vb["max_bid"] = float(bid_now)
+                return
+            side = vb["side"]
+            mid = 0.5 * (float(bid_now) + float(ask_now)) if (bid_now and ask_now) else None
+            reason = None
+            if remaining_s < config.DYNAMIC_WINDOW_END_S:
+                reason = "window_end"
+            elif mid is not None and not (config.DYNAMIC_MIDBAND_LO <= mid <= config.DYNAMIC_MIDBAND_HI):
+                reason = "mid_left_band"
+            elif bool(getattr(config, "MAKER_TWAP_GUARD", False)) and maker_guard.twap_cross_adverse(side, spot, slot.strike_twap):
+                reason = "maker_guard_twap_cross"
+            elif mid is not None and maker_guard.mid_drop_blocked(
+                    self._mid_hist.drop(vb["token"], now, mid)[1], float(getattr(config, "MAKER_MAX_MID_DROP_60S", 0.15))):
+                reason = "maker_guard_mid_drop"
+            elif strike and ((side == "UP" and spot < strike) or (side == "DOWN" and spot > strike)):
+                reason = "adverse_spot_cross"
+            elif (side == "UP" and signed_z < -0.20) or (side == "DOWN" and signed_z > 0.20):
+                reason = "adverse_z_flip"
+            if reason:
+                self._finish_late_shadow(slot, reason)
+        except Exception as ex:
+            logger.warning(f"[{slot.asset.upper()}] late_window_shadow tick failed: {ex}")
+
+    def _finish_late_shadow(self, slot, reason) -> None:
+        """inv17 LOG-ONLY: write the single late_window_shadow_result event (cancel or slot end)."""
+        vb = slot.late_shadow
+        if not vb or vb.get("done"):
+            return
+        vb["done"] = True
+        try:
+            journal_write("late_window_shadow_result", slot=vb["slot"], asset=slot.asset, side=vb["side"], bid=vb["bid"],
+                          filled=bool(vb["filled"]), fill_elapsed_s=vb["fill_elapsed_s"], ask_through=bool(vb["ask_through"]),
+                          max_bid_after_fill=vb["max_bid"], cancel_reason=(None if vb["filled"] else reason))
+        except Exception as ex:
+            logger.warning(f"[{slot.asset.upper()}] late_window_shadow result failed: {ex}")
 
     def _settle_z_now(self, slot, elapsed_s, spot=None):
         """inv15 LOG-ONLY: (signed settlement-rule z, strike ref used). Never raises."""

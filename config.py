@@ -149,6 +149,8 @@ SLOT_TRACE = os.getenv("SLOT_TRACE", "1").strip().lower() in ("yes", "y", "true"
 CHASE_SHADOW = os.getenv("CHASE_SHADOW", "1").strip().lower() in ("yes", "y", "true", "1", "on")
 # inv15 LOG-ONLY: settle_z_shadow (z under the real settlement rule: 60s TWAP at end vs 60s TWAP before start), 1/slot/asset at ~60s.
 SETTLE_Z_SHADOW = os.getenv("SETTLE_Z_SHADOW", "1").strip().lower() in ("yes", "y", "true", "1", "on")
+# inv17 LOG-ONLY: late_window_shadow (one virtual maker bid per slot when ONLY the entry block zone stops a 70-120s maker entry).
+LATE_WINDOW_SHADOW = os.getenv("LATE_WINDOW_SHADOW", "1").strip().lower() in ("yes", "y", "true", "1", "on")
 DYNAMIC_MAX_ELAPSED_S = float(os.getenv("DYNAMIC_MAX_ELAPSED_S", "240.0"))
 
 # --- AVN-MAS Take-Profit & Adverse Stop-Loss Parameters ---
