@@ -486,6 +486,11 @@ class TWAPBot:
                 + ("on: maker positions hold to settlement (TP 0.95 only; no trailing/price stop/stop-loss/hard flatten/failsafe)"
                    if getattr(config, "MAKER_HOLD_TO_EXPIRY", False) else "off (maker uses the normal exit stack)")
             )
+            logger.info(
+                "DIP_BOUNCE_EXIT="
+                + (f"on: maker positions sell at best bid >= {config.DIP_BOUNCE_SELL:.2f} after bid <= {config.DIP_BOUNCE_DIP:.2f} (TP first)"
+                   if getattr(config, "DIP_BOUNCE_EXIT", False) else "off")
+            )
         elif config.STRATEGY in ("MIDBAND_MAKER", "MIDBAND", "H-006_MIDBAND_MAKER", "H-006"):
             logger.info(
                 f"Mid-band maker: band=[{config.MIDBAND_LO:.2f}..{config.MIDBAND_HI:.2f}] "
@@ -2624,6 +2629,10 @@ class TWAPBot:
             await self._exit_position_early(slot, market, exit_px, reason="take_profit")
             return
 
+        # Dip-bounce exit (after TP, which keeps priority): maker positions only.
+        if await self._maybe_dip_bounce_exit(slot, market, pos, best_bid, best_ask, remaining_s, elapsed_s):
+            return
+
         # MAKER_HOLD_TO_EXPIRY: after the take-profit check, maker positions hold to settlement
         # (no trailing, price stop, adverse stop-loss / urgent / hard flatten, or failsafe flatten).
         if self._maker_hold_to_expiry(pos):
@@ -2903,6 +2912,53 @@ class TWAPBot:
             if main_ask is not None and main_ask >= float(config.MOMENTUM_HEDGE_TRIGGER_ASK):
                 await self._place_micro_hedge(slot, market, tokens, pos, main_ask)
 
+    async def _maybe_dip_bounce_exit(self, slot, market, pos, best_bid, best_ask, remaining_s, elapsed_s) -> bool:
+        """Track the held token's low bid; after a dip to <= DIP_BOUNCE_DIP, sell on a bounce to >= DIP_BOUNCE_SELL.
+
+        Returns True when an exit was attempted this tick (caller returns). Uses _exit_position_early (same
+        FAK sell / partial / retry / PnL booking as take-profit). Arming needs a sane book (spread <= 0.15) so a
+        garbage thin-book bid can't arm it; the sell needs the token's OWN book bid >= DIP_BOUNCE_SELL (no implied
+        bid). At most DIP_BOUNCE_MAX_ATTEMPTS sell attempts per position, then it just holds.
+        """
+        if not getattr(config, "DIP_BOUNCE_EXIT", False) or not pos or pos.get("exiting"):
+            return False
+        if "MAKER" not in str(pos.get("strategy") or "").upper() or best_bid is None:
+            return False
+        if remaining_s is not None and float(remaining_s) <= 0.0:
+            return False
+        bid = float(best_bid)
+        dip_th = float(config.DIP_BOUNCE_DIP)
+        sell_th = float(config.DIP_BOUNCE_SELL)
+        sane = best_ask is not None and 0.0 <= float(best_ask) - bid <= 0.15
+        if bid <= dip_th and sane:
+            pos["dip_low"] = round(min(float(pos.get("dip_low", bid)), bid), 4)
+            return False
+        if pos.get("dip_low") is None or bid < sell_th:
+            return False
+        if int(pos.get("dip_bounce_attempts", 0)) >= int(config.DIP_BOUNCE_MAX_ATTEMPTS):
+            return False
+        real_bid = self._real_best_bid(pos.get("token_id")) if pos.get("token_id") else None
+        if real_bid is None or float(real_bid) < sell_th:
+            return False
+        pos["dip_bounce_attempts"] = int(pos.get("dip_bounce_attempts", 0)) + 1
+        pos.setdefault("dip_bounce_shares0", float(pos["shares"]))
+        dip_low = pos.get("dip_low")
+        shares0 = pos["dip_bounce_shares0"]
+        logger.info(
+            f"[{slot.asset.upper()} DIP-BOUNCE] {pos.get('side')} bid={float(real_bid):.3f} >= {sell_th:.2f} after "
+            f"low {float(dip_low):.3f} <= {dip_th:.2f} (entry={float(pos['price']):.3f}, attempt "
+            f"{pos['dip_bounce_attempts']}/{config.DIP_BOUNCE_MAX_ATTEMPTS}) | selling"
+        )
+        pnl = await self._exit_position_early(slot, market, float(real_bid), reason="dip_bounce")
+        if slot.position is None:
+            journal_write(
+                "dip_bounce_exit", slot=market.get("slug"), asset=slot.asset, side=pos.get("side"),
+                dip_low=dip_low, sell_bid=float(real_bid), shares=shares0,
+                pnl=round(pnl, 2) if pnl is not None else None,
+                elapsed_s=round(float(elapsed_s), 1) if elapsed_s is not None else None,
+            )
+        return True
+
     @staticmethod
     def _maker_hold_to_expiry(pos: dict | None) -> bool:
         """True when MAKER_HOLD_TO_EXPIRY is on and the position is a maker-leg fill."""
@@ -3034,7 +3090,7 @@ class TWAPBot:
         pos["hedge_cost_usd"] = cost
         pos["hedge_order_id"] = order_id
 
-    async def _exit_position_early(self, slot: CoinSlot, market: dict, exit_price: float, reason: str) -> None:
+    async def _exit_position_early(self, slot: CoinSlot, market: dict, exit_price: float, reason: str) -> float | None:
         """Flatten main (+ optional hedge) before TWAP settlement; paper marks at exit_price."""
         pos = slot.position
         if not pos or pos.get("exiting"):
@@ -3244,6 +3300,7 @@ class TWAPBot:
             maker_features=pos.get("maker_features"),
         )
         self._save_trade_record(record)
+        return pnl
 
     # ------------------------------------------------------------------ live order helpers
     def _live_poll_order(self, ro: dict, now: float) -> dict | None:

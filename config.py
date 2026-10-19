@@ -323,6 +323,13 @@ LIVE_ORDER_POLL_S = float(os.getenv("LIVE_ORDER_POLL_S", "2.0"))
 # so winners are cashed on the CLOB instead of needing an on-chain redeem. Losers (low bid) settle at 0.
 LIVE_PRE_EXPIRY_EXIT_S = float(os.getenv("LIVE_PRE_EXPIRY_EXIT_S", "20.0"))
 LIVE_PRE_EXPIRY_MIN_BID = float(os.getenv("LIVE_PRE_EXPIRY_MIN_BID", "0.90"))
+# Dip-bounce exit (maker positions): once the held token's best bid has been <= DIP_BOUNCE_DIP (on a sane
+# book, spread <= 0.15), sell the whole position via the normal early-exit path when its own-book best bid
+# recovers to >= DIP_BOUNCE_SELL. Take-profit (0.95) is checked first and is unchanged. Default off.
+DIP_BOUNCE_EXIT = os.getenv("DIP_BOUNCE_EXIT", "0").strip().lower() in ("yes", "y", "true", "1", "on")
+DIP_BOUNCE_DIP = float(os.getenv("DIP_BOUNCE_DIP", "0.35"))
+DIP_BOUNCE_SELL = float(os.getenv("DIP_BOUNCE_SELL", "0.80"))
+DIP_BOUNCE_MAX_ATTEMPTS = int(os.getenv("DIP_BOUNCE_MAX_ATTEMPTS", "3"))
 # Live: refresh bankroll from the wallet's CLOB collateral balance this often (only while flat).
 LIVE_BANKROLL_REFRESH_S = float(os.getenv("LIVE_BANKROLL_REFRESH_S", "60.0"))
 # Cap how many coins can open new positions in a single 5-minute slot.
