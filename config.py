@@ -125,6 +125,9 @@ SETTLEMENT_TWAP_WINDOW_S = float(os.getenv("SETTLEMENT_TWAP_WINDOW_S", "60"))
 # is cancelled on an adverse TWAP-strike cross. Falls back to legacy behaviour without a TWAP strike.
 MAKER_TWAP_GUARD = os.getenv("MAKER_TWAP_GUARD", "1").strip().lower() in ("yes", "y", "true", "1", "on")
 MAKER_MIN_TWAP_SIGMA = float(os.getenv("MAKER_MIN_TWAP_SIGMA", "0.25"))
+# After a maker guard (mid_drop, twap_cross, direction_conflict, adverse_spot_cross, twap_sigma) cancels or
+# blocks a bid, no maker bid is posted in that slot for this many seconds (0 = off).
+GUARD_COOLDOWN_S = float(os.getenv("GUARD_COOLDOWN_S", "15"))
 # With the guard on, require a TWAP strike for the maker leg: no maker bids in a slot whose TWAP
 # strike is unavailable (e.g. first slot after a restart) and cancel a resting bid if it goes missing.
 # Off = legacy spot-strike fallback. Only effective when MAKER_TWAP_GUARD is on. Momentum unaffected.

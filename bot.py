@@ -138,6 +138,7 @@ class CoinSlot:
     move_ref_block_logged: bool = False
     # Maker guard / momentum elapsed-gate logging (once per slot per reason)
     maker_block_logged: set = field(default_factory=set)
+    guard_cooldown_until: float = 0.0  # no maker post before this ts (GUARD_COOLDOWN_S)
     momentum_gate_logged: bool = False
     entry_zone_logged: set = field(default_factory=set)
     # inv15 LOG-ONLY settle_z_shadow state (once per slot)
@@ -629,6 +630,7 @@ class TWAPBot:
             slot.move_ref_used = None
             slot.move_ref_block_logged = False
             slot.maker_block_logged = set()
+            slot.guard_cooldown_until = 0.0
             slot.momentum_gate_logged = False
             slot.entry_zone_logged = set()
             slot.settle_z_logged = False
@@ -990,6 +992,8 @@ class TWAPBot:
                             favored_side, signed_z_dyn, z_twap_dyn,
                             float(getattr(config, "MAKER_MIN_TWAP_SIGMA", 0.25)),
                         )
+                        if mk_ok and maker_guard.twap_cross_adverse(favored_side, spot, slot.strike_twap):
+                            mk_ok, mk_reason = False, maker_guard.REASON_TWAP_CROSS
                         mk_hi, mk_drop = self._mid_hist.drop(fav_token, now, mid_px)
                         if mk_ok and maker_guard.mid_drop_blocked(
                             mk_drop, float(getattr(config, "MAKER_MAX_MID_DROP_60S", 0.15))
@@ -1294,6 +1298,7 @@ class TWAPBot:
                 elif adverse_cross:
                     cancel = True
                     cancel_reason = f"adverse_spot_cross (spot={spot:.2f} vs strike={strike:.2f})"
+                    self._start_guard_cooldown(slot, maker_guard.REASON_ADVERSE_SPOT_CROSS)
                 elif adverse_z:
                     cancel = True
                     cancel_reason = f"adverse_z_flip (z={signed_z_dyn:.2f})"
@@ -1898,9 +1903,16 @@ class TWAPBot:
             )
         return True
 
+    def _start_guard_cooldown(self, slot: CoinSlot, reason: str | None) -> None:
+        """Start/extend the per-slot maker re-post cooldown after a guard block or cancel."""
+        cd = float(getattr(config, "GUARD_COOLDOWN_S", 0.0) or 0.0)
+        if cd > 0 and reason in maker_guard.COOLDOWN_REASONS:
+            slot.guard_cooldown_until = max(slot.guard_cooldown_until, time.time() + cd)
+
     def _log_maker_block(self, slot: CoinSlot, slot_key: str, reason: str | None, stage: str, **kw) -> None:
         """MAKER_BLOCK log + journal; quote-stage blocks log once per slot per reason."""
         reason = reason or "unknown"
+        self._start_guard_cooldown(slot, reason)
         key = f"{stage}:{reason}"
         if stage == "quote" and key in slot.maker_block_logged:
             return
@@ -2584,6 +2596,12 @@ class TWAPBot:
         """Post resting limit bid inside spread as Maker."""
         token_id = market["tokens"].get(signal.side)
         if not token_id or not signal.target_bid:
+            return
+        if time.time() < slot.guard_cooldown_until:
+            self._log_maker_block(
+                slot, market.get("slug", ""), maker_guard.REASON_GUARD_COOLDOWN, stage="quote", side=signal.side,
+                cooldown_left_s=round(slot.guard_cooldown_until - time.time(), 1),
+            )
             return
 
         stake_usd = (

@@ -24,6 +24,11 @@ REASON_MID_DROP = "mid_drop"
 REASON_POST_FALLING_MID = "post_falling_mid"
 REASON_TWAP_CROSS = "twap_cross"
 REASON_NO_TWAP_STRIKE = "no_twap_strike"
+REASON_ADVERSE_SPOT_CROSS = "adverse_spot_cross"
+REASON_GUARD_COOLDOWN = "guard_cooldown"
+# Guard blocks/cancels that start the per-slot GUARD_COOLDOWN_S re-post cooldown.
+COOLDOWN_REASONS = frozenset({REASON_MID_DROP, REASON_TWAP_CROSS, REASON_DIRECTION_CONFLICT,
+                              REASON_ADVERSE_SPOT_CROSS, REASON_TWAP_SIGMA})
 
 REF_SPOT_FALLBACK = "spot_fallback"  # no TWAP strike yet -> legacy spot-strike z
 REF_SPOT = "spot"
