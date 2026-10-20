@@ -158,7 +158,12 @@ class TWAPBot:
         }
         # Back-compat alias used by older tests/helpers
         self.engine = next(iter(self.slots.values())).engine if self.slots else TWAPEngine()
-        self.cl_stream = ChainlinkRTDSStream(assets=config.ASSETS)
+        # LOG-ONLY sol_shadow: SOL gets a price bucket and a CoinSlot kept OUTSIDE self.slots (never ticked/traded).
+        self._sol_shadow: CoinSlot | None = None
+        if bool(getattr(config, "SOL_SHADOW", True)) and "sol" not in config.ASSETS:
+            self._sol_shadow = CoinSlot(asset="sol", params=config._load_asset_params("sol"),
+                                        engine=_engine_for(config._load_asset_params("sol")))
+        self.cl_stream = ChainlinkRTDSStream(assets=list(config.ASSETS) + (["sol"] if self._sol_shadow else []))
         self.book_stream = PolymarketBookStream()
         self.pub_client = PolymarketPublicClient()
         self.risk = RiskManager()
@@ -604,6 +609,7 @@ class TWAPBot:
 
                 for slot in self.slots.values():
                     await self._tick_asset(slot, now)
+                self._tick_sol_shadow(now)
 
                 await asyncio.sleep(1.0)
 
@@ -645,6 +651,8 @@ class TWAPBot:
                     f"[{slot.asset.upper()}] Restored S0 ${slot.params.fmt_px(slot.strike)} from volume "
                     f"(survived redeploy)"
                 )
+
+        self._discover_sol_shadow(now)
 
     async def _tick_asset(self, slot: CoinSlot, now: float) -> None:
         market = slot.market
@@ -2385,6 +2393,121 @@ class TWAPBot:
                           max_bid_after_fill=vb["max_bid"], cancel_reason=(None if vb["filled"] else reason))
         except Exception as ex:
             logger.warning(f"[{slot.asset.upper()}] late_window_shadow result failed: {ex}")
+
+    # ------------------------------------------------------------------ LOG-ONLY sol_shadow (never trades)
+    def _discover_sol_shadow(self, now: float) -> None:
+        """New 5m window: close out the previous SOL shadow slot, then find the SOL market (book watch only)."""
+        s = self._sol_shadow
+        if s is None:
+            return
+        try:
+            self._finish_sol_shadow("slot_end")
+            s.market = None; s.strike = None; s.strike_twap = None; s.strike_twap_source = None
+            s.strike_twap_resolved = False; s.late_shadow = None; s.late_shadow_started = False
+            m = self.pub_client.find_active_5m_slot(now_ts=now, asset="sol")
+            if m and int(m.get("slot_start_ts") or 0) == int(now // config.SLOT_SECONDS * config.SLOT_SECONDS):
+                s.market = m
+                self.book_stream.watch(m["tokens"].get("UP", ""), m["tokens"].get("DOWN", ""))
+        except Exception:
+            pass
+
+    def _sol_shadow_entry_open(self, elapsed: float, now: float) -> bool:
+        hi = 240.0 if _in_utc_windows(getattr(config, "ENTRY_BLOCK_OFF_UTC", ""), now) else float(
+            getattr(config, "ENTRY_BLOCK_ELAPSED_LO", 70.0))
+        return 30.0 <= elapsed < hi
+
+    def _tick_sol_shadow(self, now: float) -> None:
+        """Rule B: virtual maker bid 0.50 on the settle_z side when |settle_z|>=0.5 and that side's mid is in
+        [DYNAMIC_MIDBAND_LO, HI]. Tracks fill (ask <= 0.50) / cancel / max bid after fill. Journal only."""
+        s = self._sol_shadow
+        if s is None or not s.market or not bool(getattr(config, "SOL_SHADOW", True)):
+            return
+        try:
+            m = s.market; e = now - float(m["slot_start_ts"]); rem = float(m["end_ts"]) - now
+            if not self.cl_stream.ready_for("sol") or self.cl_stream.is_stale(max_age_s=config.MAX_ORACLE_STALE_S, asset="sol"):
+                return
+            spot = self.cl_stream.price("sol")
+            if s.strike is None:
+                s.strike = self.cl_stream.get_slot_strike(m["slot_start_ts"], max_dist_s=5.0, asset="sol")
+                if s.strike is None and e <= 10.0:
+                    s.strike = spot
+            if not s.strike_twap_resolved and e >= 3.0:
+                s.strike_twap, s.strike_twap_source = move_ref.estimate_twap_strike(
+                    self.cl_stream, m["slot_start_ts"], float(getattr(config, "SETTLEMENT_TWAP_WINDOW_S", 60.0)),
+                    asset="sol", price_to_beat=m.get("price_to_beat"))
+                s.strike_twap_resolved = True
+            z = self._settle_z_now(s, e, spot)
+            if z is None:
+                return
+            tokens = m.get("tokens") or {}
+            vb = s.late_shadow
+            if vb is None:
+                if s.late_shadow_started or not self._sol_shadow_entry_open(e, now):
+                    return
+                side = "UP" if z >= 0 else "DOWN"
+                tok, opp = tokens.get(side), tokens.get("DOWN" if side == "UP" else "UP")
+                top = self.book_stream.get_top(tok, opp_token_id=opp) if tok else None
+                bid, ask = (top or {}).get("bid"), (top or {}).get("ask")
+                if abs(z) < 0.5 or bid is None or ask is None:
+                    return
+                mid = 0.5 * (float(bid) + float(ask))
+                if not (config.DYNAMIC_MIDBAND_LO <= mid <= config.DYNAMIC_MIDBAND_HI):
+                    return
+                s.late_shadow_started = True
+                s.late_shadow = {"slot": m.get("slug"), "side": side, "token": tok, "opp": opp, "bid": 0.50,
+                                 "filled": False, "fill_elapsed_s": None, "ask_through": False, "max_bid": None}
+                journal_write("sol_shadow", slot=m.get("slug"), asset="sol", posted=True, side=side, bid=0.50,
+                              mid=round(mid, 4), ask=float(ask), elapsed_s=round(e, 1), settle_z=z, spot=spot,
+                              strike_ref=("strike_twap" if s.strike_twap else "spot_strike"))
+                vb = s.late_shadow
+            if vb.get("done"):
+                return
+            top = self.book_stream.get_top(vb["token"], opp_token_id=vb.get("opp"))
+            bid_now, ask_now = (top or {}).get("bid"), (top or {}).get("ask")
+            if vb["filled"]:
+                if bid_now is not None:
+                    vb["max_bid"] = max(float(bid_now), vb["max_bid"] or 0.0)
+                return
+            if ask_now is not None and float(ask_now) <= vb["bid"]:
+                vb.update(filled=True, fill_elapsed_s=round(e, 1), ask_through=float(ask_now) < vb["bid"],
+                          max_bid=(float(bid_now) if bid_now is not None else None))
+                return
+            mid = 0.5 * (float(bid_now) + float(ask_now)) if (bid_now is not None and ask_now is not None) else None
+            sg = 1.0 if vb["side"] == "UP" else -1.0
+            reason = None
+            if not self._sol_shadow_entry_open(e, now) and e >= 30.0:
+                reason = "entry_window_end"
+            elif rem < config.DYNAMIC_WINDOW_END_S:
+                reason = "window_end"
+            elif mid is not None and not (config.DYNAMIC_MIDBAND_LO <= mid <= config.DYNAMIC_MIDBAND_HI):
+                reason = "mid_left_band"
+            elif sg * z < -0.20:
+                reason = "adverse_z_flip"
+            if reason:
+                self._finish_sol_shadow(reason)
+        except Exception:
+            pass
+
+    def _finish_sol_shadow(self, reason: str) -> None:
+        """Write the single sol_shadow_result (posted slots) or a posted=False sol_shadow (no virtual bid)."""
+        s = self._sol_shadow
+        if s is None or not s.market:
+            return
+        try:
+            vb = s.late_shadow
+            if vb is None:
+                if not s.late_shadow_started:
+                    s.late_shadow_started = True
+                    journal_write("sol_shadow", slot=s.market.get("slug"), asset="sol", posted=False)
+                return
+            if vb.get("done"):
+                return
+            vb["done"] = True
+            journal_write("sol_shadow_result", slot=vb["slot"], asset="sol", side=vb["side"], bid=vb["bid"],
+                          filled=bool(vb["filled"]), fill_elapsed_s=vb["fill_elapsed_s"], ask_through=bool(vb["ask_through"]),
+                          max_bid_after_fill=vb["max_bid"], cancel_reason=(None if vb["filled"] else reason))
+        except Exception:
+            pass
 
     def _settle_z_now(self, slot, elapsed_s, spot=None):
         """inv15 LOG-ONLY: (signed settlement-rule z, strike ref used). Never raises."""

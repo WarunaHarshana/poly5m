@@ -151,6 +151,8 @@ CHASE_SHADOW = os.getenv("CHASE_SHADOW", "1").strip().lower() in ("yes", "y", "t
 SETTLE_Z_SHADOW = os.getenv("SETTLE_Z_SHADOW", "1").strip().lower() in ("yes", "y", "true", "1", "on")
 # inv17 LOG-ONLY: late_window_shadow (one virtual maker bid per slot when ONLY the entry block zone stops a 70-120s maker entry).
 LATE_WINDOW_SHADOW = os.getenv("LATE_WINDOW_SHADOW", "1").strip().lower() in ("yes", "y", "true", "1", "on")
+# LOG-ONLY: sol_shadow (rule B virtual maker bid at 0.50 on the settle_z side for SOL 5m; SOL is never traded).
+SOL_SHADOW = os.getenv("SOL_SHADOW", "1").strip().lower() in ("yes", "y", "true", "1", "on")
 DYNAMIC_MAX_ELAPSED_S = float(os.getenv("DYNAMIC_MAX_ELAPSED_S", "240.0"))
 
 # --- AVN-MAS Take-Profit & Adverse Stop-Loss Parameters ---
