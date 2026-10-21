@@ -98,6 +98,15 @@ class TestBot(unittest.TestCase):
     def run_t(self, ts):
         for t in ts:
             asyncio.run(self.bot._tick_late_fv(self.slot, self.market, S + t))
+            asyncio.run(self.bot._late_fv_settle(S + t))
+
+    def test_no_market_scan_row(self):
+        self.bot.pub_client.find_active_5m_slot = lambda now_ts=None, asset=None: None
+        self.bot._load_slot_state = lambda: {}
+        self.bot._discover_sol_shadow = lambda now: None
+        asyncio.run(self.bot._discover_slot(int(S), S))
+        scan = self.ev("late_fv_scan")
+        self.assertEqual(scan[-1]["skips"], {"no_market": 1})
 
     def test_fires_once_in_window_and_logs_scan_and_result(self):
         self.run_t(range(200, 320))

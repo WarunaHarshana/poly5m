@@ -644,6 +644,8 @@ class TWAPBot:
                     await self._discover_slot(current_window, now)
 
                 await self._flush_pending_settlements(now)
+                if bool(getattr(config, "LATE_FV_SHADOW", False)):
+                    await self._late_fv_settle(now)
                 self._refresh_live_bankroll(now)
 
                 for slot in self.slots.values():
@@ -684,6 +686,9 @@ class TWAPBot:
             market = self.pub_client.find_active_5m_slot(now_ts=now, asset=slot.asset)
             if not market:
                 logger.warning(f"[{slot.asset.upper()}] Could not discover market for slot {window_ts}")
+                if bool(getattr(config, "LATE_FV_SHADOW", False)) and slot.asset == "btc":
+                    journal_write("late_fv_scan", slot=f"btc-updown-5m-{int(window_ts)}", asset=slot.asset, n_checks=0,
+                                  fired=False, best_edge=None, skips={"no_market": 1})
                 continue
             slot.market = market
             logger.info(f"[SLOT {window_ts}] {slot.asset.upper()} {market['slug']}")
@@ -2594,7 +2599,6 @@ class TWAPBot:
     # Never places/cancels orders: only REST book reads (public client), Chainlink history and journal writes.
     async def _tick_late_fv(self, slot, market, now) -> None:
         try:
-            await self._late_fv_settle(now)
             start = float(market.get("slot_start_ts") or 0)
             slug = market.get("slug")
             if not start or not slug:
