@@ -171,3 +171,75 @@ def _low_ask_thin(self):
 
 TestLateFvLive.test_low_ask_upsizes = _low_ask_test
 TestLateFvLive.test_low_ask_thin_depth = _low_ask_thin
+
+
+class FakeLiveAvg(FakeLive):
+    def place_order(self, token_id, side, price, size, order_type="GTC", max_usd=None):
+        r = super().place_order(token_id, side, price, size, order_type, max_usd)
+        r["avg_price"] = 0.31
+        return r
+
+
+def _slip_limit(self):
+    mock.patch.object(config, "LATE_FV_SLIPPAGE", 0.02).start()
+    self.bot.live_client = FakeLiveAvg()
+    self.run_t(range(215, 230))
+    self.assertEqual(self.bot.live_client.calls, [("tu", "BUY", 0.32, 5.0, "FOK")])
+    a = self.ev("late_fv_attempt")[0]
+    self.assertEqual((a["ask"], a["limit_price"], a["slippage"]), (0.30, 0.32, 0.02))
+    self.assertEqual(self.slot.position["price"], 0.31)  # actual fill price used for P&L
+    sh = self.ev("late_fv_shadow")[0]
+    self.assertNotIn("limit_price", sh); self.assertNotIn("ladder", sh)
+
+
+def _slip_default_zero(self):
+    self.run_t(range(215, 230))
+    a = self.ev("late_fv_attempt")[0]
+    self.assertEqual((a["limit_price"], a["slippage"]), (0.30, 0.0))
+
+
+def _slip_edge_skip(self):
+    mock.patch.object(config, "LATE_FV_SLIPPAGE", 0.95).start()  # limit capped at 0.97 -> edge gone
+    self.run_t(range(215, 230))
+    self.assertEqual(self.skips(), ["edge_after_slippage"])
+    self.assertEqual(self.ev("late_fv_skip")[0]["limit_price"], 0.97)
+    self.assertEqual(self.bot.live_client.calls, [])
+
+
+def _slip_depth(self):
+    mock.patch.object(config, "LATE_FV_SLIPPAGE", 0.02).start()
+    self.books = {"tu": book(asks=[(0.05, 10), (0.06, 5), (0.08, 100)], bids=[(0.04, 10)]),
+                  "td": book(asks=[(0.96, 10)], bids=[(0.94, 10)])}
+    self.bot.pub_client.get_order_book = lambda tok: self.books[tok]
+    self.run_t(range(215, 230))
+    a = self.ev("late_fv_attempt")[0]
+    self.assertEqual(a["limit_price"], 0.07)
+    self.assertEqual(a["shares"], 15.0)  # ceil(1.01/0.07)
+    self.assertEqual(a["depth_at_limit"], 25.0)  # 10@.05 + 5@.06 + complement 10@.06 (1-.94); .08 excluded
+    self.assertTrue(a["fok_would_fill"])
+
+
+def _ask_below_tick(self):
+    rec = {"slot": "s", "side": "UP", "best_ask": 0.005, "shares": 5, "model_prob": 0.9, "t": 230}
+    asyncio.run(self.bot._late_fv_live(self.slot, self.market, rec, None))
+    self.assertEqual(self.skips(), ["ask_below_tick"])
+    self.assertEqual(self.bot.live_client.calls, [])
+
+
+TestLateFvLive.test_ask_below_tick = _ask_below_tick
+TestLateFvLive.test_slippage_limit = _slip_limit
+TestLateFvLive.test_slippage_default_zero = _slip_default_zero
+TestLateFvLive.test_slippage_edge_skip = _slip_edge_skip
+TestLateFvLive.test_slippage_depth_to_limit = _slip_depth
+
+
+class TestLateFvLimit(unittest.TestCase):
+    def test_limit(self):
+        from late_fv import limit_price, depth_upto, edge_at
+        self.assertEqual(limit_price(0.30, 0.02, 0.97), 0.32)
+        self.assertEqual(limit_price(0.96, 0.02, 0.97), 0.97)
+        self.assertEqual(limit_price(0.305, 0.0, 0.97), 0.31)
+        self.assertEqual(limit_price(0.5, 0.0, 0.97), 0.5)
+        self.assertEqual(depth_upto([(0.3, 2), (0.31, 3), (0.33, 9)], 0.32), 5)
+        self.assertAlmostEqual(edge_at(0.9, 0.8), round(0.9 - 0.8 - 0.07 * 0.8 * 0.2, 4))
+

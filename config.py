@@ -190,6 +190,8 @@ LATE_FV_SHARES = float(os.getenv("LATE_FV_SHARES", "5"))
 LATE_FV_LIVE = os.getenv("LATE_FV_LIVE", "0").strip().lower() in ("yes", "y", "true", "1", "on")
 LATE_FV_MAX_USD = float(os.getenv("LATE_FV_MAX_USD", "5"))
 LATE_FV_STOP_USD = float(os.getenv("LATE_FV_STOP_USD", "6"))
+# FOK BUY limit = min(ask + LATE_FV_SLIPPAGE, LATE_FV_MAX_ASK, 0.99); edge re-checked at the limit (default 0 = at ask).
+LATE_FV_SLIPPAGE = float(os.getenv("LATE_FV_SLIPPAGE", "0"))
 # LOG-ONLY: sol_shadow (rule B virtual maker bid at 0.50 on the settle_z side for SOL 5m; SOL is never traded).
 SOL_SHADOW = os.getenv("SOL_SHADOW", "1").strip().lower() in ("yes", "y", "true", "1", "on")
 DYNAMIC_MAX_ELAPSED_S = float(os.getenv("DYNAMIC_MAX_ELAPSED_S", "240.0"))

@@ -90,7 +90,8 @@ def side_quote(book_tok, book_opp, shares: float) -> dict:
     best = min(p for p, _ in asks)
     at_best = sum(s for p, s in asks if abs(p - best) < 1e-9)
     bid = max(bids) if bids else None
-    return {"ask": best, "ask_size": round(at_best, 4), "depth_at_ask": round(at_best, 4),
+    ladder = sorted(asks)
+    return {"ask": best, "ask_size": round(at_best, 4), "depth_at_ask": round(at_best, 4), "ladder": ladder,
             "fok_fill": at_best + 1e-9 >= shares, "bid": bid,
             "spread": round(best - bid, 4) if bid is not None else None}
 
@@ -140,3 +141,21 @@ def live_shares(ask: float, base: float, max_usd: float, min_usd: float = MIN_MA
 
 def sim_pnl(won: bool, ask: float, shares: float) -> float:
     return round(shares * ((1.0 if won else 0.0) - ask) - shares * taker_fee(ask), 4)
+
+
+def depth_upto(ladder, limit: float) -> float:
+    """Total ask size at prices <= limit (what a FOK BUY at `limit` can consume)."""
+    return round(sum(s for p, s in (ladder or []) if p <= float(limit) + 1e-9), 4)
+
+
+def limit_price(ask: float, slippage: float, max_ask: float) -> float:
+    """FOK BUY limit: ask + slippage floored to the cent grid, never below ask (ceil'd to a cent),
+    capped at min(max_ask, 0.99)."""
+    a = float(ask)
+    lim = math.floor((a + max(0.0, float(slippage))) * 100 + 1e-9) / 100.0
+    lim = max(lim, math.ceil(a * 100 - 1e-9) / 100.0)
+    return round(min(lim, float(max_ask), 0.99), 2)
+
+
+def edge_at(prob: float, price: float) -> float:
+    return round(float(prob) - float(price) - taker_fee(float(price)), 4)

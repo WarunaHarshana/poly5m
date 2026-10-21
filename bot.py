@@ -512,7 +512,7 @@ class TWAPBot:
         _lfs = self._late_fv_state()
         logger.info(
             f"LATE_FV_LIVE={'ON' if getattr(config, 'LATE_FV_LIVE', False) else 'off'} mode={config.MODE} "
-            f"max_usd={config.LATE_FV_MAX_USD:.2f} stop_usd={config.LATE_FV_STOP_USD:.2f} shares={config.LATE_FV_SHARES:.0f} "
+            f"max_usd={config.LATE_FV_MAX_USD:.2f} slippage={float(getattr(config, 'LATE_FV_SLIPPAGE', 0.0)):.2f} stop_usd={config.LATE_FV_STOP_USD:.2f} shares={config.LATE_FV_SHARES:.0f} "
             f"cum_pnl={float(_lfs.get('pnl', 0.0)):+.2f} n={int(_lfs.get('n', 0))} stopped={bool(_lfs.get('stopped'))} "
             f"pending={len(self._late_fv_pending)}"
         )
@@ -2699,7 +2699,7 @@ class TWAPBot:
         self._late_fv_pending.append({**rec, "end": st["end"], "condition_id": market.get("condition_id"), "tries": 0})
         self._late_fv_save_pending()
         if bool(getattr(config, "LATE_FV_LIVE", False)):
-            await self._late_fv_live(slot, market, rec)
+            await self._late_fv_live(slot, market, rec, pick)
 
     # ------------------------------------------------------------------ LIVE late_fv taker
     def _late_fv_state_path(self):
@@ -2755,15 +2755,19 @@ class TWAPBot:
         st["pending"] = list(self._late_fv_pending)
         self._late_fv_save(st)
 
-    async def _late_fv_live(self, slot, market, rec) -> None:
+    async def _late_fv_live(self, slot, market, rec, pick: dict | None = None) -> None:
         """LIVE late_fv entry for a fired shadow pick. Never raises."""
         slug = rec.get("slot")
-        side, ask, sh = rec.get("side"), float(rec.get("best_ask") or 0.0), float(rec.get("shares") or 0.0)
+        side, ask = rec.get("side"), float(rec.get("best_ask") or 0.0)
+        slip = max(0.0, float(getattr(config, "LATE_FV_SLIPPAGE", 0.0) or 0.0))
+        max_ask = float(config.LATE_FV_MAX_ASK)
+        limit = late_fv.limit_price(ask, slip, max_ask) if ask > 0 else 0.0
+        sh = float(rec.get("shares") or 0.0)
 
         def skip(reason, **kw):
             logger.info(f"[BTC] late_fv skip: {reason} {kw}")
             journal_write("late_fv_skip", slot=slug, asset=slot.asset, reason=reason, side=side, ask=ask,
-                          shares=sh, t=rec.get("t"), edge=rec.get("edge"), **kw)
+                          shares=sh, t=rec.get("t"), edge=rec.get("edge"), limit_price=limit, slippage=slip, **kw)
         try:
             st = self._late_fv_state()
             if st.get("stopped"):
@@ -2774,23 +2778,35 @@ class TWAPBot:
                 return skip("position_open", strategy=slot.position.get("strategy"))
             if slot.resting_order:
                 return skip("maker_resting")
-            if ask <= 0 or ask > float(config.LATE_FV_MAX_ASK):
+            if 0 < ask < 0.01:
+                return skip("ask_below_tick")
+            if ask <= 0 or ask > max_ask:
                 return skip("bad_ask")
             cap = float(config.LATE_FV_MAX_USD)
-            if sh * ask > cap + 1e-9:
-                return skip("cost_above_max", cost_usd=round(sh * ask, 4), max_usd=cap)
+            sh = late_fv.live_shares(limit, float(config.LATE_FV_SHARES), cap)
+            edge_lim = late_fv.edge_at(float(rec.get("model_prob") or 0.0), limit)
+            if edge_lim < float(config.LATE_FV_MIN_EDGE) - 1e-12:
+                return skip("edge_after_slippage", edge_at_limit=edge_lim)
+            if sh * limit > cap + 1e-9:
+                return skip("cost_above_max", cost_usd=round(sh * limit, 4), max_usd=cap)
+            depth = late_fv.depth_upto((pick or {}).get("ladder"), limit) if (pick or {}).get("ladder") else None
             ok, why = self.risk.can_trade(open_notional=self._open_notional())
             if not ok:
                 return skip("risk_manager", detail=why)
             slot.sz_taker_block = True  # own the slot: no maker post afterwards
-            journal_write("late_fv_attempt", slot=slug, asset=slot.asset, side=side, ask=ask, shares=sh,
-                          cost_usd=round(sh * ask, 2), edge=rec.get("edge"), model_prob=rec.get("model_prob"),
-                          z_side=rec.get("z_side"), t=rec.get("t"), mode=config.MODE, max_usd=cap)
-            filled = await self._sz_taker_fok(slot, market, side, ask, sh, rec.get("z"), rec.get("t"),
+            journal_write("late_fv_attempt", slot=slug, asset=slot.asset, side=side, ask=ask, limit_price=limit,
+                          slippage=slip, shares=sh, cost_usd=round(sh * limit, 2), edge=rec.get("edge"),
+                          edge_at_limit=edge_lim, depth_at_limit=depth,
+                          fok_would_fill=(None if depth is None else depth + 1e-9 >= sh),
+                          model_prob=rec.get("model_prob"), z_side=rec.get("z_side"), t=rec.get("t"),
+                          mode=config.MODE, max_usd=cap)
+            filled = await self._sz_taker_fok(slot, market, side, limit, sh, rec.get("z"), rec.get("t"),
                                               strategy=LATE_FV, max_usd=cap)
             if filled and slot.position:
                 slot.position["late_fv_edge"] = rec.get("edge")
                 slot.position["late_fv_model_prob"] = rec.get("model_prob")
+                slot.position["late_fv_ask"] = ask
+                slot.position["late_fv_limit"] = limit
         except Exception as e:
             logger.error(f"[BTC] late_fv live failed: {e}")
 
