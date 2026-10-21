@@ -135,3 +135,39 @@ class TestLateFvLive(_Base):
 del _Base
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestLateFvMinNotional(unittest.TestCase):
+    def test_sizes(self):
+        from late_fv import live_shares
+        n = live_shares(0.19, 5, 5.0)
+        self.assertGreaterEqual(round(0.19, 2) * n, 1.0)
+        self.assertEqual(n, 6.0)
+        self.assertEqual(live_shares(0.05, 5, 5.0), 21.0)
+        self.assertAlmostEqual(0.05 * 21, 1.05)
+        self.assertEqual(live_shares(0.30, 5, 5.0), 5.0)
+        self.assertEqual(live_shares(0.20, 5, 5.0), 5.0)  # exactly $1.00 ok
+        self.assertEqual(live_shares(0.01, 5, 0.5), 5.0)  # cap blocks upsizing
+
+
+def _low_ask_test(self):
+    self.books = {"tu": book(asks=[(0.05, 30)], bids=[(0.04, 10)]), "td": book(asks=[(0.96, 10)], bids=[(0.94, 10)])}
+    self.bot.pub_client.get_order_book = lambda tok: self.books[tok]
+    self.run_t(range(215, 230))
+    self.assertEqual(self.bot.live_client.calls, [("tu", "BUY", 0.05, 21.0, "FOK")])
+    sh = self.ev("late_fv_shadow")[0]
+    self.assertEqual(sh["shares"], 21.0)
+    self.assertTrue(sh["fok_would_fill"])
+    self.assertEqual(self.ev("late_fv_attempt")[0]["shares"], 21.0)
+    self.assertEqual(self.slot.position["shares"], 21.0)
+
+
+def _low_ask_thin(self):
+    self.books = {"tu": book(asks=[(0.05, 10)], bids=[(0.04, 10)]), "td": book(asks=[(0.96, 10)], bids=[(0.94, 10)])}
+    self.bot.pub_client.get_order_book = lambda tok: self.books[tok]
+    self.run_t(range(215, 230))
+    self.assertFalse(self.ev("late_fv_shadow")[0]["fok_would_fill"])
+
+
+TestLateFvLive.test_low_ask_upsizes = _low_ask_test
+TestLateFvLive.test_low_ask_thin_depth = _low_ask_thin

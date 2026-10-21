@@ -121,5 +121,22 @@ def evaluate(z: float, q_up: dict, q_dn: dict, k: float, min_edge: float, max_as
     return pick, best
 
 
+MIN_MARKETABLE_USD = 1.00  # Polymarket rejects marketable BUY notional < $1 ("min size: 1")
+
+
+def live_shares(ask: float, base: float, max_usd: float, min_usd: float = MIN_MARKETABLE_USD,
+                buffer: float = 0.01) -> float:
+    """Shares for a FOK BUY at `ask`: `base` unless base*ask < min_usd, then the smallest whole-share count with
+    notional >= min_usd+buffer (place_order sends price at 2dp and size at 2dp; whole shares keep price*size exact).
+    Never exceeds max_usd (falls back to base, which the caller's cost cap then judges)."""
+    a = round(float(ask), 2)
+    if a <= 0 or base * a >= min_usd - 1e-9:
+        return float(base)
+    n = float(math.ceil((min_usd + buffer) / a - 1e-9))
+    if n * a > max_usd + 1e-9:
+        return float(base)
+    return n
+
+
 def sim_pnl(won: bool, ask: float, shares: float) -> float:
     return round(shares * ((1.0 if won else 0.0) - ask) - shares * taker_fee(ask), 4)

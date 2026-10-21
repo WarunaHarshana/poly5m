@@ -2682,6 +2682,9 @@ class TWAPBot:
         if pick is None:
             return
         st["done"] = True
+        sh = late_fv.live_shares(pick["ask"], sh, float(config.LATE_FV_MAX_USD))
+        if pick.get("depth_at_ask") is not None:
+            pick["fok_fill"] = float(pick["depth_at_ask"]) + 1e-9 >= sh
         ws = self.book_stream.get_top(tokens.get(pick["side"]), opp_token_id=tokens.get("DOWN" if pick["side"] == "UP" else "UP")) or {}
         rec = {"slot": st["slot"], "asset": slot.asset, "side": pick["side"], "model_prob": pick["prob"],
                "best_ask": pick["ask"], "ask_size": pick.get("ask_size"), "depth_at_ask": pick.get("depth_at_ask"),
@@ -2691,7 +2694,7 @@ class TWAPBot:
                "z_side": round(z if pick["side"] == "UP" else -z, 4), **info}
         st["fired"] = rec
         journal_write("late_fv_shadow", **rec)
-        logger.info(f"[BTC LATE_FV_SHADOW] virtual FOK BUY {pick['side']} {sh:.0f} sh @ {pick['ask']:.3f} t={t:.0f}s "
+        logger.info(f"[BTC LATE_FV_SHADOW] virtual FOK BUY {pick['side']} {sh:.0f} sh (${sh * pick['ask']:.2f}) @ {pick['ask']:.3f} t={t:.0f}s "
                     f"z={z:+.2f} p={pick['prob']:.3f} edge={pick['edge']:+.3f} fill={bool(pick.get('fok_fill'))}")
         self._late_fv_pending.append({**rec, "end": st["end"], "condition_id": market.get("condition_id"), "tries": 0})
         self._late_fv_save_pending()
