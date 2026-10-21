@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import logging
 import os
 import shutil
@@ -147,6 +148,8 @@ class CoinSlot:
     # inv17 LOG-ONLY late_window_shadow virtual bid (once per slot)
     late_shadow: dict | None = None
     late_shadow_started: bool = False
+    # LOG-ONLY settle_z2_shadow virtual bid (once per slot)
+    z2_shadow: dict | None = None
 
 
 class TWAPBot:
@@ -622,6 +625,8 @@ class TWAPBot:
         saved = self._load_slot_state()
         same_slot = int(saved.get("slot_ts") or 0) == int(window_ts)
         for slot in self.slots.values():
+            self._finish_settle_z2(slot, "slot_end")
+            slot.z2_shadow = None
             slot.market = None
             slot.strike = None
             slot.strike_twap = None
@@ -853,7 +858,8 @@ class TWAPBot:
                 except Exception:
                     z_twap_dyn = None
 
-            self._maybe_log_settle_z_shadow(slot, market, elapsed_s, spot, signed_z_dyn, favored_side, mid_px)
+            self._maybe_log_settle_z_shadow(slot, market, elapsed_s, spot, signed_z_dyn, favored_side, mid_px, z_twap_dyn)
+            self._tick_settle_z2(slot, elapsed_s, spot, now)
             self._tick_late_shadow(slot, elapsed_s, remaining_s, spot, strike, signed_z_dyn, now)
             allowed_feas, min_move_usd, max_allowed_ask, sigma_t = config.compute_dynamic_feasibility(
                 elapsed_s=elapsed_s, spot=spot, daily_vol=params.daily_vol
@@ -2539,7 +2545,7 @@ class TWAPBot:
         except Exception:
             return None
 
-    def _maybe_log_settle_z_shadow(self, slot, market, elapsed_s, spot, bot_z, bot_side, mid_fav) -> None:
+    def _maybe_log_settle_z_shadow(self, slot, market, elapsed_s, spot, bot_z, bot_side, mid_fav, z_twap=None) -> None:
         """inv15 LOG-ONLY: one settle_z_shadow event per slot per asset at the first tick >= 60s elapsed."""
         if slot.settle_z_logged or not bool(getattr(config, "SETTLE_Z_SHADOW", True)):
             return
@@ -2564,8 +2570,75 @@ class TWAPBot:
                 strike_twap_source=slot.strike_twap_source,
                 posted=bool(slot.maker_posted),
             )
+            self._maybe_start_settle_z2(slot, market, elapsed_s, z, bot_z, z_twap, mid_up)
         except Exception as e:
             logger.warning(f"[{slot.asset.upper()}] settle_z_shadow log failed: {e}")
+
+    # ------------------------------------------------------------------ LOG-ONLY settle_z2_shadow (never trades)
+    def _maybe_start_settle_z2(self, slot, market, elapsed_s, z, bot_z, z_twap, mid_up) -> None:
+        """Retuned settle_z entry, LOG-ONLY: |z|>=0.5, side mid <= min(0.80, Phi(1.18|z|)-0.03),
+        virtual bid floor(mid-0.03) cap 0.77, shares min(6, floor(4/bid)), direction_conflict applies."""
+        if not bool(getattr(config, "SETTLE_Z2_SHADOW", False)) or z is None or mid_up is None:
+            return
+        if abs(z) < 0.5:
+            return
+        if z_twap is not None and (float(bot_z) == 0.0 or float(z_twap) == 0.0 or (float(bot_z) > 0) != (float(z_twap) > 0)):
+            return  # direction_conflict
+        side = "UP" if z > 0 else "DOWN"
+        mid = float(mid_up) if side == "UP" else 1.0 - float(mid_up)
+        fair = 0.5 * (1.0 + math.erf(1.18 * abs(z) / math.sqrt(2.0)))
+        if mid > min(0.80, fair - 0.03):
+            return
+        bid = min(0.77, math.floor((mid - 0.03) * 100 + 1e-9) / 100.0)
+        if bid < 0.01:
+            return
+        shares = min(6, int(math.floor(4.0 / bid)))
+        tokens = (market or {}).get("tokens") or {}
+        slot.z2_shadow = {"slot": (market or {}).get("slug"), "side": side, "bid": bid, "shares": shares,
+                          "mid0": mid, "token": tokens.get(side), "opp": tokens.get("DOWN" if side == "UP" else "UP"),
+                          "filled": False, "fill_elapsed_s": None, "cancel": None, "last_z": z}
+        journal_write("settle_z2_shadow", slot=slot.z2_shadow["slot"], asset=slot.asset, side=side, bid=bid,
+                      shares=shares, mid=round(mid, 4), settle_z=z, fair=round(fair, 4),
+                      time_left_s=round(300.0 - float(elapsed_s), 1))
+
+    def _tick_settle_z2(self, slot, elapsed_s, spot, now) -> None:
+        vb = slot.z2_shadow
+        if not vb or vb.get("done"):
+            return
+        try:
+            z = self._settle_z_now(slot, elapsed_s, spot)
+            if z is not None:
+                vb["last_z"] = z
+            if vb["filled"] or vb["cancel"]:
+                return
+            top = self.book_stream.get_top(vb["token"], opp_token_id=vb.get("opp")) if vb["token"] else None
+            b = (top or {}).get("bid"); a = (top or {}).get("ask")
+            if float(elapsed_s) >= 240.0:
+                vb["cancel"] = "t240"
+            elif a is not None and float(a) < vb["bid"]:
+                vb["filled"] = True; vb["fill_elapsed_s"] = round(float(elapsed_s), 1)
+            elif a is not None and b is not None and vb["mid0"] - 0.5 * (float(a) + float(b)) >= 0.15:
+                vb["cancel"] = "mid_drop"
+        except Exception as ex:
+            logger.warning(f"[{slot.asset.upper()}] settle_z2_shadow tick failed: {ex}")
+
+    def _finish_settle_z2(self, slot, reason) -> None:
+        vb = slot.z2_shadow
+        if not vb or vb.get("done"):
+            return
+        vb["done"] = True
+        try:
+            lz = vb.get("last_z")
+            won = None if lz is None or lz == 0 else ((lz > 0) == (vb["side"] == "UP"))
+            pnl = None
+            if vb["filled"] and won is not None:
+                pnl = round(vb["shares"] * ((1.0 - vb["bid"]) if won else -vb["bid"]), 4)
+            journal_write("settle_z2_result", slot=vb["slot"], asset=slot.asset, side=vb["side"], bid=vb["bid"],
+                          shares=vb["shares"], filled=bool(vb["filled"]), fill_elapsed_s=vb["fill_elapsed_s"],
+                          cancel_reason=(None if vb["filled"] else (vb["cancel"] or reason)),
+                          final_settle_z=lz, won=won, hypo_pnl=pnl)
+        except Exception as ex:
+            logger.warning(f"[{slot.asset.upper()}] settle_z2_shadow result failed: {ex}")
 
     def _log_maker_post_shadow(self, slot, market, side, token_id, bid, shares, order_id, spot=None) -> None:
         """Shadow-only pre-post gate log (MAKER_POST_GATE_SHADOW). Never raises, never blocks."""
