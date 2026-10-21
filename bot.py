@@ -492,6 +492,7 @@ class TWAPBot:
                 + ("on: maker positions hold to settlement (TP 0.95 only; no trailing/price stop/stop-loss/hard flatten/failsafe)"
                    if getattr(config, "MAKER_HOLD_TO_EXPIRY", False) else "off (maker uses the normal exit stack)")
             )
+            logger.info(f"ENTRY_SIGNAL={'settle_z' if getattr(config, 'ENTRY_SIGNAL', '') == 'settle_z' else 'bot_z (legacy)'}")
             logger.info(
                 "DIP_BOUNCE_EXIT="
                 + (f"on: maker positions sell at best bid >= {config.DIP_BOUNCE_SELL:.2f} after bid <= {config.DIP_BOUNCE_DIP:.2f} (TP first)"
@@ -805,7 +806,8 @@ class TWAPBot:
                 spot=spot, strike=strike, realized_twap=realized_twap,
                 elapsed_s=elapsed_s, remaining_s=remaining_s, sigma_twap_usd=sigma_twap_dyn
             )
-            favored_side = "UP" if signed_z_dyn >= 0 else "DOWN"
+            entry_z, entry_min_z = self._entry_signal(slot, elapsed_s, spot, signed_z_dyn)
+            favored_side = "UP" if entry_z >= 0 else "DOWN"
             fav_opp_side = "DOWN" if favored_side == "UP" else "UP"
             fav_token = tokens.get(favored_side)
             opp_token = tokens.get(fav_opp_side)
@@ -962,11 +964,11 @@ class TWAPBot:
                             move_ref_ok=bool(move_gate_ok),
                         )
                         slot.momentum_gate_logged = True
-                    dyn_min_z = max(config.DYNAMIC_MIN_Z, params.midband_min_z)
+                    dyn_min_z = max(config.DYNAMIC_MIN_Z, params.midband_min_z) if entry_min_z is None else entry_min_z
                     is_maker_candidate = (
                         mid_px is not None
                         and config.DYNAMIC_MIDBAND_LO <= mid_px <= config.DYNAMIC_MIDBAND_HI
-                        and abs_z >= dyn_min_z
+                        and abs(entry_z) >= dyn_min_z
                     )
                     maker_feats = None
                     maker_zone_blocked = self._entry_zone_blocked(slot, slot_key, "maker", elapsed_s)
@@ -2520,6 +2522,15 @@ class TWAPBot:
                           max_bid_after_fill=vb["max_bid"], cancel_reason=(None if vb["filled"] else reason))
         except Exception:
             pass
+
+    def _entry_signal(self, slot, elapsed_s, spot, bot_z):
+        """(signed z choosing the entry side, maker min |z| or None for legacy). ENTRY_SIGNAL=settle_z uses
+        settle_z (rule B); otherwise / when settle_z is unavailable, the legacy bot_z."""
+        if getattr(config, "ENTRY_SIGNAL", "") == "settle_z":
+            z = self._settle_z_now(slot, elapsed_s, spot)
+            if z is not None:
+                return float(z), float(getattr(config, "ENTRY_SETTLE_Z_MIN", 0.5))
+        return float(bot_z), None
 
     def _settle_z_now(self, slot, elapsed_s, spot=None):
         """inv15 LOG-ONLY: (signed settlement-rule z, strike ref used). Never raises."""
