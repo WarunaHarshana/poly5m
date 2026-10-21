@@ -2710,7 +2710,8 @@ class TWAPBot:
                          else getattr(config, "TAKER_FEE_RATE", 0.07))
         order_id = f"settle_z_taker_paper_{int(time.time()*1000)}"
         if config.MODE == "live" and self.live_client:
-            resp = self.live_client.place_order(token_id, "BUY", ask, shares, order_type="FOK")
+            resp = self.live_client.place_order(token_id, "BUY", ask, shares, order_type="FOK",
+                                                max_usd=float(config.SETTLE_Z_TAKER_MAX_USD))
             if not resp.get("filled"):
                 journal_write("settle_z_taker_skip", slot=slug, asset=slot.asset, reason="fok_unfilled", side=side,
                               ask=ask, shares=shares, status=resp.get("status"), error=str(resp.get("error"))[:200])

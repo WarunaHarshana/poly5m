@@ -12,7 +12,8 @@ class FakeLive:
         self.filled = filled
         self.calls = []
 
-    def place_order(self, token_id, side, price, size, order_type="GTC"):
+    def place_order(self, token_id, side, price, size, order_type="GTC", max_usd=None):
+        self.max_usd = max_usd
         self.calls.append((token_id, side, price, size, order_type))
         return {"success": True, "filled": self.filled, "order_id": "oid1", "shares": size if self.filled else 0.0,
                 "status": "matched" if self.filled else "unmatched"}
@@ -51,6 +52,7 @@ class TestSettleZTaker(unittest.TestCase):
     def test_fill_sizes_5_shares_fok_and_holds(self):
         self.run_()
         self.assertEqual(self.bot.live_client.calls, [("tu", "BUY", 0.75, 5.0, "FOK")])
+        self.assertEqual(self.bot.live_client.max_usd, 4.0)
         self.assertEqual(self.slot.position["strategy"], "settle_z_taker")
         self.assertEqual(self.slot.position["entry_type"], "settle_z_taker")
         self.assertTrue(self.slot.sz_taker_block)
@@ -188,3 +190,14 @@ class TestSettleZTaker(unittest.TestCase):
         rows = json.load(open(self.bot._trades_log_path))
         self.assertEqual(rows[-1]["entry_type"], "settle_z_taker")
         self.assertEqual(self.bot._sz_taker_state()["n"], 1)
+
+
+def test_client_cap_override():
+    import polymarket_client as pc
+    c = pc.PolymarketLiveClient.__new__(pc.PolymarketLiveClient)
+    import config as cfg
+    with mock.patch.object(cfg, "MAX_TRADE_USD", 3.0):
+        r = c.place_order("t", "BUY", 0.80, 5, order_type="FOK")
+        assert r["error"] == "exceeds MAX_TRADE_USD"
+        r = c.place_order("t", "BUY", 0.81, 5, order_type="FOK", max_usd=4.0)
+        assert r["error"] == "exceeds MAX_TRADE_USD"

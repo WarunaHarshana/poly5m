@@ -487,10 +487,11 @@ class PolymarketLiveClient:
         avg = (usd / shares) if (usd and shares) else None
         return float(shares), avg
 
-    def place_order(self, token_id: str, side: str, price: float, size: float, order_type: str = "GTC") -> dict:
+    def place_order(self, token_id: str, side: str, price: float, size: float, order_type: str = "GTC",
+                    max_usd: float | None = None) -> dict:
         """Place an order via CLOB API. Post success != fill: 'shares' is the MATCHED size only (0 if none).
         No signature-type fallback: a signing error is returned as a failure."""
-        cap = float(getattr(config, "MAX_TRADE_USD", 0.0) or 0.0)
+        cap = float(max_usd if max_usd is not None else (getattr(config, "MAX_TRADE_USD", 0.0) or 0.0))
         if cap > 0 and side.upper() == "BUY" and round(price, 2) * round(size, 2) > cap + 1e-9:
             logger.error(f"BUY blocked: {size:.2f} sh @ {price:.2f} exceeds MAX_TRADE_USD ${cap:.2f}")
             return {"success": False, "filled": False, "error": "exceeds MAX_TRADE_USD", "order_id": None,
