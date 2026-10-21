@@ -243,3 +243,39 @@ class TestLateFvLimit(unittest.TestCase):
         self.assertEqual(depth_upto([(0.3, 2), (0.31, 3), (0.33, 9)], 0.32), 5)
         self.assertAlmostEqual(edge_at(0.9, 0.8), round(0.9 - 0.8 - 0.07 * 0.8 * 0.2, 4))
 
+
+
+def _maxprice_skip_then_cheaper(self):
+    mock.patch.object(config, "LATE_FV_MAX_PRICE", 0.25).start()
+    self.run_t(range(215, 224))  # tick 220: ask 0.30 > 0.25 -> skipped, not done
+    self.assertEqual(self.bot.live_client.calls, [])
+    self.assertEqual(self.ev("late_fv_shadow"), [])
+    self.assertFalse(self.slot.late_fv["done"])
+    self.assertFalse(getattr(self.slot, "sz_taker_block", False))
+    self.assertEqual(self.slot.late_fv["skips"].get("above_max_price"), 1)
+    self.books["tu"] = book(asks=[(0.20, 10)], bids=[(0.19, 10)])
+    self.run_t(range(224, 320))  # tick 225: 0.20 <= cap -> trades
+    self.assertEqual(self.bot.live_client.calls, [("tu", "BUY", 0.20, 5.0, "FOK")])
+    self.assertEqual(self.ev("late_fv_shadow")[0]["t"], 225.0)
+    scan = self.ev("late_fv_scan")
+    self.assertEqual(len(scan), 1)
+    self.assertEqual(scan[0]["skips"].get("above_max_price"), 1)
+
+
+def _maxprice_always_above(self):
+    mock.patch.object(config, "LATE_FV_MAX_PRICE", 0.25).start()
+    self.run_t(range(215, 320))
+    self.assertEqual(self.bot.live_client.calls, [])
+    self.assertEqual(self.ev("late_fv_shadow"), [])
+    self.assertGreaterEqual(self.ev("late_fv_scan")[0]["skips"]["above_max_price"], 9)  # every tick 220..265
+
+
+def _maxprice_default(self):
+    self.assertEqual(config.LATE_FV_MAX_PRICE, 0.97)
+    self.run_t(range(215, 230))
+    self.assertEqual(self.bot.live_client.calls, [("tu", "BUY", 0.30, 5.0, "FOK")])
+
+
+TestLateFvLive.test_max_price_skip_then_cheaper_tick_trades = _maxprice_skip_then_cheaper
+TestLateFvLive.test_max_price_skips_every_tick = _maxprice_always_above
+TestLateFvLive.test_max_price_default_unchanged = _maxprice_default

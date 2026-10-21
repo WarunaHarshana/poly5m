@@ -512,7 +512,7 @@ class TWAPBot:
         _lfs = self._late_fv_state()
         logger.info(
             f"LATE_FV_LIVE={'ON' if getattr(config, 'LATE_FV_LIVE', False) else 'off'} mode={config.MODE} "
-            f"max_usd={config.LATE_FV_MAX_USD:.2f} slippage={float(getattr(config, 'LATE_FV_SLIPPAGE', 0.0)):.2f} stop_usd={config.LATE_FV_STOP_USD:.2f} shares={config.LATE_FV_SHARES:.0f} "
+            f"max_usd={config.LATE_FV_MAX_USD:.2f} slippage={float(getattr(config, 'LATE_FV_SLIPPAGE', 0.0)):.2f} max_price={float(getattr(config, 'LATE_FV_MAX_PRICE', 0.97)):.2f} stop_usd={config.LATE_FV_STOP_USD:.2f} shares={config.LATE_FV_SHARES:.0f} "
             f"cum_pnl={float(_lfs.get('pnl', 0.0)):+.2f} n={int(_lfs.get('n', 0))} stopped={bool(_lfs.get('stopped'))} "
             f"pending={len(self._late_fv_pending)}"
         )
@@ -2681,6 +2681,13 @@ class TWAPBot:
                           "fok_fill": best.get("fok_fill")}
         if pick is None:
             return
+        max_price = float(getattr(config, "LATE_FV_MAX_PRICE", 0.97))
+        if pick["ask"] > max_price + 1e-12:
+            pick2, _ = late_fv.evaluate(z, q_up, q_dn, float(config.LATE_FV_K), float(config.LATE_FV_MIN_EDGE),
+                                        min(float(config.LATE_FV_MAX_ASK), max_price))
+            if pick2 is None:
+                return skip("above_max_price")  # not done: keep scanning later ticks this slot
+            pick = pick2
         st["done"] = True
         sh = late_fv.live_shares(pick["ask"], sh, float(config.LATE_FV_MAX_USD))
         if pick.get("depth_at_ask") is not None:
