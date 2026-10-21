@@ -161,6 +161,19 @@ SETTLE_Z_SHADOW = os.getenv("SETTLE_Z_SHADOW", "1").strip().lower() in ("yes", "
 LATE_WINDOW_SHADOW = os.getenv("LATE_WINDOW_SHADOW", "1").strip().lower() in ("yes", "y", "true", "1", "on")
 # LOG-ONLY: settle_z2_shadow (retuned settle_z entry, virtual bid only, never orders; default OFF).
 SETTLE_Z2_SHADOW = os.getenv("SETTLE_Z2_SHADOW", "0").strip().lower() in ("yes", "y", "true", "1", "on")
+# LIVE: settle_z taker (default OFF). At the settle_z_shadow tick (first tick >=60s), if |settle_z|>=MIN_Z buy the
+# settle_z side FOK at best ask (ask<=MAX_ASK, spread<=MAX_SPREAD), fixed SHARES (skip if SHARES*ask>MAX_USD), 1/slot,
+# hold to expiry. Auto stop rule persisted in STATE_DIR/settle_z_taker_state.json. Roll back: SETTLE_Z_TAKER=0.
+SETTLE_Z_TAKER = os.getenv("SETTLE_Z_TAKER", "0").strip().lower() in ("yes", "y", "true", "1", "on")
+SETTLE_Z_TAKER_MIN_Z = float(os.getenv("SETTLE_Z_TAKER_MIN_Z", "0.5"))
+SETTLE_Z_TAKER_MAX_ASK = float(os.getenv("SETTLE_Z_TAKER_MAX_ASK", "0.80"))
+SETTLE_Z_TAKER_MAX_SPREAD = float(os.getenv("SETTLE_Z_TAKER_MAX_SPREAD", "0.02"))
+SETTLE_Z_TAKER_SHARES = float(os.getenv("SETTLE_Z_TAKER_SHARES", "5"))
+SETTLE_Z_TAKER_MAX_USD = float(os.getenv("SETTLE_Z_TAKER_MAX_USD", "4"))
+SETTLE_Z_TAKER_USD = float(os.getenv("SETTLE_Z_TAKER_USD", "3"))  # legacy/unused (fixed-share sizing)
+SETTLE_Z_TAKER_STOP_N = int(os.getenv("SETTLE_Z_TAKER_STOP_N", "40"))
+SETTLE_Z_TAKER_STOP_MIN_WR = float(os.getenv("SETTLE_Z_TAKER_STOP_MIN_WR", "0.75"))
+SETTLE_Z_TAKER_STOP_PNL = float(os.getenv("SETTLE_Z_TAKER_STOP_PNL", "-10"))
 # LOG-ONLY: sol_shadow (rule B virtual maker bid at 0.50 on the settle_z side for SOL 5m; SOL is never traded).
 SOL_SHADOW = os.getenv("SOL_SHADOW", "1").strip().lower() in ("yes", "y", "true", "1", "on")
 DYNAMIC_MAX_ELAPSED_S = float(os.getenv("DYNAMIC_MAX_ELAPSED_S", "240.0"))

@@ -118,6 +118,21 @@ def _in_utc_windows(spec: str, ts: float) -> bool:
     return False
 
 
+SZ_TAKER = "settle_z_taker"
+
+
+def sz_taker_stop_reason(n: int, wins: int, pnl: float) -> str | None:
+    """settle_z taker auto-stop: P&L <= limit at any time, or after STOP_N trades WR < min / P&L < limit."""
+    lim = float(getattr(config, "SETTLE_Z_TAKER_STOP_PNL", -10.0))
+    if pnl <= lim + 1e-9:
+        return f"cum_pnl {pnl:+.2f} <= {lim:+.2f}"
+    if n >= int(getattr(config, "SETTLE_Z_TAKER_STOP_N", 40)):
+        wr = wins / n if n else 0.0
+        if wr < float(getattr(config, "SETTLE_Z_TAKER_STOP_MIN_WR", 0.75)):
+            return f"win_rate {wr:.3f} < {config.SETTLE_Z_TAKER_STOP_MIN_WR:.2f} after {n}"
+    return None
+
+
 @dataclass
 
 class CoinSlot:
@@ -150,6 +165,8 @@ class CoinSlot:
     late_shadow_started: bool = False
     # LOG-ONLY settle_z2_shadow virtual bid (once per slot)
     z2_shadow: dict | None = None
+    # LIVE settle_z taker: set once the taker decision qualified this slot (blocks maker posts for the slot)
+    sz_taker_block: bool = False
 
 
 class TWAPBot:
@@ -473,6 +490,10 @@ class TWAPBot:
         coins = ",".join(a.upper() for a in config.ASSETS)
         logger.info(f"Mode: {config.MODE.upper()} | Assets: {coins} | Timeframe: {config.TIMEFRAME}")
         logger.info(
+            f"SETTLE_Z_TAKER={'ON' if getattr(config, 'SETTLE_Z_TAKER', False) else 'off'} "
+            f"min_z={config.SETTLE_Z_TAKER_MIN_Z:.2f} max_ask={config.SETTLE_Z_TAKER_MAX_ASK:.2f} "
+            f"max_spread={config.SETTLE_Z_TAKER_MAX_SPREAD:.3f} shares={config.SETTLE_Z_TAKER_SHARES:.0f} "
+            f"max_usd={config.SETTLE_Z_TAKER_MAX_USD:.2f} stopped={self._sz_taker_state().get('stopped', False)} | "
             f"SHARP_DROP_GUARD={'ON' if getattr(config, 'SHARP_DROP_GUARD', False) else 'off'} "
             f"threshold={getattr(config, 'SHARP_DROP_THRESHOLD', 0.06):.3f} window={getattr(config, 'SHARP_DROP_WINDOW_S', 60.0):.0f}s"
         )
@@ -643,6 +664,7 @@ class TWAPBot:
             slot.momentum_gate_logged = False
             slot.entry_zone_logged = set()
             slot.settle_z_logged = False
+            slot.sz_taker_block = False
             slot.maker_posted = False
             self._finish_late_shadow(slot, "slot_end")
             slot.late_shadow = None
@@ -862,7 +884,10 @@ class TWAPBot:
                 except Exception:
                     z_twap_dyn = None
 
+            _sz_first = not slot.settle_z_logged
             self._maybe_log_settle_z_shadow(slot, market, elapsed_s, spot, signed_z_dyn, favored_side, mid_px, z_twap_dyn)
+            if _sz_first and slot.settle_z_logged:
+                await self._maybe_settle_z_taker(slot, market, elapsed_s, spot)
             self._tick_settle_z2(slot, elapsed_s, spot, now)
             self._tick_late_shadow(slot, elapsed_s, remaining_s, spot, strike, signed_z_dyn, now)
             allowed_feas, min_move_usd, max_allowed_ask, sigma_t = config.compute_dynamic_feasibility(
@@ -2171,6 +2196,7 @@ class TWAPBot:
             "asset": slot.asset,
             "slot": market["slug"],
             "strategy": strategy_tag,
+            "entry_type": strategy_tag,
             "side": signal.side,
             "token_id": token_id,
             "opp_token_id": (market.get("tokens") or {}).get("DOWN" if signal.side == "UP" else "UP"),
@@ -2549,6 +2575,178 @@ class TWAPBot:
         except Exception:
             return None
 
+    # ------------------------------------------------------------------ LIVE settle_z taker
+    def _sz_side_book(self, slot, market, z):
+        """(ask, spread) of the settle_z side token from the in-memory book stream; (None, None) if unknown."""
+        try:
+            if z is None:
+                return None, None
+            side = "UP" if z >= 0 else "DOWN"
+            tokens = (market or {}).get("tokens") or {}
+            tok = tokens.get(side)
+            if not tok:
+                return None, None
+            top = self.book_stream.get_top(tok, opp_token_id=tokens.get("DOWN" if side == "UP" else "UP")) or {}
+            a, b = top.get("ask"), top.get("bid")
+            if a is None:
+                return None, None
+            sp = round(float(a) - float(b), 4) if b is not None else None
+            return round(float(a), 4), sp
+        except Exception:
+            return None, None
+
+    def _sz_taker_state_path(self):
+        return config.STATE_DIR / "settle_z_taker_state.json"
+
+    def _sz_taker_state(self) -> dict:
+        try:
+            p = self._sz_taker_state_path()
+            if p.exists():
+                with open(p) as f:
+                    d = json.load(f)
+                    if isinstance(d, dict):
+                        return d
+        except Exception as e:
+            logger.error(f"settle_z_taker state read failed: {e}")
+        return {"n": 0, "wins": 0, "pnl": 0.0, "slots": [], "stopped": False}
+
+    def _sz_taker_save(self, st: dict) -> None:
+        p = self._sz_taker_state_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(".tmp")
+        with open(tmp, "w") as f:
+            json.dump(st, f)
+        tmp.replace(p)
+
+    def _sz_taker_note_result(self, record: dict) -> None:
+        won = record.get("won")
+        if won is None:
+            return
+        st = self._sz_taker_state()
+        slug = str(record.get("slot") or "")
+        if slug and slug in st.get("slots", []):
+            return
+        pnl = float(record.get("pnl") or 0.0)
+        st["n"] = int(st.get("n", 0)) + 1
+        st["wins"] = int(st.get("wins", 0)) + (1 if won else 0)
+        st["pnl"] = round(float(st.get("pnl", 0.0)) + pnl, 4)
+        st["slots"] = (list(st.get("slots", [])) + [slug])[-500:]
+        reason = sz_taker_stop_reason(st["n"], st["wins"], st["pnl"])
+        if reason and not st.get("stopped"):
+            st["stopped"] = True
+            st["stop_reason"] = reason
+            st["stopped_at"] = datetime.now(timezone.utc).isoformat()
+            logger.warning(f"settle_z_taker STOPPED: {reason} (n={st['n']} wins={st['wins']} pnl={st['pnl']:+.2f})")
+            journal_write("settle_z_taker_stopped", reason=reason, n=st["n"], wins=st["wins"], pnl=st["pnl"])
+        self._sz_taker_save(st)
+
+    async def _maybe_settle_z_taker(self, slot, market, elapsed_s, spot) -> None:
+        """LIVE settle_z taker decision, once per slot at the settle_z_shadow tick. Never raises."""
+        if not bool(getattr(config, "SETTLE_Z_TAKER", False)) or slot.asset != "btc":
+            return
+        slug = (market or {}).get("slug")
+
+        def skip(reason, **kw):
+            logger.info(f"[{slot.asset.upper()}] settle_z_taker skip: {reason} {kw}")
+            journal_write("settle_z_taker_skip", slot=slug, asset=slot.asset, reason=reason,
+                          elapsed_s=(round(float(elapsed_s), 1) if elapsed_s is not None else None), **kw)
+        try:
+            if float(elapsed_s) > 90.0:
+                return  # joined mid-slot; settle_z_shadow also skips these
+            st = self._sz_taker_state()
+            if st.get("stopped"):
+                return skip("stopped", stop_reason=st.get("stop_reason"))
+            z = self._settle_z_now(slot, elapsed_s, spot)
+            if z is None:
+                return skip("no_settle_z")
+            if abs(float(z)) < float(config.SETTLE_Z_TAKER_MIN_Z):
+                return skip("z_below_min", settle_z=z)
+            side = "UP" if z >= 0 else "DOWN"
+            ask, spread = self._sz_side_book(slot, market, z)
+            if slot.position:
+                return skip("position_exists", settle_z=z, side=side, ask=ask, spread=spread,
+                            existing=slot.position.get("strategy"))
+            if slug and slug in self._slot_done:
+                return skip("slot_done", settle_z=z, side=side)
+            if (bool(getattr(config, "ENTRY_BLOCK_ENABLED", False))
+                    and float(elapsed_s) >= float(config.ENTRY_BLOCK_ELAPSED_LO)
+                    and float(elapsed_s) < float(config.ENTRY_BLOCK_ELAPSED_HI)
+                    and not _in_utc_windows(getattr(config, "ENTRY_BLOCK_OFF_UTC", ""), time.time())):
+                return skip("entry_block_zone", settle_z=z, side=side, ask=ask, spread=spread)
+            if ask is None or spread is None:
+                return skip("no_book", settle_z=z, side=side, ask=ask, spread=spread)
+            if ask > float(config.SETTLE_Z_TAKER_MAX_ASK) + 1e-9:
+                return skip("ask_above_max", settle_z=z, side=side, ask=ask, spread=spread)
+            if spread > float(config.SETTLE_Z_TAKER_MAX_SPREAD) + 1e-9:
+                return skip("spread_above_max", settle_z=z, side=side, ask=ask, spread=spread)
+            shares = float(config.SETTLE_Z_TAKER_SHARES)
+            if shares < float(config.MIN_ORDER_SHARES):
+                shares = float(config.MIN_ORDER_SHARES)
+            if shares * ask > float(config.SETTLE_Z_TAKER_MAX_USD) + 1e-9:
+                return skip("cost_above_max", settle_z=z, side=side, ask=ask, shares=shares)
+            ok, why = self.risk.can_trade(open_notional=self._open_notional())
+            if not ok:
+                return skip("risk_manager", settle_z=z, side=side, ask=ask, detail=why)
+            # Qualified: own the slot (no maker post). Cancel any resting maker bid first (adopts a partial fill).
+            slot.sz_taker_block = True
+            if slot.resting_order:
+                if config.MODE == "live":
+                    self._live_finalize_resting(slot, "settle_z_taker")
+                slot.resting_order = None
+                if slot.position:
+                    return skip("maker_position_exists", settle_z=z, side=side, ask=ask)
+            journal_write("settle_z_taker_attempt", slot=slug, asset=slot.asset, side=side, settle_z=z,
+                          ask=ask, spread=spread, shares=shares, cost_usd=round(shares * ask, 2),
+                          elapsed_s=round(float(elapsed_s), 1), mode=config.MODE)
+            await self._sz_taker_fok(slot, market, side, ask, shares, z, elapsed_s)
+        except Exception as e:
+            logger.error(f"[{slot.asset.upper()}] settle_z_taker failed: {e}")
+
+    async def _sz_taker_fok(self, slot, market, side, ask, shares, z, elapsed_s) -> None:
+        tokens = market.get("tokens") or {}
+        token_id = tokens.get(side)
+        slug = market.get("slug")
+        fee_rate = float(market.get("fee_rate") if market.get("fee_rate") is not None
+                         else getattr(config, "TAKER_FEE_RATE", 0.07))
+        order_id = f"settle_z_taker_paper_{int(time.time()*1000)}"
+        if config.MODE == "live" and self.live_client:
+            resp = self.live_client.place_order(token_id, "BUY", ask, shares, order_type="FOK")
+            if not resp.get("filled"):
+                journal_write("settle_z_taker_skip", slot=slug, asset=slot.asset, reason="fok_unfilled", side=side,
+                              ask=ask, shares=shares, status=resp.get("status"), error=str(resp.get("error"))[:200])
+                logger.warning(f"[BTC] settle_z_taker FOK not filled: status={resp.get('status')} err={resp.get('error')}")
+                return
+            order_id = resp.get("order_id") or resp.get("orderID") or order_id
+            if resp.get("shares"):
+                shares = float(resp["shares"])
+            if resp.get("avg_price"):
+                try:
+                    ask = float(resp["avg_price"])
+                except (TypeError, ValueError):
+                    pass
+        cost_usd = round(shares * ask, 2)
+        fee_usd = round(fee_rate * ask * (1.0 - ask) * shares, 4)
+        st_ts = _extract_slot_start_ts(market)
+        now_fill = time.time()
+        el_s = max(0.0, min(300.0, round(now_fill - st_ts, 1))) if st_ts else None
+        entry_time_utc = datetime.now(timezone.utc).isoformat()
+        journal_write("settle_z_taker_fill", slot=slug, asset=slot.asset, side=side, price=ask, shares=shares,
+                      cost_usd=cost_usd, fee=fee_usd, order_id=order_id, settle_z=z, mode=config.MODE)
+        journal_write("paper_fill" if config.MODE != "live" else "fill", strategy=SZ_TAKER, entry_type=SZ_TAKER,
+                      side=side, price=ask, shares=shares, cost_usd=cost_usd, fee=fee_usd,
+                      total_cost=round(cost_usd + fee_usd, 4), slot=slug, asset=slot.asset, order_id=order_id,
+                      z_score=z, entry_time_utc=entry_time_utc, entry_elapsed_s=el_s)
+        logger.info(f"[BTC SETTLE_Z_TAKER FILLED] BUY {side} {shares:.2f} sh @ {ask:.3f} (${cost_usd:.2f}) z={z}")
+        slot.position = {
+            "asset": slot.asset, "slot": slug, "strategy": SZ_TAKER, "entry_type": SZ_TAKER, "side": side,
+            "token_id": token_id, "opp_token_id": tokens.get("DOWN" if side == "UP" else "UP"),
+            "price": ask, "shares": shares, "cost_usd": cost_usd, "fee": fee_usd,
+            "total_cost": round(cost_usd + fee_usd, 4), "strike": slot.strike, "z_score": z, "prob": None,
+            "rebate": 0.0, "slot_start_ts": st_ts, "entry_time": now_fill, "entry_time_utc": entry_time_utc,
+            "entry_elapsed_s": el_s, "entry_window_time": _format_window_time(el_s), "order_id": order_id,
+            **self._strike_meta(slot),
+        }
+
     def _maybe_log_settle_z_shadow(self, slot, market, elapsed_s, spot, bot_z, bot_side, mid_fav, z_twap=None) -> None:
         """inv15 LOG-ONLY: one settle_z_shadow event per slot per asset at the first tick >= 60s elapsed."""
         if slot.settle_z_logged or not bool(getattr(config, "SETTLE_Z_SHADOW", True)):
@@ -2560,6 +2758,7 @@ class TWAPBot:
             if float(elapsed_s) > 90.0:
                 return  # joined mid-slot (e.g. restart): skip rather than log a late snapshot
             z = self._settle_z_now(slot, elapsed_s, spot)
+            sz_ask, sz_spread = self._sz_side_book(slot, market, z)
             mid_up = None
             if mid_fav is not None:
                 mid_up = float(mid_fav) if bot_side == "UP" else 1.0 - float(mid_fav)
@@ -2573,6 +2772,7 @@ class TWAPBot:
                 strike_ref=("strike_twap" if slot.strike_twap else "spot_strike"),
                 strike_twap_source=slot.strike_twap_source,
                 posted=bool(slot.maker_posted),
+                ask=sz_ask, spread=sz_spread,
             )
             self._maybe_start_settle_z2(slot, market, elapsed_s, z, bot_z, z_twap, mid_up)
         except Exception as e:
@@ -2673,6 +2873,9 @@ class TWAPBot:
         """Post resting limit bid inside spread as Maker."""
         token_id = market["tokens"].get(signal.side)
         if not token_id or not signal.target_bid:
+            return
+        if slot.sz_taker_block:
+            logger.info(f"[{slot.asset.upper()}] maker post skipped: settle_z_taker owns this slot")
             return
         if time.time() < slot.guard_cooldown_until:
             self._log_maker_block(
@@ -2850,6 +3053,12 @@ class TWAPBot:
         tp_bid = getattr(config, "TAKE_PROFIT_BID", 0.95)
         tp_ask = getattr(config, "TAKE_PROFIT_ASK", 0.96)
         tp_target = min(tp_bid, tp_ask)
+        if pos.get("strategy") == SZ_TAKER:
+            # settle_z taker: hold to settlement (no TP / dip-bounce / stops / pre-expiry exit).
+            if not pos.get("hold_to_expiry_logged"):
+                pos["hold_to_expiry_logged"] = True
+                logger.info(f"[{slot.asset.upper()}] settle_z_taker holding {side} entry={entry:.3f} to settlement")
+            return
         if best_bid is not None and float(best_bid) >= tp_target and float(best_bid) > entry:
             exit_px = float(best_bid)
             logger.info(
@@ -4036,6 +4245,12 @@ class TWAPBot:
 
     def _save_trade_record(self, record: dict) -> None:
         record = self._strip_jev_fields(record)
+        if record.get("strategy") == SZ_TAKER:
+            record["entry_type"] = SZ_TAKER
+            try:
+                self._sz_taker_note_result(record)
+            except Exception as e:
+                logger.error(f"settle_z_taker stop-rule update failed: {e}")
         trades = []
         if self._trades_log_path.exists():
             try:
