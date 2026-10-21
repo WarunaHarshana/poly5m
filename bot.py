@@ -40,6 +40,7 @@ from jev_advisor import JevAdvisor, JevDecision
 import move_ref
 import maker_guard
 import shadow_log
+import late_fv
 
 logging.basicConfig(
     level=logging.INFO,
@@ -167,6 +168,8 @@ class CoinSlot:
     z2_shadow: dict | None = None
     # LIVE settle_z taker: set once the taker decision qualified this slot (blocks maker posts for the slot)
     sz_taker_block: bool = False
+    # LOG-ONLY late fair-value taker shadow state (BTC, once per slot)
+    late_fv: dict | None = None
 
 
 class TWAPBot:
@@ -191,6 +194,8 @@ class TWAPBot:
         self.jev = JevAdvisor()
         self._mid_hist = maker_guard.MidHistory(float(getattr(config, "MAKER_MID_WINDOW_S", 60.0)))
         self._rest_throttle = shadow_log.Throttle(1.0)
+        self._late_fv_pending: list[dict] = []
+        self._late_fv_next_settle = 0.0
         self._post_fill = shadow_log.PostFillTracer()
         self._slot_trace = shadow_log.SlotTracer()
         self._slot_trace_rest = shadow_log.RestTopCache(self._slot_trace_rest_fetch)
@@ -497,6 +502,11 @@ class TWAPBot:
             f"SHARP_DROP_GUARD={'ON' if getattr(config, 'SHARP_DROP_GUARD', False) else 'off'} "
             f"threshold={getattr(config, 'SHARP_DROP_THRESHOLD', 0.06):.3f} window={getattr(config, 'SHARP_DROP_WINDOW_S', 60.0):.0f}s"
         )
+        logger.info(
+            f"LATE_FV_SHADOW={'ON' if getattr(config, 'LATE_FV_SHADOW', False) else 'off'} (log-only, no orders) "
+            f"window={config.LATE_FV_T_LO:.0f}-{config.LATE_FV_T_HI:.0f}s step={config.LATE_FV_STEP:.0f}s k={config.LATE_FV_K} "
+            f"min_edge={config.LATE_FV_MIN_EDGE} max_ask={config.LATE_FV_MAX_ASK} shares={config.LATE_FV_SHARES:.0f}"
+        )
         logger.info("One position per coin per 5-minute window")
         for a in config.ASSETS:
             p = config.ASSET_PARAMS[a]
@@ -667,6 +677,8 @@ class TWAPBot:
             slot.sz_taker_block = False
             slot.maker_posted = False
             self._finish_late_shadow(slot, "slot_end")
+            self._late_fv_flush_scan(slot)
+            slot.late_fv = None
             slot.late_shadow = None
             slot.late_shadow_started = False
             market = self.pub_client.find_active_5m_slot(now_ts=now, asset=slot.asset)
@@ -700,6 +712,8 @@ class TWAPBot:
 
         tokens = market.get("tokens") or {}
         self._log_slot_trace(slot, now)
+        if bool(getattr(config, "LATE_FV_SHADOW", False)) and asset == "btc":
+            await self._tick_late_fv(slot, market, now)
 
         # ---------------------------------------------------------------------
         # 1. PRIORITY POSITION MANAGEMENT: NEVER SKIP OPEN POSITIONS!
@@ -2574,6 +2588,145 @@ class TWAPBot:
             return round(z, 4) if z is not None else None
         except Exception:
             return None
+
+
+    # ------------------------------------------------------------------ LOG-ONLY late fair-value taker shadow
+    # Never places/cancels orders: only REST book reads (public client), Chainlink history and journal writes.
+    async def _tick_late_fv(self, slot, market, now) -> None:
+        try:
+            await self._late_fv_settle(now)
+            start = float(market.get("slot_start_ts") or 0)
+            slug = market.get("slug")
+            if not start or not slug:
+                return
+            st = slot.late_fv
+            if st is None or st.get("slot") != slug:
+                st = slot.late_fv = {"slot": slug, "start": start, "end": float(market.get("end_ts") or start + 300),
+                                     "next_t": float(config.LATE_FV_T_LO), "done": False, "scan_logged": False,
+                                     "n_checks": 0, "best": None, "skips": {}}
+            t = now - start
+            if st["scan_logged"]:
+                return
+            if t > float(config.LATE_FV_T_HI) + float(config.LATE_FV_STEP):
+                self._late_fv_flush_scan(slot)
+                return
+            if st["done"] or t < st["next_t"] or t > float(config.LATE_FV_T_HI) + 1.0:
+                return
+            while st["next_t"] <= t:
+                st["next_t"] += float(config.LATE_FV_STEP)
+            await self._late_fv_check(slot, market, st, now, t)
+        except Exception as e:
+            logger.warning(f"[BTC] late_fv shadow error: {e}")
+
+    async def _late_fv_check(self, slot, market, st, now, t) -> None:
+        def skip(reason):
+            st["skips"][reason] = st["skips"].get(reason, 0) + 1
+        ticks = self.cl_stream.history_snapshot(slot.asset)
+        if not ticks:
+            return skip("no_feed")
+        start = st["start"]
+        spot_ts, spot = ticks[-1]
+        if now - spot_ts > float(getattr(config, "MAX_ORACLE_STALE_S", 10.0)):
+            return skip("stale_feed")
+        if min(ts for ts, _ in ticks) > start - 55.0:
+            return skip("no_strike_history")
+        strike, _ = self.cl_stream.compute_realized_twap(start_ts=start - 60.0, end_ts=start, asset=slot.asset)
+        vol, vol_n = late_fv.vol_1s(ticks, start)
+        vol_fallback = vol is None
+        if vol is None:
+            vol = 1e-4  # hf_search fallback when < 600 returns
+        obs = late_fv.grid_1s(ticks, start + 239, now) if t >= 240 else None
+        z = late_fv.settle_z(spot, strike, t, vol, obs)
+        if z is None:
+            return skip("no_z")
+        tokens = market.get("tokens") or {}
+        up, dn = tokens.get("UP"), tokens.get("DOWN")
+        if not up or not dn:
+            return skip("no_tokens")
+        f0 = time.time()
+        bk_up, bk_dn = await asyncio.gather(asyncio.to_thread(self.pub_client.get_order_book, up),
+                                            asyncio.to_thread(self.pub_client.get_order_book, dn))
+        fetch_ms = round((time.time() - f0) * 1000.0, 1)
+        if not bk_up and not bk_dn:
+            return skip("no_book")
+        sh = float(config.LATE_FV_SHARES)
+        q_up = late_fv.side_quote(bk_up, bk_dn, sh)
+        q_dn = late_fv.side_quote(bk_dn, bk_up, sh)
+        pick, best = late_fv.evaluate(z, q_up, q_dn, float(config.LATE_FV_K), float(config.LATE_FV_MIN_EDGE),
+                                      float(config.LATE_FV_MAX_ASK))
+        st["n_checks"] += 1
+        if best is None:
+            return skip("no_ask")
+        bts = [x for x in (late_fv.book_ts(bk_up), late_fv.book_ts(bk_dn)) if x]
+        b_ts = max(bts) if bts else None
+        info = {"t": round(t, 1), "z": round(z, 4), "spot": spot, "strike": round(strike, 4), "vol": vol,
+                "vol_n": vol_n, "vol_fallback": vol_fallback,
+                "latency_s": round(b_ts - spot_ts, 3) if b_ts else None, "spot_age_s": round(now - spot_ts, 3),
+                "book_fetch_ms": fetch_ms}
+        if st["best"] is None or best["edge"] > st["best"]["edge"]:
+            st["best"] = {**info, "side": best["side"], "edge": best["edge"], "ask": best["ask"], "prob": best["prob"],
+                          "fok_fill": best.get("fok_fill")}
+        if pick is None:
+            return
+        st["done"] = True
+        ws = self.book_stream.get_top(tokens.get(pick["side"]), opp_token_id=tokens.get("DOWN" if pick["side"] == "UP" else "UP")) or {}
+        rec = {"slot": st["slot"], "asset": slot.asset, "side": pick["side"], "model_prob": pick["prob"],
+               "best_ask": pick["ask"], "ask_size": pick.get("ask_size"), "depth_at_ask": pick.get("depth_at_ask"),
+               "shares": sh, "fok_would_fill": bool(pick.get("fok_fill")), "bid": pick.get("bid"),
+               "spread": pick.get("spread"), "edge": pick["edge"], "fee": round(late_fv.taker_fee(pick["ask"]) * sh, 4),
+               "ws_ask": ws.get("ask"), "ws_age_s": ws.get("age_s"), "ptb": market.get("price_to_beat"),
+               "z_side": round(z if pick["side"] == "UP" else -z, 4), **info}
+        st["fired"] = rec
+        journal_write("late_fv_shadow", **rec)
+        logger.info(f"[BTC LATE_FV_SHADOW] virtual FOK BUY {pick['side']} {sh:.0f} sh @ {pick['ask']:.3f} t={t:.0f}s "
+                    f"z={z:+.2f} p={pick['prob']:.3f} edge={pick['edge']:+.3f} fill={bool(pick.get('fok_fill'))}")
+        self._late_fv_pending.append({**rec, "end": st["end"], "condition_id": market.get("condition_id"), "tries": 0})
+
+    def _late_fv_flush_scan(self, slot) -> None:
+        st = slot.late_fv
+        if not st or st.get("scan_logged"):
+            return
+        st["scan_logged"] = True
+        try:
+            b = st.get("best") or {}
+            journal_write("late_fv_scan", slot=st["slot"], asset=slot.asset, n_checks=st["n_checks"],
+                          fired=bool(st.get("fired")), fired_t=(st.get("fired") or {}).get("t"),
+                          best_edge=b.get("edge"), best_side=b.get("side"), best_t=b.get("t"), best_ask=b.get("ask"),
+                          best_prob=b.get("prob"), best_z=b.get("z"), best_fok_fill=b.get("fok_fill"),
+                          vol_fallback=b.get("vol_fallback"), skips=st.get("skips") or {})
+        except Exception as e:
+            logger.warning(f"[BTC] late_fv_scan log failed: {e}")
+
+    async def _late_fv_settle(self, now) -> None:
+        if not self._late_fv_pending or now < self._late_fv_next_settle:
+            return
+        self._late_fv_next_settle = now + 15.0
+        keep = []
+        for p in self._late_fv_pending:
+            if now < p["end"] + 5.0:
+                keep.append(p)
+                continue
+            res = None
+            try:
+                res = await asyncio.to_thread(self.pub_client.get_resolution, p["slot"], now, p.get("condition_id"))
+            except Exception:
+                res = None
+            side = (res or {}).get("side")
+            if side not in ("UP", "DOWN"):
+                p["tries"] += 1
+                if now > p["end"] + 3600:
+                    journal_write("late_fv_result", slot=p["slot"], asset=p["asset"], side=p["side"], outcome=None,
+                                  won=None, pnl=None, reason="unresolved")
+                else:
+                    keep.append(p)
+                continue
+            won = side == p["side"]
+            pnl = late_fv.sim_pnl(won, float(p["best_ask"]), float(p["shares"]))
+            journal_write("late_fv_result", slot=p["slot"], asset=p["asset"], side=p["side"], outcome=side, won=won,
+                          ask=p["best_ask"], shares=p["shares"], fee=p["fee"], pnl=pnl,
+                          fok_would_fill=p["fok_would_fill"], t=p["t"], edge=p["edge"], source=(res or {}).get("source"))
+            logger.info(f"[BTC LATE_FV_RESULT] {p['slot']} {p['side']} outcome={side} pnl={pnl:+.2f} (shadow)")
+        self._late_fv_pending = keep
 
     # ------------------------------------------------------------------ LIVE settle_z taker
     def _sz_side_book(self, slot, market, z):
