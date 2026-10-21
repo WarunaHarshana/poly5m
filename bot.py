@@ -120,6 +120,8 @@ def _in_utc_windows(spec: str, ts: float) -> bool:
 
 
 SZ_TAKER = "settle_z_taker"
+LATE_FV = "late_fv"
+HOLD_TO_SETTLE = (SZ_TAKER, LATE_FV)
 
 
 def sz_taker_stop_reason(n: int, wins: int, pnl: float) -> str | None:
@@ -194,7 +196,7 @@ class TWAPBot:
         self.jev = JevAdvisor()
         self._mid_hist = maker_guard.MidHistory(float(getattr(config, "MAKER_MID_WINDOW_S", 60.0)))
         self._rest_throttle = shadow_log.Throttle(1.0)
-        self._late_fv_pending: list[dict] = []
+        self._late_fv_pending: list[dict] = list(self._late_fv_state().get("pending") or [])
         self._late_fv_next_settle = 0.0
         self._post_fill = shadow_log.PostFillTracer()
         self._slot_trace = shadow_log.SlotTracer()
@@ -506,6 +508,13 @@ class TWAPBot:
             f"LATE_FV_SHADOW={'ON' if getattr(config, 'LATE_FV_SHADOW', False) else 'off'} (log-only, no orders) "
             f"window={config.LATE_FV_T_LO:.0f}-{config.LATE_FV_T_HI:.0f}s step={config.LATE_FV_STEP:.0f}s k={config.LATE_FV_K} "
             f"min_edge={config.LATE_FV_MIN_EDGE} max_ask={config.LATE_FV_MAX_ASK} shares={config.LATE_FV_SHARES:.0f}"
+        )
+        _lfs = self._late_fv_state()
+        logger.info(
+            f"LATE_FV_LIVE={'ON' if getattr(config, 'LATE_FV_LIVE', False) else 'off'} mode={config.MODE} "
+            f"max_usd={config.LATE_FV_MAX_USD:.2f} stop_usd={config.LATE_FV_STOP_USD:.2f} shares={config.LATE_FV_SHARES:.0f} "
+            f"cum_pnl={float(_lfs.get('pnl', 0.0)):+.2f} n={int(_lfs.get('n', 0))} stopped={bool(_lfs.get('stopped'))} "
+            f"pending={len(self._late_fv_pending)}"
         )
         logger.info("One position per coin per 5-minute window")
         for a in config.ASSETS:
@@ -2685,6 +2694,102 @@ class TWAPBot:
         logger.info(f"[BTC LATE_FV_SHADOW] virtual FOK BUY {pick['side']} {sh:.0f} sh @ {pick['ask']:.3f} t={t:.0f}s "
                     f"z={z:+.2f} p={pick['prob']:.3f} edge={pick['edge']:+.3f} fill={bool(pick.get('fok_fill'))}")
         self._late_fv_pending.append({**rec, "end": st["end"], "condition_id": market.get("condition_id"), "tries": 0})
+        self._late_fv_save_pending()
+        if bool(getattr(config, "LATE_FV_LIVE", False)):
+            await self._late_fv_live(slot, market, rec)
+
+    # ------------------------------------------------------------------ LIVE late_fv taker
+    def _late_fv_state_path(self):
+        return config.STATE_DIR / "late_fv_state.json"
+
+    def _late_fv_state(self) -> dict:
+        try:
+            p = self._late_fv_state_path()
+            if p.exists():
+                with open(p) as f:
+                    d = json.load(f)
+                if isinstance(d, dict):
+                    return d
+        except Exception as e:
+            logger.error(f"late_fv state read failed: {e}")
+        return {"n": 0, "wins": 0, "pnl": 0.0, "slots": [], "stopped": False, "pending": []}
+
+    def _late_fv_save(self, st: dict) -> None:
+        p = self._late_fv_state_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(".tmp")
+        with open(tmp, "w") as f:
+            json.dump(st, f, default=str)
+        tmp.replace(p)
+
+    def _late_fv_save_pending(self) -> None:
+        try:
+            st = self._late_fv_state()
+            st["pending"] = list(self._late_fv_pending)
+            self._late_fv_save(st)
+        except Exception as e:
+            logger.error(f"late_fv pending save failed: {e}")
+
+    def _late_fv_note_result(self, record: dict) -> None:
+        if record.get("won") is None and record.get("pnl") is None:
+            return
+        st = self._late_fv_state()
+        slug = str(record.get("slot") or "")
+        if slug and slug in st.get("slots", []):
+            return
+        pnl = float(record.get("pnl") or 0.0)
+        st["n"] = int(st.get("n", 0)) + 1
+        st["wins"] = int(st.get("wins", 0)) + (1 if record.get("won") else 0)
+        st["pnl"] = round(float(st.get("pnl", 0.0)) + pnl, 4)
+        st["slots"] = (list(st.get("slots", [])) + [slug])[-500:]
+        lim = float(getattr(config, "LATE_FV_STOP_USD", 6.0))
+        if st["pnl"] <= -lim and not st.get("stopped"):
+            st["stopped"] = True
+            st["stop_reason"] = f"cum_pnl {st['pnl']:+.2f} <= -{lim:.2f}"
+            st["stopped_at"] = datetime.now(timezone.utc).isoformat()
+            logger.warning(f"late_fv LIVE STOPPED: {st['stop_reason']} (n={st['n']} wins={st['wins']})")
+            journal_write("late_fv_stopped", reason=st["stop_reason"], n=st["n"], wins=st["wins"], pnl=st["pnl"])
+        st["pending"] = list(self._late_fv_pending)
+        self._late_fv_save(st)
+
+    async def _late_fv_live(self, slot, market, rec) -> None:
+        """LIVE late_fv entry for a fired shadow pick. Never raises."""
+        slug = rec.get("slot")
+        side, ask, sh = rec.get("side"), float(rec.get("best_ask") or 0.0), float(rec.get("shares") or 0.0)
+
+        def skip(reason, **kw):
+            logger.info(f"[BTC] late_fv skip: {reason} {kw}")
+            journal_write("late_fv_skip", slot=slug, asset=slot.asset, reason=reason, side=side, ask=ask,
+                          shares=sh, t=rec.get("t"), edge=rec.get("edge"), **kw)
+        try:
+            st = self._late_fv_state()
+            if st.get("stopped"):
+                return skip("stopped", stop_reason=st.get("stop_reason"), cum_pnl=st.get("pnl"))
+            if rec.get("vol_fallback"):
+                return skip("vol_fallback")
+            if slot.position:
+                return skip("position_open", strategy=slot.position.get("strategy"))
+            if slot.resting_order:
+                return skip("maker_resting")
+            if ask <= 0 or ask > float(config.LATE_FV_MAX_ASK):
+                return skip("bad_ask")
+            cap = float(config.LATE_FV_MAX_USD)
+            if sh * ask > cap + 1e-9:
+                return skip("cost_above_max", cost_usd=round(sh * ask, 4), max_usd=cap)
+            ok, why = self.risk.can_trade(open_notional=self._open_notional())
+            if not ok:
+                return skip("risk_manager", detail=why)
+            slot.sz_taker_block = True  # own the slot: no maker post afterwards
+            journal_write("late_fv_attempt", slot=slug, asset=slot.asset, side=side, ask=ask, shares=sh,
+                          cost_usd=round(sh * ask, 2), edge=rec.get("edge"), model_prob=rec.get("model_prob"),
+                          z_side=rec.get("z_side"), t=rec.get("t"), mode=config.MODE, max_usd=cap)
+            filled = await self._sz_taker_fok(slot, market, side, ask, sh, rec.get("z"), rec.get("t"),
+                                              strategy=LATE_FV, max_usd=cap)
+            if filled and slot.position:
+                slot.position["late_fv_edge"] = rec.get("edge")
+                slot.position["late_fv_model_prob"] = rec.get("model_prob")
+        except Exception as e:
+            logger.error(f"[BTC] late_fv live failed: {e}")
 
     def _late_fv_flush_scan(self, slot) -> None:
         st = slot.late_fv
@@ -2730,7 +2835,10 @@ class TWAPBot:
                           ask=p["best_ask"], shares=p["shares"], fee=p["fee"], pnl=pnl,
                           fok_would_fill=p["fok_would_fill"], t=p["t"], edge=p["edge"], source=(res or {}).get("source"))
             logger.info(f"[BTC LATE_FV_RESULT] {p['slot']} {p['side']} outcome={side} pnl={pnl:+.2f} (shadow)")
+        changed = len(keep) != len(self._late_fv_pending)
         self._late_fv_pending = keep
+        if changed:
+            self._late_fv_save_pending()
 
     # ------------------------------------------------------------------ LIVE settle_z taker
     def _sz_side_book(self, slot, market, z):
@@ -2866,21 +2974,22 @@ class TWAPBot:
         except Exception as e:
             logger.error(f"[{slot.asset.upper()}] settle_z_taker failed: {e}")
 
-    async def _sz_taker_fok(self, slot, market, side, ask, shares, z, elapsed_s) -> None:
+    async def _sz_taker_fok(self, slot, market, side, ask, shares, z, elapsed_s,
+                            strategy: str = SZ_TAKER, max_usd: float | None = None) -> bool:
         tokens = market.get("tokens") or {}
         token_id = tokens.get(side)
         slug = market.get("slug")
         fee_rate = float(market.get("fee_rate") if market.get("fee_rate") is not None
                          else getattr(config, "TAKER_FEE_RATE", 0.07))
-        order_id = f"settle_z_taker_paper_{int(time.time()*1000)}"
+        cap = float(config.SETTLE_Z_TAKER_MAX_USD if max_usd is None else max_usd)
+        order_id = f"{strategy}_paper_{int(time.time()*1000)}"
         if config.MODE == "live" and self.live_client:
-            resp = self.live_client.place_order(token_id, "BUY", ask, shares, order_type="FOK",
-                                                max_usd=float(config.SETTLE_Z_TAKER_MAX_USD))
+            resp = self.live_client.place_order(token_id, "BUY", ask, shares, order_type="FOK", max_usd=cap)
             if not resp.get("filled"):
-                journal_write("settle_z_taker_skip", slot=slug, asset=slot.asset, reason="fok_unfilled", side=side,
+                journal_write(f"{strategy}_skip", slot=slug, asset=slot.asset, reason="fok_unfilled", side=side,
                               ask=ask, shares=shares, status=resp.get("status"), error=str(resp.get("error"))[:200])
-                logger.warning(f"[BTC] settle_z_taker FOK not filled: status={resp.get('status')} err={resp.get('error')}")
-                return
+                logger.warning(f"[BTC] {strategy} FOK not filled: status={resp.get('status')} err={resp.get('error')}")
+                return False
             order_id = resp.get("order_id") or resp.get("orderID") or order_id
             if resp.get("shares"):
                 shares = float(resp["shares"])
@@ -2895,15 +3004,15 @@ class TWAPBot:
         now_fill = time.time()
         el_s = max(0.0, min(300.0, round(now_fill - st_ts, 1))) if st_ts else None
         entry_time_utc = datetime.now(timezone.utc).isoformat()
-        journal_write("settle_z_taker_fill", slot=slug, asset=slot.asset, side=side, price=ask, shares=shares,
+        journal_write(f"{strategy}_fill", slot=slug, asset=slot.asset, side=side, price=ask, shares=shares,
                       cost_usd=cost_usd, fee=fee_usd, order_id=order_id, settle_z=z, mode=config.MODE)
-        journal_write("paper_fill" if config.MODE != "live" else "fill", strategy=SZ_TAKER, entry_type=SZ_TAKER,
+        journal_write("paper_fill" if config.MODE != "live" else "fill", strategy=strategy, entry_type=strategy,
                       side=side, price=ask, shares=shares, cost_usd=cost_usd, fee=fee_usd,
                       total_cost=round(cost_usd + fee_usd, 4), slot=slug, asset=slot.asset, order_id=order_id,
                       z_score=z, entry_time_utc=entry_time_utc, entry_elapsed_s=el_s)
-        logger.info(f"[BTC SETTLE_Z_TAKER FILLED] BUY {side} {shares:.2f} sh @ {ask:.3f} (${cost_usd:.2f}) z={z}")
+        logger.info(f"[BTC {strategy.upper()} FILLED] BUY {side} {shares:.2f} sh @ {ask:.3f} (${cost_usd:.2f}) z={z}")
         slot.position = {
-            "asset": slot.asset, "slot": slug, "strategy": SZ_TAKER, "entry_type": SZ_TAKER, "side": side,
+            "asset": slot.asset, "slot": slug, "strategy": strategy, "entry_type": strategy, "side": side,
             "token_id": token_id, "opp_token_id": tokens.get("DOWN" if side == "UP" else "UP"),
             "price": ask, "shares": shares, "cost_usd": cost_usd, "fee": fee_usd,
             "total_cost": round(cost_usd + fee_usd, 4), "strike": slot.strike, "z_score": z, "prob": None,
@@ -2911,6 +3020,7 @@ class TWAPBot:
             "entry_elapsed_s": el_s, "entry_window_time": _format_window_time(el_s), "order_id": order_id,
             **self._strike_meta(slot),
         }
+        return True
 
     def _maybe_log_settle_z_shadow(self, slot, market, elapsed_s, spot, bot_z, bot_side, mid_fav, z_twap=None) -> None:
         """inv15 LOG-ONLY: one settle_z_shadow event per slot per asset at the first tick >= 60s elapsed."""
@@ -3040,7 +3150,7 @@ class TWAPBot:
         if not token_id or not signal.target_bid:
             return
         if slot.sz_taker_block:
-            logger.info(f"[{slot.asset.upper()}] maker post skipped: settle_z_taker owns this slot")
+            logger.info(f"[{slot.asset.upper()}] maker post skipped: taker (settle_z/late_fv) owns this slot")
             return
         if time.time() < slot.guard_cooldown_until:
             self._log_maker_block(
@@ -3218,8 +3328,8 @@ class TWAPBot:
         tp_bid = getattr(config, "TAKE_PROFIT_BID", 0.95)
         tp_ask = getattr(config, "TAKE_PROFIT_ASK", 0.96)
         tp_target = min(tp_bid, tp_ask)
-        if pos.get("strategy") == SZ_TAKER:
-            # settle_z taker: hold to settlement (no TP / dip-bounce / stops / pre-expiry exit).
+        if pos.get("strategy") in HOLD_TO_SETTLE:
+            # settle_z taker / late_fv: hold to settlement (no TP / dip-bounce / stops / pre-expiry exit).
             if not pos.get("hold_to_expiry_logged"):
                 pos["hold_to_expiry_logged"] = True
                 logger.info(f"[{slot.asset.upper()}] settle_z_taker holding {side} entry={entry:.3f} to settlement")
@@ -4410,6 +4520,12 @@ class TWAPBot:
 
     def _save_trade_record(self, record: dict) -> None:
         record = self._strip_jev_fields(record)
+        if record.get("strategy") == LATE_FV:
+            record["entry_type"] = LATE_FV
+            try:
+                self._late_fv_note_result(record)
+            except Exception as e:
+                logger.error(f"late_fv stop-rule update failed: {e}")
         if record.get("strategy") == SZ_TAKER:
             record["entry_type"] = SZ_TAKER
             try:

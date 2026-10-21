@@ -149,7 +149,7 @@ class TestBot(unittest.TestCase):
             src = inspect.getsource(fn)
             for bad in ("place_order", "live_client", "cancel_order", "_sz_taker_fok", "post_order"):
                 self.assertNotIn(bad, src)
-        self.assertFalse(hasattr(config, "LATE_FV_LIVE"))
+        self.assertFalse(config.LATE_FV_LIVE)  # default off: shadow-only path never touches the order client
 
     def test_flag_off_default(self):
         import importlib, os

@@ -174,8 +174,8 @@ SETTLE_Z_TAKER_USD = float(os.getenv("SETTLE_Z_TAKER_USD", "3"))  # legacy/unuse
 SETTLE_Z_TAKER_STOP_N = int(os.getenv("SETTLE_Z_TAKER_STOP_N", "40"))
 SETTLE_Z_TAKER_STOP_MIN_WR = float(os.getenv("SETTLE_Z_TAKER_STOP_MIN_WR", "0.75"))
 SETTLE_Z_TAKER_STOP_PNL = float(os.getenv("SETTLE_Z_TAKER_STOP_PNL", "-10"))
-# LOG-ONLY: late fair-value taker shadow (BTC 5m, default OFF). Virtual FOK BUY only; there is deliberately no
-# LATE_FV_LIVE flag and the shadow path has no order client. Journals late_fv_shadow / late_fv_result / late_fv_scan.
+# LOG-ONLY: late fair-value taker shadow (BTC 5m, default OFF). Virtual FOK BUY only; live orders only via
+# LATE_FV_LIVE below. Journals late_fv_shadow / late_fv_result / late_fv_scan.
 LATE_FV_SHADOW = os.getenv("LATE_FV_SHADOW", "0").strip().lower() in ("yes", "y", "true", "1", "on")
 LATE_FV_T_LO = float(os.getenv("LATE_FV_T_LO", "220"))
 LATE_FV_T_HI = float(os.getenv("LATE_FV_T_HI", "265"))
@@ -184,6 +184,12 @@ LATE_FV_K = float(os.getenv("LATE_FV_K", "0.9"))
 LATE_FV_MIN_EDGE = float(os.getenv("LATE_FV_MIN_EDGE", "0.03"))
 LATE_FV_MAX_ASK = float(os.getenv("LATE_FV_MAX_ASK", "0.97"))
 LATE_FV_SHARES = float(os.getenv("LATE_FV_SHARES", "5"))
+# LIVE late_fv (default OFF): when LATE_FV_SHADOW fires and LATE_FV_LIVE=1, place a real FOK BUY at the observed best
+# ask via the settle_z taker FOK path, cap LATE_FV_MAX_USD per order, hold to settlement. Auto-stop when cumulative
+# live P&L <= -LATE_FV_STOP_USD (persisted STATE_DIR/late_fv_state.json). Roll back: LATE_FV_LIVE=0.
+LATE_FV_LIVE = os.getenv("LATE_FV_LIVE", "0").strip().lower() in ("yes", "y", "true", "1", "on")
+LATE_FV_MAX_USD = float(os.getenv("LATE_FV_MAX_USD", "5"))
+LATE_FV_STOP_USD = float(os.getenv("LATE_FV_STOP_USD", "6"))
 # LOG-ONLY: sol_shadow (rule B virtual maker bid at 0.50 on the settle_z side for SOL 5m; SOL is never traded).
 SOL_SHADOW = os.getenv("SOL_SHADOW", "1").strip().lower() in ("yes", "y", "true", "1", "on")
 DYNAMIC_MAX_ELAPSED_S = float(os.getenv("DYNAMIC_MAX_ELAPSED_S", "240.0"))
