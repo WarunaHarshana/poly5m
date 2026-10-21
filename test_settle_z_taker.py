@@ -184,6 +184,13 @@ class TestSettleZTaker(unittest.TestCase):
         self.assertEqual(kw["ask"], 0.75)
         self.assertEqual(kw["spread"], 0.01)
 
+    def test_rest_fallback_when_ws_book_missing(self):
+        self.bot.book_stream.get_top = lambda tok, opp_token_id=None: None
+        with mock.patch("bot.extract_market_top", return_value=(0.77, 0.78, None)), \
+                mock.patch.object(self.bot.pub_client, "get_order_book", return_value={}):
+            self.run_()
+        self.assertEqual(self.bot.live_client.calls, [("tu", "BUY", 0.78, 5.0, "FOK")])
+
     def test_trade_record_tagged(self):
         self.bot._save_trade_record({"strategy": "settle_z_taker", "slot": "x", "won": True, "pnl": 1.2})
         import json

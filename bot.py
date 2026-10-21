@@ -2586,8 +2586,15 @@ class TWAPBot:
             tok = tokens.get(side)
             if not tok:
                 return None, None
-            top = self.book_stream.get_top(tok, opp_token_id=tokens.get("DOWN" if side == "UP" else "UP")) or {}
+            opp = tokens.get("DOWN" if side == "UP" else "UP")
+            top = self.book_stream.get_top(tok, opp_token_id=opp) or {}
             a, b = top.get("ask"), top.get("bid")
+            if a is None or b is None:  # WS book missing/stale: REST fallback (same as the main tick path)
+                bk = self.pub_client.get_order_book(tok)
+                bk_opp = self.pub_client.get_order_book(opp) if opp else None
+                r_bid, r_ask, _ = extract_market_top(bk, bk_opp)
+                a = r_ask if a is None else a
+                b = r_bid if b is None else b
             if a is None:
                 return None, None
             sp = round(float(a) - float(b), 4) if b is not None else None
