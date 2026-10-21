@@ -547,3 +547,190 @@ class PolymarketBookStream:
             except Exception:
                 break
 
+
+
+class BinanceSpotStream:
+    """Binance BTCUSDT aggTrade websocket -> 1s bars (LOG-ONLY late_fv input).
+
+    history_snapshot() returns (ts, close) where ts = the END of each completed 1s bar (no lookahead: the close of
+    the bar [s, s+1) is stamped s+1), plus the latest trade (trade time T, price) as the live last tick. Same shape
+    as ChainlinkRTDSStream so late_fv's grid/vol/TWAP code runs unchanged. Seeds ~35 min of 1s klines over REST at
+    start so vol (30 min of 1s data) needs no warm-up. Reconnects forever, rotating through BINANCE_WS_URLS.
+    """
+
+    def __init__(self, symbol: str = "BTCUSDT", ws_urls: list[str] | None = None, rest_urls: list[str] | None = None,
+                 maxlen: int = 4000):
+        self.symbol = symbol.upper()
+        self.ws_urls = list(ws_urls or getattr(config, "BINANCE_WS_URLS", []))
+        self.rest_urls = list(rest_urls or getattr(config, "BINANCE_REST_URLS", []))
+        self._bars: collections.deque[tuple[float, float]] = collections.deque(maxlen=maxlen)
+        self._cur_sec: int | None = None
+        self._cur_close: float | None = None
+        self._last: tuple[float, float] | None = None  # (trade_ts, price)
+        self._last_recv: float = 0.0
+        self._recv_lag: collections.deque[float] = collections.deque(maxlen=2000)  # recv - trade T
+        self._lock = threading.Lock()
+        self._stop = False
+        self._thread: threading.Thread | None = None
+        self.connected = False
+        self.url_in_use: str | None = None
+        self.seeded_bars = 0
+        self.reconnects = 0
+
+    # ---- lifecycle
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop = False
+        self._thread = threading.Thread(target=self._run_loop, name="binance-spot", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop = True
+
+    # ---- ingest (pure, testable)
+    def on_trade(self, trade_ts: float, price: float, recv_ts: float | None = None) -> None:
+        if not price or price <= 0:
+            return
+        sec = int(trade_ts)
+        with self._lock:
+            if self._cur_sec is None:
+                self._cur_sec, self._cur_close = sec, price
+            elif sec > self._cur_sec:
+                self._bars.append((float(self._cur_sec + 1), float(self._cur_close)))
+                self._cur_sec, self._cur_close = sec, price
+            elif sec == self._cur_sec:
+                self._cur_close = price
+            if self._last is None or trade_ts >= self._last[0]:
+                self._last = (float(trade_ts), float(price))
+            r = time.time() if recv_ts is None else recv_ts
+            self._last_recv = r
+            self._recv_lag.append(r - trade_ts)
+
+    def seed_bars(self, bars: list[tuple[float, float]]) -> int:
+        """bars: (bar_end_ts, close) ascending; only those older than the first live bar are inserted."""
+        with self._lock:
+            first = self._bars[0][0] if self._bars else (self._cur_sec + 1 if self._cur_sec is not None else 1e18)
+            old = [(float(t), float(p)) for t, p in bars if t < first and p > 0]
+            merged = sorted(set(old)) + list(self._bars)
+            self._bars.clear()
+            self._bars.extend(merged[-self._bars.maxlen:])
+            self.seeded_bars = len(old)
+            return len(old)
+
+    # ---- reads
+    def history_snapshot(self, asset: str | None = None) -> list[tuple[float, float]]:
+        with self._lock:
+            out = list(self._bars)
+            if self._last is not None and (not out or self._last[0] > out[-1][0]):
+                out.append(self._last)
+            return out
+
+    def last_tick(self) -> tuple[float, float] | None:
+        with self._lock:
+            return self._last
+
+    def spot_age_s(self, now: float | None = None) -> float | None:
+        lt = self.last_tick()
+        return None if lt is None else (time.time() if now is None else now) - lt[0]
+
+    def recv_lag_stats(self) -> dict:
+        with self._lock:
+            v = sorted(self._recv_lag)
+        if not v:
+            return {"n": 0}
+        q = lambda f: round(v[min(len(v) - 1, int(f * len(v)))], 4)
+        return {"n": len(v), "p50": q(0.5), "p90": q(0.9), "p99": q(0.99), "max": round(v[-1], 4)}
+
+    def compute_realized_twap(self, start_ts: float, end_ts: float | None = None, asset: str | None = None):
+        return twap_trapezoid(self.history_snapshot(), start_ts, end_ts)
+
+    def status(self, now: float | None = None) -> dict:
+        age = self.spot_age_s(now)
+        with self._lock:
+            n = len(self._bars)
+        return {"connected": self.connected, "url": self.url_in_use, "bars": n, "seeded_bars": self.seeded_bars,
+                "spot_age_s": None if age is None else round(age, 3), "reconnects": self.reconnects,
+                "recv_lag": self.recv_lag_stats()}
+
+    # ---- network
+    def _seed_rest(self) -> None:
+        import urllib.request
+        end_ms = int(time.time() * 1000)
+        for base in self.rest_urls:
+            try:
+                bars: list[tuple[float, float]] = []
+                start_ms = end_ms - 2200 * 1000
+                while start_ms < end_ms:
+                    u = f"{base}/api/v3/klines?symbol={self.symbol}&interval=1s&limit=1000&startTime={start_ms}"
+                    with urllib.request.urlopen(u, timeout=8) as r:
+                        rows = json.loads(r.read().decode())
+                    if not rows:
+                        break
+                    for k in rows:
+                        bars.append((float(k[0]) / 1000.0 + 1.0, float(k[4])))
+                    start_ms = int(rows[-1][0]) + 1000
+                    if len(rows) < 1000:
+                        break
+                n = self.seed_bars(bars)
+                logger.info(f"[Binance] seeded {n} 1s bars from {base}")
+                return
+            except Exception as e:
+                logger.warning(f"[Binance] REST seed failed via {base}: {e}")
+
+    def _run_loop(self) -> None:
+        asyncio.run(self._run())
+
+    async def _run(self) -> None:
+        import websockets
+        seeded = False
+        i = 0
+        while not self._stop:
+            url = self.ws_urls[i % len(self.ws_urls)]
+            try:
+                async with websockets.connect(url, ping_interval=20, ping_timeout=10, open_timeout=12,
+                                              close_timeout=2, max_size=2**20) as ws:
+                    self.connected, self.url_in_use = True, url
+                    logger.info(f"[Binance] connected {url}")
+                    while not self._stop:
+                        raw = await asyncio.wait_for(ws.recv(), timeout=15.0)
+                        try:
+                            m = json.loads(raw)
+                            m = m.get("data", m)
+                            self.on_trade(float(m["T"]) / 1000.0, float(m["p"]))
+                        except Exception:
+                            continue
+                        if not seeded:
+                            seeded = True
+                            await asyncio.to_thread(self._seed_rest)
+            except Exception as e:
+                logger.warning(f"[Binance] ws error via {url}: {e!r}")
+            self.connected = False
+            self.reconnects += 1
+            i += 1
+            await asyncio.sleep(1.0)
+
+
+def twap_trapezoid(ticks, start_ts: float, end_ts: float | None = None) -> tuple[float, float]:
+    """Same trapezoidal TWAP as ChainlinkRTDSStream.compute_realized_twap, over an explicit tick list."""
+    ticks = list(ticks)
+    if not ticks:
+        return 0.0, 0.0
+    end = float(end_ts) if end_ts is not None else ticks[-1][0]
+    start = float(start_ts)
+    elapsed = max(0.0, end - start)
+    if elapsed <= 0.0:
+        return ticks[-1][1], 0.0
+    w = [(ts, p) for ts, p in ticks if start <= ts <= end]
+    if not w:
+        prior = [p for ts, p in ticks if ts < start]
+        return (prior[-1] if prior else ticks[-1][1]), elapsed
+    pts = []
+    if w[0][0] > start:
+        prior = [p for ts, p in ticks if ts <= start]
+        pts.append((start, prior[-1] if prior else w[0][1]))
+    pts.extend(w)
+    if pts[-1][0] < end:
+        pts.append((end, pts[-1][1]))
+    integral = sum((pts[i + 1][0] - pts[i][0]) * (pts[i][1] + pts[i + 1][1]) / 2.0 for i in range(len(pts) - 1))
+    return integral / elapsed, elapsed

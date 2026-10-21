@@ -551,3 +551,14 @@ JEV_ALLOW_DOWNSIZING = os.getenv("JEV_ALLOW_DOWNSIZING", "true").strip().lower()
 # JEV_SHADOW: consult Jev and log/journal/tag its real verdict, but never enforce it
 # (every consult proceeds as an approve at size 1.0; timeouts/errors never block).
 JEV_SHADOW = os.getenv("JEV_SHADOW", "no").strip().lower() in ("yes", "y", "true", "1", "on")
+# late_fv spot source: chainlink (default) | binance. With binance, strike, spot AND vol all come from the Binance
+# BTCUSDT feed (never mixed with Chainlink). Both sources are always computed and logged side by side in shadow.
+LATE_FV_SPOT_SOURCE = (os.getenv("LATE_FV_SPOT_SOURCE", "chainlink").strip().lower() or "chainlink")
+if LATE_FV_SPOT_SOURCE not in ("chainlink", "binance"):
+    LATE_FV_SPOT_SOURCE = "chainlink"
+LATE_FV_BINANCE_MAX_AGE_S = float(os.getenv("LATE_FV_BINANCE_MAX_AGE_S", "1.0"))
+BINANCE_WS_URLS = [u.strip() for u in os.getenv(
+    "BINANCE_WS_URLS",
+    "wss://stream.binance.com:9443/ws/btcusdt@aggTrade,wss://data-stream.binance.vision/ws/btcusdt@aggTrade").split(",") if u.strip()]
+BINANCE_REST_URLS = [u.strip() for u in os.getenv(
+    "BINANCE_REST_URLS", "https://data-api.binance.vision,https://api.binance.com").split(",") if u.strip()]
