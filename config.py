@@ -155,10 +155,6 @@ SETTLE_Z_SHADOW = os.getenv("SETTLE_Z_SHADOW", "1").strip().lower() in ("yes", "
 # inv17 LOG-ONLY: late_window_shadow (one virtual maker bid per slot when ONLY the entry block zone stops a 70-120s maker entry).
 LATE_WINDOW_SHADOW = os.getenv("LATE_WINDOW_SHADOW", "1").strip().lower() in ("yes", "y", "true", "1", "on")
 # LOG-ONLY: sol_shadow (rule B virtual maker bid at 0.50 on the settle_z side for SOL 5m; SOL is never traded).
-# LIVE: ENTRY_SIGNAL=settle_z -> maker/momentum entry side from settle_z (rule B: |settle_z| >= ENTRY_SETTLE_Z_MIN on the
-# maker leg); unset/other -> legacy spot-strike bot_z (fallback also when settle_z is unavailable). Guards unchanged.
-ENTRY_SIGNAL = os.getenv("ENTRY_SIGNAL", "").strip().lower()
-ENTRY_SETTLE_Z_MIN = float(os.getenv("ENTRY_SETTLE_Z_MIN", "0.5"))
 SOL_SHADOW = os.getenv("SOL_SHADOW", "1").strip().lower() in ("yes", "y", "true", "1", "on")
 DYNAMIC_MAX_ELAPSED_S = float(os.getenv("DYNAMIC_MAX_ELAPSED_S", "240.0"))
 
