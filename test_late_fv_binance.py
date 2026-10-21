@@ -25,6 +25,14 @@ class TestBinanceStream(unittest.TestCase):
         self.assertEqual(n, 2)  # bar 11.0 already live: not overwritten
         self.assertEqual(bn.history_snapshot()[:3], [(9.0, 0.5), (10.0, 0.7), (11.0, 2.0)])
 
+    def test_book_heartbeat_refreshes_age_not_price(self):
+        bn = feeds.BinanceSpotStream(ws_urls=["x"], rest_urls=[])
+        bn.on_trade(10.0, 5.0)
+        bn.on_book(recv_ts=12.8)
+        self.assertAlmostEqual(bn.spot_age_s(13.0), 0.2)
+        self.assertAlmostEqual(bn.trade_age_s(13.0), 3.0)
+        self.assertEqual(bn.last_tick(), (10.0, 5.0))
+
     def test_twap_matches_chainlink_implementation(self):
         cl = feeds.ChainlinkRTDSStream(assets=["btc"])
         ticks = [(100.0 + i, 50.0 + (i % 7)) for i in range(120)]

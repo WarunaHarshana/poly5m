@@ -568,6 +568,7 @@ class BinanceSpotStream:
         self._cur_close: float | None = None
         self._last: tuple[float, float] | None = None  # (trade_ts, price)
         self._last_recv: float = 0.0
+        self._last_book_recv: float = 0.0  # bookTicker heartbeat: price confirmed current even without trades
         self._recv_lag: collections.deque[float] = collections.deque(maxlen=2000)  # recv - trade T
         self._lock = threading.Lock()
         self._stop = False
@@ -607,6 +608,10 @@ class BinanceSpotStream:
             self._last_recv = r
             self._recv_lag.append(r - trade_ts)
 
+    def on_book(self, recv_ts: float | None = None) -> None:
+        with self._lock:
+            self._last_book_recv = time.time() if recv_ts is None else recv_ts
+
     def seed_bars(self, bars: list[tuple[float, float]]) -> int:
         """bars: (bar_end_ts, close) ascending; only those older than the first live bar are inserted."""
         with self._lock:
@@ -630,9 +635,19 @@ class BinanceSpotStream:
         with self._lock:
             return self._last
 
-    def spot_age_s(self, now: float | None = None) -> float | None:
+    def trade_age_s(self, now: float | None = None) -> float | None:
         lt = self.last_tick()
         return None if lt is None else (time.time() if now is None else now) - lt[0]
+
+    def spot_age_s(self, now: float | None = None) -> float | None:
+        """Age of the last confirmation of the spot: min(trade age, bookTicker heartbeat age). bookTicker on the
+        spot stream has no event time, so its heartbeat age is measured on receive (excludes ~0.13s transport)."""
+        n = time.time() if now is None else now
+        with self._lock:
+            lt, bk = self._last, self._last_book_recv
+        if lt is None:
+            return None
+        return n - max(lt[0], bk) if bk else n - lt[0]
 
     def recv_lag_stats(self) -> dict:
         with self._lock:
@@ -650,7 +665,8 @@ class BinanceSpotStream:
         with self._lock:
             n = len(self._bars)
         return {"connected": self.connected, "url": self.url_in_use, "bars": n, "seeded_bars": self.seeded_bars,
-                "spot_age_s": None if age is None else round(age, 3), "reconnects": self.reconnects,
+                "spot_age_s": None if age is None else round(age, 3),
+                "trade_age_s": None if self.trade_age_s(now) is None else round(self.trade_age_s(now), 3), "reconnects": self.reconnects,
                 "recv_lag": self.recv_lag_stats()}
 
     # ---- network
@@ -697,12 +713,18 @@ class BinanceSpotStream:
                         try:
                             m = json.loads(raw)
                             m = m.get("data", m)
-                            self.on_trade(float(m["T"]) / 1000.0, float(m["p"]))
+                            if "T" in m and "p" in m:
+                                self.on_trade(float(m["T"]) / 1000.0, float(m["p"]))
+                            elif "b" in m and "a" in m:
+                                self.on_book()
+                                continue
+                            else:
+                                continue
                         except Exception:
                             continue
                         if not seeded:
                             seeded = True
-                            await asyncio.to_thread(self._seed_rest)
+                            threading.Thread(target=self._seed_rest, name="binance-seed", daemon=True).start()
             except Exception as e:
                 logger.warning(f"[Binance] ws error via {url}: {e!r}")
             self.connected = False

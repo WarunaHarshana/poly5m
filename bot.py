@@ -2663,7 +2663,10 @@ class TWAPBot:
             return None, "no_feed"
         spot_ts, spot = ticks[-1]
         age = now - spot_ts
+        trade_age = age
         if src == "binance":
+            a2 = stream.spot_age_s(now) if hasattr(stream, "spot_age_s") else None
+            age = age if a2 is None else a2
             if age > float(getattr(config, "LATE_FV_BINANCE_MAX_AGE_S", 1.0)):
                 return None, "stale_binance"
         elif age > float(getattr(config, "MAX_ORACLE_STALE_S", 10.0)):
@@ -2681,7 +2684,7 @@ class TWAPBot:
             return None, "no_z"
         return {"spot_source": src, "t": round(t, 1), "z": round(z, 4), "spot": spot, "strike": round(strike, 4),
                 "vol": vol, "vol_n": vol_n, "vol_fallback": vol_fallback, "spot_age_s": round(age, 3),
-                "_spot_ts": spot_ts}, None
+                "trade_age_s": round(trade_age, 3), "_spot_ts": spot_ts}, None
 
     async def _late_fv_check(self, slot, market, st, now, t) -> None:
         by = st.get("by") or {st.get("primary") or "chainlink": st}
@@ -2737,7 +2740,7 @@ class TWAPBot:
             pick, best = late_fv.evaluate(z, q_up, q_dn, k, me, float(config.LATE_FV_MAX_ASK))
             pick_c, _ = late_fv.evaluate(z, q_up, q_dn, k, me, cap_ask)
             tick_row[src] = {"z": z, "spot": info["spot"], "strike": info["strike"], "vol": info["vol"],
-                             "spot_age_s": info["spot_age_s"], "best_side": (best or {}).get("side"),
+                             "spot_age_s": info["spot_age_s"], "trade_age_s": info["trade_age_s"], "best_side": (best or {}).get("side"),
                              "best_edge": (best or {}).get("edge"), "pick": (pick_c or {}).get("side"),
                              "pick_edge": (pick_c or {}).get("edge"), "pick_ask": (pick_c or {}).get("ask"),
                              "done": bool(sub.get("done"))}

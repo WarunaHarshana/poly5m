@@ -559,6 +559,7 @@ if LATE_FV_SPOT_SOURCE not in ("chainlink", "binance"):
 LATE_FV_BINANCE_MAX_AGE_S = float(os.getenv("LATE_FV_BINANCE_MAX_AGE_S", "1.0"))
 BINANCE_WS_URLS = [u.strip() for u in os.getenv(
     "BINANCE_WS_URLS",
-    "wss://stream.binance.com:9443/ws/btcusdt@aggTrade,wss://data-stream.binance.vision/ws/btcusdt@aggTrade").split(",") if u.strip()]
+    "wss://stream.binance.com:9443/stream?streams=btcusdt@aggTrade/btcusdt@bookTicker,"
+    "wss://data-stream.binance.vision/stream?streams=btcusdt@aggTrade/btcusdt@bookTicker").split(",") if u.strip()]
 BINANCE_REST_URLS = [u.strip() for u in os.getenv(
     "BINANCE_REST_URLS", "https://data-api.binance.vision,https://api.binance.com").split(",") if u.strip()]
