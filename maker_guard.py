@@ -26,6 +26,7 @@ REASON_TWAP_CROSS = "twap_cross"
 REASON_NO_TWAP_STRIKE = "no_twap_strike"
 REASON_ADVERSE_SPOT_CROSS = "adverse_spot_cross"
 REASON_GUARD_COOLDOWN = "guard_cooldown"
+REASON_SHARP_DROP = "sharp_drop"
 # Guard blocks/cancels that start the per-slot GUARD_COOLDOWN_S re-post cooldown.
 COOLDOWN_REASONS = frozenset({REASON_MID_DROP, REASON_TWAP_CROSS, REASON_DIRECTION_CONFLICT,
                               REASON_ADVERSE_SPOT_CROSS, REASON_TWAP_SIGMA})
@@ -174,6 +175,28 @@ def post_falling_mid_blocked(
         if r is not None and r > float(stable_max_range) + 1e-9:
             return True
     return False
+
+
+def sharp_drop(hist: "MidHistory", token: str | None, now: float, window_s: float) -> tuple[float | None, float | None, float | None]:
+    """Post-time sharp-drop measure: (mid, window_high, drop). Same definition as the maker_post_shadow
+    'drop' field: mid = latest recorded mid, high = max mid over the last window_s, drop = max(0, high-mid).
+    The window is capped by the history's own retention (MAKER_MID_WINDOW_S)."""
+    m = hist.latest(token)
+    dq = hist._h.get(token or "")
+    cutoff = float(now) - min(float(window_s), hist.window_s)
+    vals = [v for ts, v in (dq or ()) if ts >= cutoff]
+    if m is None or not vals:
+        return m, None, None
+    hi = max(vals)
+    return m, hi, max(0.0, hi - m)
+
+
+def sharp_drop_blocked(drop: float | None, threshold: float) -> bool:
+    """Block the post when drop >= threshold. Missing data / threshold <= 0 does not block (fail-open)."""
+    d = _finite(drop)
+    if d is None or float(threshold) <= 0:
+        return False
+    return d >= float(threshold) - 1e-9
 
 
 SHADOW_DROP_THRESHOLDS = (0.03, 0.05, 0.08)

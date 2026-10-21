@@ -142,6 +142,11 @@ MAKER_MID_WINDOW_S = float(os.getenv("MAKER_MID_WINDOW_S", "60"))
 MAKER_POST_MAX_MID_DROP = float(os.getenv("MAKER_POST_MAX_MID_DROP", "0"))
 MAKER_POST_STABLE_S = float(os.getenv("MAKER_POST_STABLE_S", "3"))
 MAKER_POST_STABLE_MAX_RANGE = float(os.getenv("MAKER_POST_STABLE_MAX_RANGE", "0"))
+# LIVE sharp-drop guard (default OFF): at maker post time skip the post if the favoured mid is
+# >= SHARP_DROP_THRESHOLD below its max mid over the last SHARP_DROP_WINDOW_S (same 'drop' as maker_post_shadow).
+SHARP_DROP_GUARD = os.getenv("SHARP_DROP_GUARD", "0").strip().lower() in ("yes", "y", "true", "1", "on")
+SHARP_DROP_THRESHOLD = float(os.getenv("SHARP_DROP_THRESHOLD", "0.06"))
+SHARP_DROP_WINDOW_S = float(os.getenv("SHARP_DROP_WINDOW_S", "60"))
 # Shadow-only logging of the pre-post gate (never blocks): journal event maker_post_shadow on each maker bid post.
 MAKER_POST_GATE_SHADOW = os.getenv("MAKER_POST_GATE_SHADOW", "1").strip().lower() in ("yes", "y", "true", "1", "on")
 # inv12 LOG-ONLY traces (never change trading): resting-path ticks, post-fill path.

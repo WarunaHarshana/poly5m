@@ -472,6 +472,10 @@ class TWAPBot:
         logger.info(f"STARTING POLY 5M BOT | STRATEGY={config.STRATEGY}")
         coins = ",".join(a.upper() for a in config.ASSETS)
         logger.info(f"Mode: {config.MODE.upper()} | Assets: {coins} | Timeframe: {config.TIMEFRAME}")
+        logger.info(
+            f"SHARP_DROP_GUARD={'ON' if getattr(config, 'SHARP_DROP_GUARD', False) else 'off'} "
+            f"threshold={getattr(config, 'SHARP_DROP_THRESHOLD', 0.06):.3f} window={getattr(config, 'SHARP_DROP_WINDOW_S', 60.0):.0f}s"
+        )
         logger.info("One position per coin per 5-minute window")
         for a in config.ASSETS:
             p = config.ASSET_PARAMS[a]
@@ -2676,6 +2680,19 @@ class TWAPBot:
                 cooldown_left_s=round(slot.guard_cooldown_until - time.time(), 1),
             )
             return
+        if bool(getattr(config, "SHARP_DROP_GUARD", False)):
+            sd_mid, sd_hi, sd_drop = maker_guard.sharp_drop(
+                self._mid_hist, token_id, time.time(), float(getattr(config, "SHARP_DROP_WINDOW_S", 60.0))
+            )
+            if maker_guard.sharp_drop_blocked(sd_drop, float(getattr(config, "SHARP_DROP_THRESHOLD", 0.06))):
+                st0 = market.get("slot_start_ts")
+                self._log_maker_block(
+                    slot, market.get("slug", ""), maker_guard.REASON_SHARP_DROP, stage="post", side=signal.side,
+                    mid=sd_mid, mid_high=sd_hi, mid_drop=sd_drop, bid=signal.target_bid,
+                    threshold=float(getattr(config, "SHARP_DROP_THRESHOLD", 0.06)),
+                    elapsed_s=(round(time.time() - float(st0), 1) if st0 else None),
+                )
+                return
 
         stake_usd = (
             self.risk.calculate_stake(signal.edge_net, signal.target_bid, open_notional=self._open_notional())
